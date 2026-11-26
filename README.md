@@ -23,6 +23,7 @@ not have. XSEmu does not emulate the console's CPU or hardware.
 - [How it works](#how-it-works)
 - [Shader pipeline](#shader-pipeline)
 - [Requirements](#requirements)
+- [Quick start on Windows](#quick-start-on-windows)
 - [Build and test](#build-and-test)
 - [Usage](#usage)
 - [Repository layout](#repository-layout)
@@ -182,6 +183,22 @@ state wrong.
 - To build: the Rust MSVC toolchain (`stable-x86_64-pc-windows-msvc`; CI uses
   1.99.0) and the Visual Studio C++ build tools.
 - An unpacked copy of a title that you own. See [Legal](#legal).
+
+## Quick start on Windows
+
+From a PowerShell window in the repository root:
+
+```powershell
+.\scripts\setup-windows.ps1     # once: Rust and the Visual Studio C++ build tools
+.\scripts\build-windows.ps1     # dist\bin\xcl.exe, DXC, Agility SDK, dist\xcl-windows-x64.zip
+.\run.cmd                       # or: .\dist\bin\xcl.exe run "D:\Games\MyTitle"
+```
+
+`build-windows.ps1` copies DXC from the Windows SDK and the D3D12 Agility SDK
+into `dist\bin\` when it finds or downloads them, so the folder works on
+Windows 10 (whose inbox `D3D12Core.dll` stops at Shader Model 6.5). `build.cmd`
+and `run.cmd` are the double-click entry points; `run.cmd` builds first when
+`dist\` is missing.
 
 ## Build and test
 
