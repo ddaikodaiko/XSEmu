@@ -22,6 +22,7 @@ not have. XSEmu does not emulate the console's CPU or hardware.
 - [Status](#status)
 - [How it works](#how-it-works)
 - [Shader pipeline](#shader-pipeline)
+- [Quick start on Windows](#quick-start-on-windows)
 - [Requirements](#requirements)
 - [Build and test](#build-and-test)
 - [Usage](#usage)
@@ -166,6 +167,27 @@ that, draws with the pipeline are skipped until it is built. By default a
 compute bind keeps waiting, because a skipped dispatch could leave the title's
 state wrong.
 `XCL_ASYNC_PSO=0` builds every pipeline inside the create call instead.
+
+## Quick start on Windows
+
+From a PowerShell window in the repository root:
+
+```powershell
+.\scripts\setup-windows.ps1     # once: Rust, VS C++ tools, CMake, Ninja, Qt 6.8
+.\scripts\build-windows.ps1     # builds dist\bin\XSEmu.exe and XSEmuLauncher.exe
+.\run-xsemu.cmd                 # opens the launcher
+```
+
+`build-windows.ps1` copies DXC and the D3D12 Agility SDK next to the executables
+when it finds them, so `dist\bin\` is a portable folder. After the first build,
+double-clicking `run-xsemu.cmd` (or `build.cmd`) rebuilds only when `dist\` is
+missing.
+
+Without the launcher, run a title from the command line:
+
+```powershell
+.\dist\bin\XSEmu.exe run "D:\Games\MyTitle"
+```
 
 ## Requirements
 

@@ -1,0 +1,110 @@
+# Builds a self-contained Windows x64 folder (XSEmu + launcher + DXC + Agility SDK)
+# and uploads it as a zip artifact. Runs on every branch push and on demand, so a
+# build can be produced without a local Windows toolchain.
+name: Windows artifacts
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-2025
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: rustup toolchain install 1.99.0-x86_64-pc-windows-msvc --profile minimal
+
+      - name: Set up the MSVC environment
+        uses: ilammy/msvc-dev-cmd@7defe9254715b088f12dddd9942945a3d75cdad5 # v1.9.0
+        with:
+          arch: x64
+
+      - name: Build the emulator
+        run: cargo +1.99.0-x86_64-pc-windows-msvc build --release --locked -p xcl
+
+      - name: Install Qt 6.8 (MSVC 2022, x64)
+        uses: jurplel/install-qt-action@b344308e4483fc892e0d27b3cd1b173ebdd95f06 # v4.5.0
+        with:
+          version: '6.8.3'
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          cache: true
+
+      - name: Build and install the launcher
+        run: |
+          cmake -S launcher -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DXSEMU_LAUNCHER_TESTS=OFF -DXSEMU_FAKE_EMULATOR=OFF
+          cmake --build build
+          cmake --install build --prefix dist
+
+      - name: Assemble the portable folder
+        shell: pwsh
+        run: |
+          $bin = 'dist/bin'
+          if (-not (Test-Path $bin)) { throw "the launcher did not install to $bin" }
+          Copy-Item target/release/XSEmu.exe $bin
+
+          # DXC from the Windows SDK (the emulator also searches Windows Kits, but a copy
+          # next to the executable makes the folder self-contained).
+          $kits = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Directory -ErrorAction SilentlyContinue |
+                  Sort-Object Name -Descending
+          $dxc = $kits | ForEach-Object { Join-Path $_.FullName 'x64\dxcompiler.dll' } |
+                 Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ($dxc) {
+            $dir = Split-Path $dxc
+            Copy-Item (Join-Path $dir 'dxcompiler.dll') $bin
+            if (Test-Path (Join-Path $dir 'dxil.dll')) { Copy-Item (Join-Path $dir 'dxil.dll') $bin }
+            Write-Host "DXC bundled from $dir"
+          } else {
+            Write-Warning 'dxcompiler.dll not found in the Windows SDK; the launcher will rely on the target PC'
+          }
+
+          # Agility SDK: needed for Shader Model 6.6 + mesh shaders on Windows 10.
+          try {
+            Invoke-WebRequest -Uri 'https://www.nuget.org/api/v2/package/Microsoft.Direct3D.D3D12/1.615.1' -OutFile agility.zip
+            Expand-Archive agility.zip -DestinationPath agility -Force
+            New-Item -ItemType Directory -Force (Join-Path $bin 'D3D12') | Out-Null
+            Copy-Item 'agility/build/native/bin/x64/*.dll' (Join-Path $bin 'D3D12')
+            Write-Host 'Agility SDK bundled in D3D12\'
+          } catch {
+            Write-Warning "Agility SDK not bundled: $_"
+          }
+
+          @'
+          XSEmu - portable Windows build
+          ==============================
+
+          Run XSEmuLauncher.exe (or run.cmd). Choose a title's folder or its exe.
+
+          Requirements: Windows 10/11 x64, a D3D12 GPU with Shader Model 6.6
+          and mesh shaders. The D3D12 Agility SDK is in D3D12\; DXC is bundled.
+
+          If the launcher does not find the emulator, set XSEmu.exe as its path in
+          Settings. Logs and per-title data live in %LOCALAPPDATA%\XCL\<title>\.
+
+          This build is experimental research software. Use only titles you own.
+          '@ | Set-Content (Join-Path $bin 'QUICKSTART.txt') -Encoding UTF8
+
+          @'
+          @echo off
+          start "" "%~dp0XSEmuLauncher.exe"
+          '@ | Set-Content (Join-Path $bin 'run.cmd') -Encoding ASCII
+
+          Compress-Archive -Path (Join-Path $bin '*') -DestinationPath XSEmu-windows-x64.zip -Force
+          Get-ChildItem $bin | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: Upload the portable build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: XSEmu-windows-x64
+          path: XSEmu-windows-x64.zip
+          if-no-files-found: error
