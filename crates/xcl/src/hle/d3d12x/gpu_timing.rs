@@ -2034,6 +2034,14 @@ mod tests {
             let first_id = queue_token(first.as_raw()).unwrap();
             let (fence, value) = fence_of(first_id, index);
             crate::gpu::fence::wait(&fence, value, &dev, None, 5_000).unwrap();
+            // The fence says the first flight finished; collect it before the same list is
+            // submitted again, so the replay is the only flight that counts.
+            poll(Some(first_id));
+            {
+                let state = STATE.lock().unwrap();
+                let in_flight = state.slots[index].recording.as_ref().unwrap().in_flight;
+                assert_eq!(in_flight, 0, "the completed first flight must be retired");
+            }
 
             let unblock = Unblock(gate.clone());
             replay.Wait(&gate, 1).unwrap();
