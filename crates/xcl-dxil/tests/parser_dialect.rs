@@ -453,7 +453,7 @@ fn prelude_units(emit: &str) -> Vec<(String, String)> {
     let table = tables(emit, &mem);
     let mut units = Vec::new();
     for pixel in [false, true] {
-        let mut s = String::from("RWByteAddressBuffer io : register(u0);\nRWByteAddressBuffer res : register(u1);\nRWByteAddressBuffer mem : register(u2);\n");
+        let mut s = String::from("static uint lane_id;\nvoid xcl_trip(uint k) {}\nRWByteAddressBuffer io : register(u0);\nRWByteAddressBuffer res : register(u1);\nRWByteAddressBuffer mem : register(u2);\n");
         if pixel {
             s.insert_str(0, "#define XCL_PIXEL 1\n");
         }
@@ -464,7 +464,7 @@ fn prelude_units(emit: &str) -> Vec<(String, String)> {
         units.push((format!("prelude, pixel {pixel}"), s));
     }
     for (spin, pair) in [(0, 0), (0, 1), (1, 1)] {
-        let mut s = String::from("static uint lane_id;\nstatic uint xcl_half = 0u;\ngroupshared uint xcl_lds[8192];\n");
+        let mut s = String::from("static uint lane_id;\nvoid xcl_trip(uint k) {}\nstatic uint xcl_half = 0u;\ngroupshared uint xcl_lds[8192];\n");
         s.push_str(&format!("#define XCL_X_THREADS 96u\n#define XCL_X_WAVES 2u\n#define XCL_X_SLOT 64u\n#define XCL_X_SPIN {spin}\n#define XCL_X_PAIR {pair}\n"));
         s.push_str("#define XCL_X_LDS_TOP 7000u\n#define XCL_XS(i) xcl_lds[7001u + (i)]\n#define XCL_XC(i) xcl_lds[8100u + (i)]\n#define XCL_XW xcl_lds[8191u]\n");
         s.push_str("#define XCL_BAR_ALIVE xcl_lds[8189u]\n#define XCL_BAR_STATE xcl_lds[8190u]\n");

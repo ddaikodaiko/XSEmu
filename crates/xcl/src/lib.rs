@@ -27,6 +27,8 @@ pub mod modules;
 pub mod pe;
 pub mod preflight;
 pub mod progress;
+pub mod progress_window;
+mod live_stall;
 pub mod report;
 pub mod resolver;
 pub mod rpf;

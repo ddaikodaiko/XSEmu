@@ -24,9 +24,11 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 /// bytes of a `D3D12_INPUT_ELEMENT_DESC`
 pub const ELEMENT: usize = 32;
 const VERSION: u8 = 1;
+/// a record whose description is in `pso_canon`'s one form
+const CANONICAL: u8 = 2;
 /// runs after which a pipeline none of them made is stale
 pub const STALE_AFTER_RUNS: u32 = 3;
-/// bytes of a `created.bin` entry: the key, the translation era, the run
+/// bytes of a `created.bin` (and `bound.bin`) entry: the key, the translation era, the run
 const CREATED: usize = 20;
 
 /// How the pipeline was made (which of XCL's builds makes it again).
@@ -57,12 +59,14 @@ pub struct Record {
     /// the input layout: the offset in `desc` of the pointer to its elements, and each element
     /// (its name pointer 0) with its semantic name
     pub layout: Option<(u32, Vec<(Vec<u8>, [u8; ELEMENT])>)>,
+    /// the description is in `pso_canon`'s one form (kept in the version, so in the key)
+    pub canonical: bool,
 }
 
 impl Record {
     /// What is kept of it: its shaders as their hash and length.
     fn encode(&self) -> Vec<u8> {
-        let mut out = vec![VERSION, self.kind as u8];
+        let mut out = vec![if self.canonical { CANONICAL } else { VERSION }, self.kind as u8];
         out.extend_from_slice(&(self.desc.len() as u32).to_le_bytes());
         out.extend_from_slice(&self.desc);
         out.extend_from_slice(&(self.shaders.len() as u32).to_le_bytes());
@@ -132,7 +136,7 @@ pub(super) fn shaders_key(hashes: impl Iterator<Item = u64>) -> u64 {
 }
 
 fn encoded_shaders_key(e: &[u8]) -> Option<u64> {
-    if e.first() != Some(&VERSION) {
+    if !matches!(e.first(), Some(&VERSION | &CANONICAL)) {
         return None;
     }
     let word = |p: usize| Some(u32::from_le_bytes(e.get(p..p + 4)?.try_into().ok()?) as usize);
@@ -153,9 +157,10 @@ fn decode(b: &[u8], shader: &mut impl FnMut(u64, u32) -> Option<Arc<Vec<u8>>>) -
     };
     let u32_ = |s: &[u8]| u32::from_le_bytes(s.try_into().unwrap());
     let head = take(2)?;
-    if head[0] != VERSION {
+    if head[0] != VERSION && head[0] != CANONICAL {
         return None;
     }
+    let canonical = head[0] == CANONICAL;
     let kind = Kind::from_u8(head[1])?;
     let n = u32_(take(4)?) as usize;
     let desc = take(n)?.to_vec();
@@ -181,7 +186,7 @@ fn decode(b: &[u8], shader: &mut impl FnMut(u64, u32) -> Option<Arc<Vec<u8>>>) -
             Some((off, elems))
         }
     };
-    (at == b.len()).then_some(Record { kind, desc, shaders, layout })
+    (at == b.len()).then_some(Record { kind, desc, shaders, layout, canonical })
 }
 
 /// The kept entries' bytes: each a length and an encoded record (a torn last entry is left out).
@@ -194,6 +199,26 @@ fn entries(file: &[u8]) -> Vec<&[u8]> {
         at += 4 + len;
     }
     out
+}
+
+/// `Store::index`: the list's bytes and each key's first entry in them (offset, length).
+pub(super) struct Index {
+    dir: PathBuf,
+    file: Vec<u8>,
+    at: HashMap<u64, (usize, usize)>,
+}
+
+impl Index {
+    /// Pipeline `key` (None: not kept, not one this XCL reads, or a shader it names is missing).
+    pub(super) fn get(&self, key: u64) -> Option<Record> {
+        let &(at, len) = self.at.get(&key)?;
+        decode(self.file.get(at..at + len)?, &mut |hash, len| read_shader(&self.dir, hash, len))
+    }
+}
+
+/// Shader `hash` of `len` bytes, as kept (None: missing or not that shader).
+fn read_shader(dir: &Path, hash: u64, len: u32) -> Option<Arc<Vec<u8>>> {
+    std::fs::read(shader_path(dir, hash, len)).ok().filter(|b| b.len() == len as usize && crate::gpu::shader::fnv64(b) == hash).map(Arc::new)
 }
 
 fn shader_path(dir: &Path, hash: u64, len: u32) -> PathBuf {
@@ -305,13 +330,33 @@ impl Store {
         Self::load_filtered(dir, Some(kind), |key, e| include(key, encoded_shaders_key(e)))
     }
 
+    pub(super) fn load_keys(dir: &Path, keys: &HashSet<u64>) -> Loaded {
+        Self::load_filtered(dir, None, |key, _| keys.contains(&key))
+    }
+
+    /// Each kept pipeline's entry by key, the list read once: a warm-up child decodes the keys it
+    /// is given from it (`Index::get`) instead of reading the list again for each batch.
+    pub(super) fn index(dir: &Path) -> Index {
+        let file = std::fs::read(dir.join("pipelines.bin")).unwrap_or_default();
+        let base = file.as_ptr() as usize;
+        let mut at = HashMap::new();
+        for e in entries(&file) {
+            at.entry(key_of(e)).or_insert((e.as_ptr() as usize - base, e.len()));
+        }
+        Index { dir: dir.to_path_buf(), file, at }
+    }
+
+    pub(super) fn latest_run(dir: &Path) -> u32 {
+        Self::runs_in(dir)
+    }
+
     fn load_filtered(dir: &Path, kind: Option<Kind>, mut include: impl FnMut(u64, &[u8]) -> bool) -> Loaded {
         let file = std::fs::read(dir.join("pipelines.bin")).unwrap_or_default();
         let mut shaders: HashMap<(u64, u32), Option<Arc<Vec<u8>>>> = HashMap::new();
         let mut read = |hash: u64, len: u32| {
             shaders
                 .entry((hash, len))
-                .or_insert_with(|| std::fs::read(shader_path(dir, hash, len)).ok().filter(|b| b.len() == len as usize && crate::gpu::shader::fnv64(b) == hash).map(Arc::new))
+                .or_insert_with(|| read_shader(dir, hash, len))
                 .clone()
         };
         let (mut seen, mut out) = (HashSet::new(), Loaded { records: Vec::new(), broken: 0, repeated: 0 });
@@ -358,9 +403,18 @@ impl Store {
     }
 
     pub(super) fn recently_created(dir: &Path, count: std::num::NonZeroU32) -> std::io::Result<(std::ops::RangeInclusive<u32>, HashSet<u64>)> {
+        Self::recently_in(dir, "created.bin", count)
+    }
+
+    /// The pipelines the last `count` runs bound (`note_bound`); none before `bound.bin` was kept.
+    pub(super) fn recently_bound(dir: &Path, count: std::num::NonZeroU32) -> HashSet<u64> {
+        Self::recently_in(dir, "bound.bin", count).map_or_else(|_| HashSet::new(), |(_, keys)| keys)
+    }
+
+    fn recently_in(dir: &Path, name: &str, count: std::num::NonZeroU32) -> std::io::Result<(std::ops::RangeInclusive<u32>, HashSet<u64>)> {
         let last = Self::runs_in(dir);
         let runs = last.saturating_sub(count.get() - 1).max(1)..=last;
-        let file = std::fs::read(dir.join("created.bin"))?;
+        let file = std::fs::read(dir.join(name))?;
         let keys = file.chunks_exact(CREATED)
             .filter(|e| runs.contains(&u32::from_le_bytes(e[16..].try_into().unwrap())))
             .map(|e| u64::from_le_bytes(e[..8].try_into().unwrap()))
@@ -385,9 +439,18 @@ impl Store {
     /// Run `run` made pipeline `key` in translation era `era` (`file`: `created.bin`, opened by
     /// the first).
     pub fn made(&self, file: &mut Option<std::fs::File>, key: u64, era: u64, run: u32) -> std::io::Result<()> {
+        self.note_in("created.bin", file, key, era, run)
+    }
+
+    /// Run `run` bound pipeline `key` (`file`: `bound.bin`, opened by the first).
+    fn bound(&self, file: &mut Option<std::fs::File>, key: u64, era: u64, run: u32) -> std::io::Result<()> {
+        self.note_in("bound.bin", file, key, era, run)
+    }
+
+    fn note_in(&self, name: &str, file: &mut Option<std::fs::File>, key: u64, era: u64, run: u32) -> std::io::Result<()> {
         if file.is_none() {
             std::fs::create_dir_all(&self.dir)?;
-            *file = Some(std::fs::OpenOptions::new().create(true).append(true).open(self.dir.join("created.bin"))?);
+            *file = Some(std::fs::OpenOptions::new().create(true).append(true).open(self.dir.join(name))?);
         }
         file.as_mut().unwrap().write_all(&created_entry(key, era, run))
     }
@@ -425,8 +488,32 @@ impl Store {
     /// `xcl warm-up --full`'s progress in translation era `era`: what a pass of this era went
     /// through already; a record of another era is started again.
     pub fn progress(&self, era: u64) -> std::io::Result<Progress> {
+        self.progress_in("full-progress.bin", era)
+    }
+
+    /// `xcl warm-up --blocking`'s record of the keys it made ready in translation era `era` with
+    /// adapter and driver `driver`; true: a record of another driver was dropped (the driver
+    /// refuses the blobs of another). A record kept before the driver was noted is taken as this
+    /// driver's.
+    pub(super) fn blocking_progress(&self, era: u64, driver: &str) -> std::io::Result<(Progress, bool)> {
         std::fs::create_dir_all(&self.dir)?;
-        let path = self.dir.join("full-progress.bin");
+        let noted = self.dir.join("blocking-progress.driver");
+        let changed = std::fs::read_to_string(&noted).is_ok_and(|kept| kept != driver);
+        if changed {
+            self.blocking_progress_clear();
+        }
+        std::fs::write(&noted, driver)?;
+        Ok((self.progress_in("blocking-progress.bin", era)?, changed))
+    }
+
+    /// `xcl warm-up --blocking --fresh`: the next pass replays every key.
+    pub(super) fn blocking_progress_clear(&self) {
+        let _ = std::fs::remove_file(self.dir.join("blocking-progress.bin"));
+    }
+
+    fn progress_in(&self, name: &str, era: u64) -> std::io::Result<Progress> {
+        std::fs::create_dir_all(&self.dir)?;
+        let path = self.dir.join(name);
         let mut bytes = std::fs::read(&path).unwrap_or_default();
         if bytes.get(..8) != Some(&era.to_le_bytes()[..]) {
             bytes = era.to_le_bytes().to_vec();
@@ -457,11 +544,57 @@ pub fn dir() -> PathBuf {
     crate::gpu::recomp::dxc::cache_dir().join("pipelines")
 }
 
+pub(super) fn blocking_path() -> PathBuf {
+    dir().join("blocking-v2.txt")
+}
+
+pub(super) const BLOCKING_WAIT_MS: usize = 250;
+
+/// The keys of a blocking list, each once: those with a measured wait of `BLOCKING_WAIT_MS` or
+/// more, longest first, then those a target list (`min_run` None) names without a wait (the key
+/// alone) in the order listed. The game's own list always has a wait: a line without one is torn.
+pub(super) fn blocking_order(text: &str, min_run: Option<u32>) -> Vec<u64> {
+    let mut waits = HashMap::<u64, usize>::new();
+    let mut unmeasured = Vec::new();
+    let mut listed = HashSet::new();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        if let Some(min_run) = min_run {
+            if !fields.next().and_then(|s| s.parse::<u32>().ok()).is_some_and(|run| run >= min_run) {
+                continue;
+            }
+        }
+        let Some(key) = fields.next().and_then(|v| u64::from_str_radix(v, 16).ok()).filter(|&key| key != 0) else { continue };
+        let ms = fields.next();
+        if fields.next().is_some() {
+            continue;
+        }
+        match ms.map(str::parse::<usize>) {
+            None => {
+                if min_run.is_none() && listed.insert(key) {
+                    unmeasured.push(key);
+                }
+            }
+            Some(Ok(ms)) if ms >= BLOCKING_WAIT_MS => {
+                let old = waits.entry(key).or_default();
+                *old = (*old).max(ms);
+            }
+            Some(_) => {}
+        }
+    }
+    let mut ordered: Vec<_> = waits.iter().map(|(&key, &ms)| (key, ms)).collect();
+    ordered.sort_unstable_by_key(|&(key, ms)| (std::cmp::Reverse(ms), key));
+    ordered.into_iter().map(|(key, _)| key).chain(unmeasured.into_iter().filter(|key| !waits.contains_key(key))).collect()
+}
+
 enum ToWrite {
     /// a pipeline to keep, encoded
     Keep(Record, Vec<u8>),
     /// the key of a pipeline this run made for the first time
     Made(u64),
+    /// the key of a pipeline this run bound for the first time
+    Bound(u64),
+    Blocked(u64, usize),
 }
 
 struct Global {
@@ -469,6 +602,8 @@ struct Global {
     tx: Mutex<mpsc::Sender<ToWrite>>,
     /// the keys this run made
     made: Mutex<HashSet<u64>>,
+    /// the keys this run bound
+    bound: Mutex<HashSet<u64>>,
 }
 
 /// This process's list and the thread that writes to it (None: `XCL_PSO_MANIFEST=0`, or a test).
@@ -490,11 +625,29 @@ fn global() -> Option<&'static Global> {
         let (tx, rx) = mpsc::channel::<ToWrite>();
         let _ = std::thread::Builder::new().name("xcl-pso-manifest".into()).spawn(move || {
             let Some(g) = global() else { return };
-            let (mut failed, mut created) = (false, None);
+            let (mut failed, mut created, mut bound, mut blocking) = (false, None, None, None);
+            let mut slowest = HashMap::new();
             for w in rx {
                 let r = match w {
                     ToWrite::Keep(r, encoded) => g.store.write(&r, &encoded),
                     ToWrite::Made(key) => g.store.made(&mut created, key, era, run),
+                    ToWrite::Bound(key) => g.store.bound(&mut bound, key, era, run),
+                    ToWrite::Blocked(key, ms) => {
+                        let previous = slowest.entry(key).or_insert(0);
+                        if ms <= *previous {
+                            continue;
+                        }
+                        let result = (|| {
+                            if blocking.is_none() {
+                                blocking = Some(std::fs::OpenOptions::new().create(true).append(true).open(blocking_path())?);
+                            }
+                            writeln!(blocking.as_mut().unwrap(), "{run} {key:016x} {ms}")
+                        })();
+                        if result.is_ok() {
+                            *previous = ms;
+                        }
+                        result
+                    }
                 };
                 if let Err(e) = r {
                     if !std::mem::replace(&mut failed, true) {
@@ -503,15 +656,15 @@ fn global() -> Option<&'static Global> {
                 }
             }
         });
-        Some(Global { store, tx: Mutex::new(tx), made: Mutex::new(HashSet::new()) })
+        Some(Global { store, tx: Mutex::new(tx), made: Mutex::new(HashSet::new()), bound: Mutex::new(HashSet::new()) })
     })
     .as_ref()
 }
 
 /// The title made pipeline `r`: kept for the warm-up unless it is already, and noted as made by
 /// this run (written on a thread of its own; the title's thread only hashes it).
-pub fn record(r: Record) {
-    let Some(g) = global() else { return };
+pub fn record(r: Record) -> u64 {
+    let Some(g) = global() else { return 0 };
     let (key, encoded) = g.store.note(&r);
     let made = g.made.lock().unwrap().insert(key);
     let tx = g.tx.lock().unwrap();
@@ -521,11 +674,177 @@ pub fn record(r: Record) {
     if made {
         let _ = tx.send(ToWrite::Made(key));
     }
+    key
+}
+
+/// The title bound pipeline `key` (a `record` key): the next runs and warm-ups build it ahead
+/// of the ones no run bound (`pso_sched::Backlog::drawn_first`, `blocking_targets`).
+pub(super) fn note_bound(key: u64) {
+    let Some(g) = global() else { return };
+    if key != 0 && g.bound.lock().unwrap().insert(key) {
+        let _ = g.tx.lock().unwrap().send(ToWrite::Bound(key));
+    }
+}
+
+/// An earlier run of the last `STALE_AFTER_RUNS` bound pipeline `key`.
+pub(super) fn bound_earlier(key: u64) -> bool {
+    static EARLIER: OnceLock<HashSet<u64>> = OnceLock::new();
+    key != 0
+        && EARLIER
+            .get_or_init(|| {
+                if cfg!(test) {
+                    return HashSet::new();
+                }
+                let dir = dir();
+                // (the runs before this one: `global` counted this one already when it was opened)
+                Store::recently_bound(&dir, std::num::NonZeroU32::new(STALE_AFTER_RUNS + 1).unwrap())
+            })
+            .contains(&key)
+}
+
+pub(super) fn note_blocked(key: u64, ms: usize) {
+    if key != 0 && ms >= BLOCKING_WAIT_MS {
+        if let Some(g) = global() {
+            let _ = g.tx.lock().unwrap().send(ToWrite::Blocked(key, ms));
+        }
+    }
+}
+
+// Adapted from CGBJ (a VIctory fork) at f4b48ad766ddbec1a1867022cd42f7645b0dd55e,
+// crates/victory-gpu/src/pipeline/library.rs (`SLOW_FILE`, `SLOW_MS`, `slow`, `note_time`):
+// keyed by our manifest key, and read by the warm-up's order as well.
+// Copyright (C) the VIctory/CGBJ contributors. GPL-3.0-or-later.
+
+/// A pipeline whose build took this long is a slow one (`slow_ms`).
+pub const SLOW_MS: u64 = 1000;
+
+/// How long each pipeline that was slow to build took at most, in ms: `slow-pipelines.txt` in
+/// the list's folder, a key and its time a line (a key may be there more than once).
+fn slow_times() -> &'static Mutex<(HashMap<u64, u64>, Option<std::fs::File>)> {
+    static S: OnceLock<Mutex<(HashMap<u64, u64>, Option<std::fs::File>)>> = OnceLock::new();
+    S.get_or_init(|| {
+        if cfg!(test) {
+            return Mutex::new((HashMap::new(), None));
+        }
+        let path = dir().join("slow-pipelines.txt");
+        let times = parse_slow(&std::fs::read_to_string(&path).unwrap_or_default());
+        let file = std::fs::create_dir_all(dir()).and_then(|_| std::fs::OpenOptions::new().create(true).append(true).open(&path)).ok();
+        Mutex::new((times, file))
+    })
+}
+
+fn parse_slow(text: &str) -> HashMap<u64, u64> {
+    let mut times = HashMap::new();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(key), Some(ms), None) = (fields.next(), fields.next(), fields.next()) else { continue };
+        let (Ok(key), Ok(ms)) = (u64::from_str_radix(key, 16), ms.parse::<u64>()) else { continue };
+        if key != 0 && ms >= SLOW_MS {
+            let t = times.entry(key).or_insert(0);
+            *t = (*t).max(ms);
+        }
+    }
+    times
+}
+
+/// The longest an earlier build of pipeline `key` took, if that was `SLOW_MS` or more.
+pub fn slow_ms(key: u64) -> Option<u64> {
+    if key == 0 { None } else { slow_times().lock().unwrap().0.get(&key).copied() }
+}
+
+pub fn slow(key: u64) -> bool {
+    slow_ms(key).is_some()
+}
+
+/// Building pipeline `key` took `ms`, waits for memory left out: kept when slow and the
+/// longest yet.
+pub fn note_build_time(key: u64, ms: u64) {
+    if key == 0 || ms < SLOW_MS {
+        return;
+    }
+    let mut s = slow_times().lock().unwrap();
+    let known = s.0.entry(key).or_insert(0);
+    if ms > *known {
+        *known = ms;
+        if let Some(f) = s.1.as_mut() {
+            let _ = writeln!(f, "{key:016x} {ms}");
+        }
+    }
+}
+
+/// What `xcl warm-up --blocking` builds without `--targets` (`blocking_targets`).
+pub(super) struct Targets {
+    pub keys: Vec<u64>,
+    /// of `keys`, those with a measured wait (first)
+    pub waited: usize,
+    /// of `keys`, those a run drew with otherwise
+    pub drawn: usize,
+    /// kept pipelines no run drew with: left for their first bind in a run, or `warm-up --full`
+    pub left: usize,
+}
+
+/// The pipelines kept in `dir` that runs drew with, as `xcl warm-up --blocking` builds them:
+/// those whose bind a run of `min_run` on waited for, the longest wait first (`blocking_order`);
+/// then those the last `STALE_AFTER_RUNS` runs bound (`note_bound`) or whose shaders a run used
+/// or skipped a draw for (`used`: shader keys, `shaders_key`), the slowest measured first, the
+/// others in the order kept. The ones no run drew with are counted, not built.
+pub(super) fn blocking_targets(dir: &Path, text: &str, min_run: u32, used: &HashSet<u64>) -> Targets {
+    let mut keys = blocking_order(text, Some(min_run));
+    let waited = keys.len();
+    let mut seen: HashSet<u64> = keys.iter().copied().collect();
+    let bound = Store::recently_bound(dir, std::num::NonZeroU32::new(STALE_AFTER_RUNS).unwrap());
+    let file = std::fs::read(dir.join("pipelines.bin")).unwrap_or_default();
+    let (mut drawn, mut left) = (Vec::new(), 0);
+    for e in entries(&file) {
+        let key = key_of(e);
+        if !seen.insert(key) {
+            continue;
+        }
+        if bound.contains(&key) || encoded_shaders_key(e).is_some_and(|k| used.contains(&k)) {
+            drawn.push(key);
+        } else {
+            left += 1;
+        }
+    }
+    drawn.sort_by_key(|&key| std::cmp::Reverse(slow_ms(key).unwrap_or(0)));
+    let n = drawn.len();
+    keys.extend(drawn);
+    Targets { keys, waited, drawn: n, left }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build times: the longest of each key, from `SLOW_MS` on; other lines are passed over.
+    #[test]
+    fn slow_times_keep_the_longest_from_the_threshold() {
+        let t = parse_slow(&format!("a 1200\na 3000\na 2000\nb {}\n0 5000\nc x\nd 1500 extra\nzz 9000\n", SLOW_MS - 1));
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[&0xa], 3000);
+    }
+
+    /// The warm-up's own list: waited-for ones first, then what runs bound or used, and the
+    /// ones no run drew with counted, not built.
+    #[test]
+    fn blocking_targets_are_waits_then_what_runs_drew_with() {
+        let dir = temp_dir("targets");
+        let waited = sample(Kind::Compute, b"waited", b"W");
+        let bound = sample(Kind::Graphics, b"bound", b"B");
+        let used = sample(Kind::Graphics, b"used", b"U");
+        let neither = sample(Kind::Graphics, b"neither", b"N");
+        let store = Store::open(dir.clone());
+        for r in [&waited, &bound, &used, &neither] {
+            store.add(r).unwrap();
+        }
+        let run = store.begin_run(true).unwrap();
+        store.bound(&mut None, bound.key(), 0, run).unwrap();
+        let used_key = shaders_key(used.shaders.iter().map(|(_, s)| crate::gpu::shader::fnv64(s)));
+        let t = blocking_targets(&dir, &format!("{run} {:x} 900\n", waited.key()), run, &[used_key].into_iter().collect());
+        assert_eq!(t.keys, [waited.key(), bound.key(), used.key()]);
+        assert_eq!((t.waited, t.drawn, t.left), (1, 2, 1));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("xcl-pso-manifest-{name}-{}", std::process::id()));
@@ -541,7 +860,71 @@ mod tests {
             desc: (0u8..64).collect(),
             shaders: vec![(8, Arc::new(shader.to_vec())), (24, Arc::new(b"shared shader".to_vec()))],
             layout: Some((40, vec![(name.to_vec(), e)])),
+            canonical: false,
         }
+    }
+
+    #[test]
+    fn the_canonical_form_is_part_of_the_key_and_kept() {
+        let dir = temp_dir("canonical");
+        let raw = sample(Kind::MeshStream, b"mesh shader", b"POSITION");
+        let canonical = Record { canonical: true, ..raw.clone() };
+        assert_ne!(raw.key(), canonical.key());
+        let store = Store::open(dir.clone());
+        for r in [&raw, &canonical] {
+            assert!(store.add(r).unwrap());
+        }
+        let loaded = Store::open(dir.clone()).load();
+        assert_eq!(loaded.records.len(), 2);
+        assert!(loaded.records.contains(&raw) && loaded.records.contains(&canonical));
+        assert!(loaded.records.iter().all(|r| [raw.key(), canonical.key()].contains(&r.key())));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_index_gives_each_kept_record_as_loading_it_does() {
+        let dir = temp_dir("index");
+        let a = sample(Kind::Graphics, b"vertex shader", b"POSITION");
+        let b = sample(Kind::Compute, b"compute shader", b"C");
+        let store = Store::open(dir.clone());
+        for r in [&a, &b] {
+            store.add(r).unwrap();
+        }
+        let index = Store::index(&dir);
+        assert_eq!(index.get(a.key()), Some(a.clone()));
+        assert_eq!(index.get(b.key()), Some(b.clone()));
+        assert_eq!(Store::load_keys(&dir, &[a.key(), b.key()].into_iter().collect()).records.len(), 2);
+        assert_eq!(index.get(a.key() ^ 2), None);
+        std::fs::remove_file(shader_path(&dir, crate::gpu::shader::fnv64(b"compute shader"), b"compute shader".len() as u32)).unwrap();
+        assert_eq!(index.get(b.key()), None, "a shader it names is missing");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn blocking_replay_selects_exact_records_not_other_descriptors_of_the_same_shader() {
+        let dir = temp_dir("blocking");
+        let a = sample(Kind::Graphics, b"vertex shader", b"POSITION");
+        let b = sample(Kind::Graphics, b"vertex shader", b"TEXCOORD");
+        let c = sample(Kind::MeshStream, b"mesh shader", b"MESH");
+        let store = Store::open(dir.clone());
+        for record in [&a, &b, &c] {
+            store.add(record).unwrap();
+        }
+        let order = blocking_order(&format!("{:x} 400\n{:x} 700\n{:x} 900\n{:x} 249\ninvalid\n{:x} 1000 extra\n", a.key(), c.key(), a.key(), b.key(), b.key()), None);
+        assert_eq!(order, [a.key(), c.key()]);
+        let loaded = Store::load_keys(&dir, &order.into_iter().collect());
+        assert_eq!(loaded.records.len(), 2);
+        assert!(loaded.records.contains(&a) && loaded.records.contains(&c));
+        assert_eq!(blocking_order("4 1 9999\n5 2 500\n6 3 800\n", Some(5)), [3, 2]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A target list may name keys without a wait: they follow the measured ones, in the order
+    /// listed, each once, and a key also listed with a wait goes with the measured ones.
+    #[test]
+    fn blocking_order_takes_keys_without_a_wait_after_the_measured_ones() {
+        assert_eq!(blocking_order("c\n5 300\na\nc\n7 900\n5\nb\n0\nzz\n9 100\n", None), [7, 5, 0xc, 0xa, 0xb]);
+        assert_eq!(blocking_order("4 1\n6 3\n6 2 500\n", Some(5)), [2], "the game's list: a line without a wait is torn");
     }
 
     /// Pipelines are kept once each, with their shaders, and read back as they were made.
@@ -549,7 +932,7 @@ mod tests {
     fn pipelines_are_kept_once_and_read_back_whole() {
         let dir = temp_dir("roundtrip");
         let (a, b) = (sample(Kind::Graphics, b"vertex shader a", b"POSITION"), sample(Kind::VertexStream, b"vertex shader b", b"TEXCOORD"));
-        let compute = Record { kind: Kind::Compute, desc: vec![7; 40], shaders: vec![(8, Arc::new(vec![1, 2, 3]))], layout: None };
+        let compute = Record { kind: Kind::Compute, desc: vec![7; 40], shaders: vec![(8, Arc::new(vec![1, 2, 3]))], layout: None, canonical: false };
         let store = Store::open(dir.clone());
         assert!(store.add(&a).unwrap());
         assert!(store.add(&b).unwrap());
@@ -680,6 +1063,25 @@ mod tests {
 
     /// A `--full` pass stopped part way goes on where it left off in the same translation era, and
     /// starts again in another or once it went through everything.
+    #[test]
+    fn a_blocking_pass_starts_again_on_another_driver() {
+        let dir = temp_dir("blocking-progress");
+        let store = Store::open(dir.clone());
+        store.progress_in("blocking-progress.bin", 5).unwrap().note(1);
+        let (p, changed) = store.blocking_progress(5, "10de-2684-a").unwrap();
+        assert!(!changed && p.done == [1].into_iter().collect(), "a record kept before the driver was noted is kept");
+        p.note(2);
+        drop(p);
+        let (p, changed) = store.blocking_progress(5, "10de-2684-a").unwrap();
+        assert!(!changed && p.done == [1, 2].into_iter().collect());
+        drop(p);
+        let (p, changed) = store.blocking_progress(5, "10de-2684-b").unwrap();
+        assert!(changed && p.done.is_empty(), "another driver starts again");
+        drop(p);
+        assert!(!store.blocking_progress(5, "10de-2684-b").unwrap().1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_full_pass_goes_on_where_it_stopped_in_its_era() {
         let dir = temp_dir("progress");

@@ -38,6 +38,7 @@ mod call;
 mod cfg;
 mod dxbreak;
 mod expr;
+mod handles;
 mod lanes;
 mod ssa;
 mod stmt;
@@ -451,6 +452,8 @@ impl<'a> Lower<'a> {
         if cfg::thread_empty_blocks(&mut e.body, &self.loop_blocks, &self.loop_exits, self.handle_ty) {
             return Err(Error::Unsupported("a resource chosen by control flow".into()));
         }
+        cfg::simplify(&mut e.body, &e.m, &self.loop_blocks, &self.loop_exits, self.handle_ty);
+        handles::hoist_heap_handles(&mut e.body, &e.m);
         if let Some(io) = io {
             io.finish(&e.m, &e.body, &mut info)?;
         }

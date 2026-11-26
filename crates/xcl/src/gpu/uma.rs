@@ -57,6 +57,88 @@ pub struct Uma {
 /// bytes of XCL's arena pool (`Uma::new`)
 pub const POOL: usize = 64 << 20;
 
+/// (diagnostics) A block of a committed window handed out or given back: where, when (s of the
+/// run), and the XCL code that asked.
+#[derive(Clone, Copy)]
+struct Event {
+    at: usize,
+    len: usize,
+    t: f32,
+    by: &'static std::panic::Location<'static>,
+    back: bool,
+}
+
+/// The last blocks handed out and given back in the committed windows, the oldest first. The
+/// window is one allocator for the title's memory and for XCL's own GPU-written blocks, first
+/// fit, and a block given back is handed out again at once: a crash record asks whose an
+/// address was before it was whose it is now.
+static HISTORY: Mutex<std::collections::VecDeque<Event>> = Mutex::new(std::collections::VecDeque::new());
+const HISTORY_KEPT: usize = 65536;
+
+fn note_event(at: usize, len: usize, back: bool, by: &'static std::panic::Location<'static>) {
+    let mut h = HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+    if h.len() == HISTORY_KEPT {
+        h.pop_front();
+    }
+    h.push_back(Event { at, len, t: crate::log::uptime() as f32, by, back });
+}
+
+/// (diagnostics, `alias::report`) Whose the memory at `p` in a committed window is and was:
+/// the block it is in now – when it was handed out and to which code of XCL's (the title's
+/// allocations come by `kernelx`) – and the blocks that were there before, the latest first.
+pub fn history_at(p: usize) -> Vec<String> {
+    if !get().is_some_and(|u| u.is_committed(p)) {
+        return Vec::new();
+    }
+    let Some(h) = crate::alias::try_lock(&HISTORY) else {
+        return vec!["the blocks handed out at this address: (locked by another thread)".into()];
+    };
+    let events: Vec<Event> = h.iter().copied().collect();
+    describe_history(&events, p, crate::log::uptime() as f32)
+}
+
+fn describe_history(events: &[Event], p: usize, now: f32) -> Vec<String> {
+    let src = |e: &Event| {
+        let f = e.by.file().replace('\\', "/");
+        format!("{}:{}", f.rsplit_once("src/").map_or(f.as_str(), |x| x.1), e.by.line())
+    };
+    let here: Vec<&Event> = events.iter().rev().filter(|e| e.at <= p && p - e.at < e.len).take(8).collect();
+    let Some(last) = here.first() else {
+        return vec![format!("the block at this address was handed out before the last {} blocks of the window were handed out or given back (or never)", events.len())];
+    };
+    let one = |e: &Event| format!("{:.3} s ({:.3} s before): {:#x} + {:#x} {} {}", e.t, now - e.t, e.at, e.len, if e.back { "given back by" } else { "handed out to" }, src(e));
+    let mut out = vec![if last.back {
+        format!("this address is in no block now: the last one was given back {:.3} s before ({})", now - last.t, one(last))
+    } else {
+        format!("this address is in a block handed out {:.3} s before: {}", now - last.t, one(last))
+    }];
+    if here.len() > 1 {
+        out.push(format!("the blocks at this address before, the latest first: {}", here[1..].iter().map(|e| one(e)).collect::<Vec<_>>().join("; ")));
+    }
+    out
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::{describe_history, Event};
+
+    /// An address names the block it is in with when and for whom, the blocks there before,
+    /// and says so when nothing is known of it.
+    #[test]
+    fn an_address_names_its_block_and_the_blocks_before() {
+        let by = std::panic::Location::caller();
+        let e = |at, len, t, back| Event { at, len, t, by, back };
+        let events = [e(0x10_0000, 0x2_0000, 1.0, false), e(0x10_0000, 0x2_0000, 5.0, true), e(0x11_0000, 0x1_0000, 5.5, false), e(0x40_0000, 0x1_0000, 6.0, false)];
+        let at = describe_history(&events, 0x11_0040, 7.0);
+        assert_eq!(at.len(), 2, "{at:?}");
+        assert!(at[0].starts_with("this address is in a block handed out 1.500 s before: 5.500 s (1.500 s before): 0x110000 + 0x10000 handed out to gpu/uma.rs:"), "{at:?}");
+        assert!(at[1].contains("5.000 s (2.000 s before): 0x100000 + 0x20000 given back by") && at[1].contains("; 1.000 s (6.000 s before): 0x100000 + 0x20000 handed out to"), "{at:?}");
+        let gone = describe_history(&events, 0x10_0040, 7.0);
+        assert!(gone[0].starts_with("this address is in no block now: the last one was given back 2.000 s before"), "{gone:?}");
+        assert!(describe_history(&events, 0x90_0000, 7.0)[0].contains("before the last 4 blocks"));
+    }
+}
+
 #[derive(Default)]
 struct Inner {
     /// free ranges: offset → length (coalesced)
@@ -606,6 +688,7 @@ impl Uma {
         let used = (Self::tracing() && size >= 1 << 20).then_some(g.used_bytes);
         drop(g);
         let p = (self.base + at) as *mut u8;
+        note_event(p as usize, size, false, std::panic::Location::caller());
         if let Some(used) = used {
             self.trace(size, Some(p as usize), used);
         }
@@ -624,6 +707,7 @@ impl Uma {
     }
 
     /// Release a block from `alloc` (false: not one of ours).
+    #[track_caller]
     pub fn free(&self, p: usize) -> bool {
         if !self.is_committed(p) {
             return false;
@@ -639,6 +723,7 @@ impl Uma {
         let mut g = self.inner.lock().unwrap();
         let off = p - self.base;
         let Some(orig) = g.used.remove(&off) else { return false };
+        note_event(p, orig, true, std::panic::Location::caller());
         g.used_bytes -= orig;
         g.reserved.remove(&off);
         let (mut start, mut len) = (off, orig);

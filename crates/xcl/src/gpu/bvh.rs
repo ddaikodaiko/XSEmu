@@ -244,8 +244,7 @@ fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
-/// Möller–Trumbore as the triangle node returns it: (t·det, det, i·det, j·det), `None` = miss
-pub fn triangle_hit(v: &Triangle, o: [f32; 3], d: [f32; 3]) -> Option<[f32; 4]> {
+fn triangle_intersection(v: &Triangle, o: [f32; 3], d: [f32; 3]) -> ([f32; 4], bool) {
     let (e1, e2) = (sub(v[1], v[0]), sub(v[2], v[0]));
     let p = cross(d, e2);
     let det = dot(e1, p);
@@ -253,11 +252,17 @@ pub fn triangle_hit(v: &Triangle, o: [f32; 3], d: [f32; 3]) -> Option<[f32; 4]> 
     let q = cross(sv, e1);
     let (i, j, t) = (dot(sv, p), dot(d, q), dot(e2, q));
     let hit = if det > 0.0 {
-        i >= 0.0 && j >= 0.0 && i + j <= det
+        t >= 0.0 && i >= 0.0 && j >= 0.0 && i + j <= det
     } else {
-        det < 0.0 && i <= 0.0 && j <= 0.0 && i + j >= det
+        det < 0.0 && t <= 0.0 && i <= 0.0 && j <= 0.0 && i + j >= det
     };
-    hit.then_some([t, det, i, j])
+    ([t, det, i, j], hit)
+}
+
+/// Möller–Trumbore as the triangle node returns it: (t·det, det, i·det, j·det), `None` = miss
+pub fn triangle_hit(v: &Triangle, o: [f32; 3], d: [f32; 3]) -> Option<[f32; 4]> {
+    let (numerators, hit) = triangle_intersection(v, o, d);
+    hit.then_some(numerators)
 }
 
 fn word(data: &[u8], at: usize) -> u32 {
@@ -281,14 +286,14 @@ fn half(h: u32) -> f32 {
 }
 
 /// One `image_bvh_intersect_ray` on the CPU, same results as the HLSL emulation: box32 /
-/// box16 → child ids hit within `tmax` (closest first when `sort`), triangle → (t·det, det,
-/// I·det, J·det) bits (barycentrics in the original vertex order) or (inf, 1, 0, 0); other
-/// types → 0xFFFFFFFF ×4.
-pub fn intersect_node(data: &[u8], node: u32, tmax: f32, o: [f32; 3], d: [f32; 3], inv: [f32; 3], sort: bool) -> [u32; 4] {
+/// box16 → child ids hit within the grown interval, triangle → (t·det, det, I·det, J·det)
+/// bits with remapped barycentrics; other types → 0xFFFFFFFF ×4.
+pub(crate) fn intersect_node(data: &[u8], node: u32, tmax: f32, o: [f32; 3], d: [f32; 3], inv: [f32; 3], opts: NodeOptions) -> [u32; 4] {
     let at = node_at(node);
     match node & 7 {
         4 | BOX32 => {
             let mut hits = [(f32::INFINITY, INVALID); 4];
+            let grow = 1.0 + f32::from(opts.box_grow) * 5.960464477539063e-8_f32;
             for (k, h) in hits.iter_mut().enumerate() {
                 let child = word(data, at + 4 * k);
                 let (mn, mx) = if node & 7 == BOX32 {
@@ -297,29 +302,25 @@ pub fn intersect_node(data: &[u8], node: u32, tmax: f32, o: [f32; 3], d: [f32; 3
                     let w = [0, 1, 2].map(|j| word(data, at + 16 + 12 * k + 4 * j));
                     ([half(w[0]), half(w[0] >> 16), half(w[1])], [half(w[1] >> 16), half(w[2]), half(w[2] >> 16)])
                 };
-                let valid = child != INVALID && (0..3).all(|a| mn[a] <= mx[a]);
-                let (mut a, mut b) = (f32::NEG_INFINITY, f32::INFINITY);
+                let (mut a, mut b) = (f32::NAN, f32::NAN);
                 for axis in 0..3 {
-                    let (lo, hi) = if inv[axis].is_infinite() {
-                        if o[axis] >= mn[axis] && o[axis] <= mx[axis] {
-                            (f32::NEG_INFINITY, f32::INFINITY)
-                        } else {
-                            (f32::INFINITY, f32::NEG_INFINITY)
-                        }
+                    let t1 = (mn[axis] - o[axis]) * inv[axis];
+                    let t2 = (mx[axis] - o[axis]) * inv[axis];
+                    let (lo, hi) = if inv[axis].is_sign_negative() {
+                        (t2, t1)
                     } else {
-                        let t1 = (mn[axis] - o[axis]) * inv[axis];
-                        let t2 = (mx[axis] - o[axis]) * inv[axis];
-                        (t1.min(t2), t1.max(t2))
+                        (t1, t2)
                     };
                     a = a.max(lo);
                     b = b.min(hi);
                 }
-                if valid && a <= b && b >= 0.0 && a <= tmax {
-                    *h = (a, child);
+                let entry = a.max(0.0);
+                if child != INVALID && !a.is_nan() && !b.is_nan() && !tmax.is_nan() && entry <= b.min(tmax) * grow {
+                    *h = (entry, child);
                 }
             }
-            if sort {
-                for (i, j) in [(0, 1), (2, 3), (0, 2), (1, 3), (1, 2)] {
+            if opts.sort {
+                for (i, j) in [(0, 2), (1, 3), (0, 1), (2, 3), (1, 2)] {
                     if hits[j].0 < hits[i].0 {
                         hits.swap(i, j);
                     }
@@ -329,18 +330,31 @@ pub fn intersect_node(data: &[u8], node: u32, tmax: f32, o: [f32; 3], d: [f32; 3
         }
         0..=3 => {
             let ty = node & 7;
-            let v = if ty == 1 { [vec3(data, at + 12), vec3(data, at + 36), vec3(data, at + 24)] } else { [vec3(data, at), vec3(data, at + 12), vec3(data, at + 24)] };
-            match triangle_hit(&v, o, d) {
-                Some([t, det, i, j]) => {
-                    let bc = [det - i - j, i, j, 0.0];
-                    let id = word(data, at + 60) >> (8 * ty);
-                    [t, det, bc[(id & 3) as usize], bc[((id >> 2) & 3) as usize]].map(f32::to_bits)
-                }
-                None => [f32::INFINITY.to_bits(), 1.0f32.to_bits(), 0, 0],
+            let offsets = [[0, 12, 24], [12, 36, 24], [24, 36, 48], [24, 48, 0]];
+            let v = offsets[ty as usize].map(|off| vec3(data, at + off));
+            let miss = [f32::INFINITY.to_bits(), 1.0f32.to_bits(), 0, 0];
+            if opts.bary_mode && (tmax.is_nan() || !o.into_iter().all(f32::is_finite) || d.into_iter().chain(inv).any(f32::is_nan)) {
+                return miss;
             }
+            let ([t, det, i, j], hit) = triangle_intersection(&v, o, d);
+            let t = if hit { t } else if opts.bary_mode && det != 0.0 && [t, det, i, j].into_iter().all(f32::is_finite) {
+                f32::INFINITY.copysign(det)
+            } else {
+                return miss;
+            };
+            let bc = [det - i - j, i, j, det - i - j];
+            let id = word(data, at + 60) >> (8 * ty);
+            [t, det, bc[(id & 3) as usize], bc[((id >> 2) & 3) as usize]].map(f32::to_bits)
         }
         _ => [INVALID; 4],
     }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct NodeOptions {
+    pub sort: bool,
+    pub box_grow: u8,
+    pub bary_mode: bool,
 }
 
 /// closest hit (t, primitive, instance id) below `root`; instance nodes go to `instance`
@@ -361,7 +375,7 @@ fn closest(data: &[u8], root: u32, o: [f32; 3], d: [f32; 3], tmax: f32, instance
             }
             4 | BOX32 => {
                 // closest child popped first
-                let r = intersect_node(data, n, limit, o, d, inv, true);
+                let r = intersect_node(data, n, limit, o, d, inv, NodeOptions { sort: true, ..Default::default() });
                 stack.extend(r.iter().rev().filter(|&&c| c != INVALID));
             }
             0..=3 => {
@@ -369,7 +383,7 @@ fn closest(data: &[u8], root: u32, o: [f32; 3], d: [f32; 3], tmax: f32, instance
                 if n & 7 == 0 && word(data, node_at(n) + 48) & 0x80 != 0 {
                     stack.push(n | 1);
                 }
-                let r = intersect_node(data, n, limit, o, d, inv, true).map(f32::from_bits);
+                let r = intersect_node(data, n, limit, o, d, inv, NodeOptions::default()).map(f32::from_bits);
                 let t = r[0] / r[1];
                 if r[0] != f32::INFINITY && t >= 0.0 && t < limit {
                     best = Some((t, word(data, node_at(n) + if n & 7 == 1 { 56 } else { 52 }), 0));
@@ -416,6 +430,71 @@ impl Bvh {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    pub const TRIANGLE_VERTICES: [[f32; 3]; 5] = [
+        [0.0, 0.0, 8.0], [4.0, 0.0, 8.0], [0.0, 4.0, 8.0], [4.0, 4.0, 8.0], [-4.0, 6.0, 8.0],
+    ];
+    pub const TRIANGLE_REMAP: u32 = u32::from_le_bytes([0x09, 0x02, 0x07, 0x0D]);
+
+    pub fn triangle_ray(ty: usize, ray: usize) -> ([f32; 3], [f32; 3], f32, [f32; 2]) {
+        let xy = [[0.5, 1.5], [2.5, 2.0], [-1.0, 4.75], [-0.5, 2.75]][ty];
+        let ij = [[0.125, 0.375], [0.375, 0.5], [0.5, 0.125], [0.125, 0.5]][ty];
+        let (t, sign) = [(4.0, 1.0), (4.0, -1.0), (-4.0, 1.0), (-4.0, -1.0), (0.0, 1.0)][ray];
+        let d = [0.5, -0.25, 2.0].map(|x| x * sign);
+        ([xy[0] - t * d[0], xy[1] - t * d[1], 8.0 - t * d[2]], d, t, ij)
+    }
+
+    #[test]
+    fn raw_triangle_types_remap_and_forward_ray() {
+        let mut node = [0u8; 64];
+        for (k, v) in TRIANGLE_VERTICES.iter().enumerate() {
+            put(&mut node, 12 * k, &v.map(f32::to_bits));
+        }
+        put(&mut node, 60, &[TRIANGLE_REMAP]);
+        for ty in 0..4 {
+            for ray in 0..5 {
+                let (o, d, t, [i, j]) = triangle_ray(ty, ray);
+                let inv = d.map(|x| 1.0 / x);
+                let r = intersect_node(&node, ty as u32, 1.0, o, d, inv, NodeOptions { bary_mode: true, ..Default::default() }).map(f32::from_bits);
+                assert_eq!(r[1].is_sign_negative(), d[2] > 0.0);
+                assert_eq!([r[2] / r[1], r[3] / r[1]], [i, j]);
+                if t < 0.0 {
+                    assert_eq!(r[0], f32::INFINITY.copysign(r[1]), "type {ty}, ray {ray}");
+                    assert_eq!(intersect_node(&node, ty as u32, 1.0, o, d, inv, NodeOptions::default()), [f32::INFINITY.to_bits(), 1.0f32.to_bits(), 0, 0]);
+                } else {
+                    assert_eq!(r[0] / r[1], t, "type {ty}, ray {ray}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn box_sort_ties_and_negative_extent() {
+        let mut node = [0u8; 128];
+        let ids = [8, 16, 24, 32];
+        put(&mut node, 0, &ids);
+        for (k, z) in [6.0f32, -2.0, -2.0, 18.0].into_iter().enumerate() {
+            put(&mut node, 16 + 24 * k, &[-16.0, -16.0, z, 16.0, 16.0, z + 8.0].map(f32::to_bits));
+        }
+        let query = |extent, sort| intersect_node(&node, BOX32, extent, [0.0; 3], [0.5, -0.25, 2.0], [2.0, -4.0, 0.5], NodeOptions { sort, ..Default::default() });
+        assert_eq!(query(4.0, true), [24, 16, 8, INVALID]);
+        assert_eq!(query(4.0, false), [8, 16, 24, INVALID]);
+        assert_eq!(query(-0.5, true), [INVALID; 4]);
+        put(&mut node, 16 + 24, &[-16.0f32, -16.0, -4.0].map(f32::to_bits));
+        assert_eq!(intersect_node(&node, BOX32, 4.0, [0.0; 3], [0.5, -0.25, 2.0], [2.0, -4.0, 0.5], NodeOptions { sort: true, ..Default::default() }), [24, 16, 8, INVALID]);
+    }
+
+    #[test]
+    fn box_growth_applies_after_clipping_ray_extent() {
+        let mut node = [0u8; 128];
+        put(&mut node, 0, &[8, INVALID, INVALID, INVALID]);
+        put(&mut node, 16, &[-1.0f32, -1.0, 2.0, 1.0, 1.0, 4.0].map(f32::to_bits));
+        let query = |tmax, box_grow| intersect_node(&node, BOX32, tmax, [0.0; 3], [0.0, 0.0, 1.0], [f32::INFINITY, f32::INFINITY, 1.0], NodeOptions { box_grow, ..Default::default() });
+        let near = 2.0f32.to_bits();
+        assert_eq!(query(f32::from_bits(near - 1), 0), [INVALID; 4]);
+        assert_eq!(query(f32::from_bits(near - 1), 6), [8, INVALID, INVALID, INVALID]);
+        assert_eq!(query(f32::from_bits(near - 16), 6), [INVALID; 4]);
+    }
 
     pub fn rng(seed: u64) -> impl FnMut(f32, f32) -> f32 {
         let mut s = seed;
@@ -596,7 +675,7 @@ pub(crate) mod tests {
         let box_f = |mn: [f32; 3], mx: [f32; 3]| [mn[0], mn[1], mn[2], mx[0], mx[1], mx[2]].map(f32::to_bits);
         // child 0: normal box [-1..1, -1..1, 5..6]; ray origin lies right on x = -1.0 with dx = 0
         put(&mut data, 16, &box_f([-1.0, -1.0, 5.0], [1.0, 1.0, 6.0]));
-        // child 1: NaN-disabled box (GPURT convention)
+        // child 1: a single NaN plane leaves that side open
         put(&mut data, 40, &box_f([f32::NAN, -1.0, 2.0], [1.0, 1.0, 3.0]));
         // child 2: inverted empty box (mn.x > mx.x)
         put(&mut data, 64, &box_f([2.0, -1.0, 2.0], [-2.0, 1.0, 3.0]));
@@ -606,8 +685,10 @@ pub(crate) mod tests {
         let o = [-1.0, 0.0, 0.0];
         let d = [0.0, 0.0, 1.0];
         let inv = [f32::INFINITY, f32::INFINITY, 1.0];
-        let got = intersect_node(&data, BOX32, 100.0, o, d, inv, true);
-        assert_eq!(got, [c0, INVALID, INVALID, INVALID]);
+        let opts = NodeOptions { sort: true, ..Default::default() };
+        assert_eq!(intersect_node(&data, BOX32, 100.0, o, d, inv, opts), [c1, c0, INVALID, INVALID]);
+        put(&mut data, 40, &box_f([f32::NAN; 3], [1.0, 1.0, 3.0]));
+        assert_eq!(intersect_node(&data, BOX32, 100.0, o, d, inv, opts), [c0, INVALID, INVALID, INVALID]);
     }
 
     #[test]

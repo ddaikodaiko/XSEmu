@@ -257,6 +257,10 @@ unsafe fn commit_sparse(a: usize, n: usize, p: u32) -> *mut c_void {
 }
 
 pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: u32, p: u32) -> *mut c_void {
+    virtual_alloc(addr, size, t, p, None)
+}
+
+unsafe fn virtual_alloc(addr: *const c_void, size: usize, t: u32, p: u32, gdk: Option<physical::RawGdk64>) -> *mut c_void {
     if let Some(q) = placeholders::alloc(addr, size, t, sanitize_protect(p)) {
         trace_mem("VirtualAlloc (placeholder)", addr as usize, size, t as u64, p, q as usize);
         return q;
@@ -291,7 +295,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
     // the title's other reservations of 64 KiB pages: placeholders, so the physical pages it maps
     // there are views of the pages themselves (`physical`; off with XCL_PAGE_VIEWS=0: copies)
     if title_64k_reservation && t & mem::MEM_COMMIT == 0 && page_views() {
-        if let Some(q) = physical::reserve(size) {
+        if let Some(q) = physical::reserve_compat(size, gdk) {
             mirrors::reserved(q, size, t, p);
             trace_mem("VirtualAlloc (64K pages, placeholders)", 0, size, t as u64, p, q);
             return q as *mut c_void;
@@ -857,12 +861,21 @@ pub unsafe fn runtime_free(p: usize, attrs: u64) {
 /// DWORD protect)`: VirtualAlloc with an allocator's attributes – a graphics memory type is
 /// GPU-visible memory (as MEM_GRAPHICS: sparse VRAM pool).
 pub unsafe extern "system" fn XMemVirtualAlloc(addr: *const c_void, size: usize, t: u32, attrs: u64, p: u32) -> *mut c_void {
+    if let Some(q) = physical::gdk_reserve(addr, size, t, attrs, p) {
+        if !q.is_null() {
+            mirrors::reserved(q as usize, size, t, p);
+        }
+        return q;
+    }
     let a = XAllocAttrs::decode(attrs);
+    let gdk = (t & MEM_64K_PAGES == MEM_64K_PAGES).then_some(physical::RawGdk64 {
+        requested: addr as usize, requested_size: size, allocation: t, flags: attrs, protection: p,
+    });
     let mut t = if a.memory_type != 0 { t | MEM_GRAPHICS } else { t };
     if a.memory_type != 0 && a.page_size == 2 {
         t |= 0x8000_0000;
     }
-    VirtualAlloc(addr, size, t, p)
+    virtual_alloc(addr, size, t, p, gdk)
 }
 
 /// `BOOL XMemVirtualQuery(HANDLE process, const void* address, XMEM_BASIC_INFORMATION* info)`

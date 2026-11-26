@@ -25,9 +25,13 @@
 //! Without the shared heap (it could not be made) a heap keeps its own PC heap: SRV at 2k,
 //! UAV at 2k + 1.
 
+pub(crate) mod vsharp;
+use vsharp::Writer;
 use std::sync::Mutex;
 
 use windows::Win32::Graphics::Direct3D12::*;
+
+use super::material_gate_views::{self, Key, NativeView};
 
 /// bytes of a CBV/SRV/UAV slot (T# / V#) and of a sampler slot (S#)
 pub const SLOT: u32 = 32;
@@ -45,6 +49,7 @@ enum Memory {
 }
 
 struct Heap {
+    stamp: u64,
     obj: usize,
     shadow: usize,
     n: u32,
@@ -333,7 +338,13 @@ pub fn register(obj: usize, n: u32, pc_cpu: u64, pc_gpu: u64, inc: u32, sampler:
         }
     }
     let pages = if shared && !sampler && GLOBAL.lock().unwrap().is_some() { vec![UNMAPPED; n.div_ceil(PAGE_SLOTS).max(1) as usize] } else { Vec::new() };
-    HEAPS.lock().unwrap().push(Heap { obj, shadow: p as usize, n, pc_cpu, pc_gpu, inc, sampler, pages, visible, memory });
+    static STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let stamp = if vsharp::enabled() { STAMP.fetch_add(1,std::sync::atomic::Ordering::Relaxed)+1 } else {0};
+    HEAPS.lock().unwrap().push(Heap { stamp, obj, shadow: p as usize, n, pc_cpu, pc_gpu, inc, sampler, pages, visible, memory });
+    if !sampler && n != 0 && super::depth_lineage::enabled() {
+        LINEAGE_UAVS.lock().unwrap().get_or_insert_with(Default::default)
+            .heaps.insert(p as usize, p as usize + n as usize * SLOT as usize);
+    }
     true
 }
 
@@ -341,9 +352,22 @@ pub fn register(obj: usize, n: u32, pc_cpu: u64, pc_gpu: u64, inc: u32, sampler:
 pub fn unregister(obj: usize) {
     let gone = {
         let mut heaps = HEAPS.lock().unwrap();
-        heaps.iter().position(|h| h.obj == obj).map(|i| heaps.swap_remove(i))
+        let gone = heaps.iter().position(|h| h.obj == obj).map(|i| heaps.swap_remove(i));
+        if let Some(h)=gone.as_ref().filter(|h|!h.sampler) { vsharp::forget(h.shadow..h.shadow+h.n as usize*SLOT as usize); }
+        if let Some(h) = gone.as_ref().filter(|h| !h.sampler && material_gate_views::enabled()) {
+            material_gate_views::forget_heap(h.shadow..h.shadow + h.n as usize * SLOT as usize,
+                h.pages.iter().enumerate().filter(|&(_, &f)| f != UNMAPPED).map(|(p, &f)| (f, page_descriptors(h.n, p as u32))));
+        }
+        gone
     };
     if let Some(h) = gone {
+        if !h.sampler && super::depth_lineage::enabled() {
+            if let Some(uavs) = LINEAGE_UAVS.lock().unwrap().as_mut() {
+                if let Some(end) = uavs.heaps.remove(&h.shadow) {
+                    uavs.forget(|at, _| (h.shadow..end).contains(&at));
+                }
+            }
+        }
         if let Some(res) = RES.lock().unwrap().as_mut() {
             res.forget(h.shadow..h.shadow + h.n as usize * h.slot_bytes() as usize);
         }
@@ -439,7 +463,19 @@ pub unsafe fn publish_range(first: &Slot, n: u32) {
 struct ViewOwners {
     by_slot: std::collections::HashMap<usize, usize>,
     by_shared_index: std::collections::HashMap<u32, (usize, usize)>,
+    native_srvs: std::collections::HashMap<usize, NativeSrv>,
+    native_uavs: std::collections::HashMap<usize, NativeUav>,
 }
+
+#[derive(Clone, Copy)]
+pub(super) struct NativeUav {
+    pub resource: usize,
+    pub view: (i32, i32),
+    pub backing: (u64, u32, u16, i32, i32, i32),
+    pub volume: Option<(u32, u32, u32)>,
+}
+
+pub(super) type NativeSrv = (usize, i32, i32, i32, i32, i32);
 
 impl ViewOwners {
     fn note(&mut self, s: &Slot, res: usize) {
@@ -459,6 +495,8 @@ impl ViewOwners {
     fn forget(&mut self, slots: std::ops::Range<usize>) {
         self.by_slot.retain(|at, _| !slots.contains(at));
         self.by_shared_index.retain(|_, (at, _)| !slots.contains(at));
+        self.native_srvs.retain(|at, _| !slots.contains(at));
+        self.native_uavs.retain(|at, _| !slots.contains(at));
     }
 
     fn shared_owner(&self, index: u32) -> Option<usize> {
@@ -494,8 +532,144 @@ pub(super) fn image_resource_at(addr32: u32, index: u32) -> Option<usize> {
     resource_at(s.at)
 }
 
+pub(super) fn note_native_srv(s: &Slot, srv: Option<NativeSrv>) {
+    let mut guard = RES.lock().unwrap();
+    let owners = guard.get_or_insert_with(Default::default);
+    if let Some(srv) = srv {
+        owners.native_srvs.insert(s.at, srv);
+    } else {
+        owners.native_srvs.remove(&s.at);
+    }
+}
+
+pub(super) fn native_srv_at(addr32: u32, index: u32) -> Option<NativeSrv> {
+    native_view_at(addr32, index, |owners, at| owners.native_srvs.get(&at).copied())
+}
+
+pub(super) fn note_native_uav(s: &Slot, resource: Option<NativeUav>) {
+    let mut guard = RES.lock().unwrap();
+    let owners = guard.get_or_insert_with(Default::default);
+    if let Some(resource) = resource {
+        owners.native_uavs.insert(s.at, resource);
+    } else {
+        owners.native_uavs.remove(&s.at);
+    }
+}
+
+pub(super) fn native_uav_at(addr32: u32, index: u32) -> Option<usize> {
+    native_uav_details_at(addr32, index).map(|v| v.resource)
+}
+
+pub(super) fn native_uav_details_at(addr32: u32, index: u32) -> Option<NativeUav> {
+    native_view_at(addr32, index, |owners, at| owners.native_uavs.get(&at).copied())
+}
+
+fn native_view_at<T>(addr32: u32, index: u32, get: impl FnOnce(&ViewOwners, usize) -> Option<T>) -> Option<T> {
+    let shared = GLOBAL.lock().unwrap().is_some();
+    if shared {
+        let guard = RES.lock().unwrap();
+        let owners = guard.as_ref()?;
+        let &(at, _) = owners.by_shared_index.get(&index)?;
+        return get(owners, at);
+    }
+    let u = crate::gpu::uma::get()?;
+    let s = slot((u.base() + addr32 as usize) as u64)?;
+    if s.sampler || s.index != index {
+        return None;
+    }
+    get(RES.lock().unwrap().as_ref()?, s.at)
+}
+
+type LineageUav = super::device_x::LineageUav;
+
+#[derive(Default)]
+struct LineageUavs {
+    heaps: std::collections::BTreeMap<usize, usize>,
+    by_slot: std::collections::HashMap<usize, ([u32; 8], LineageUav, Option<u32>)>,
+    by_index: std::collections::HashMap<u32, usize>,
+}
+
+impl LineageUavs {
+    fn forget(&mut self, mut forget: impl FnMut(usize, LineageUav) -> bool) {
+        self.by_slot.retain(|&at, &mut (_, uav, _)| !forget(at, uav));
+        let by_slot = &self.by_slot;
+        self.by_index.retain(|_, at| by_slot.contains_key(at));
+    }
+}
+
+static LINEAGE_UAVS: Mutex<Option<LineageUavs>> = Mutex::new(None);
+
+pub(super) fn forget_lineage_uav_resource(resource: usize) {
+    if let Some(uavs) = LINEAGE_UAVS.lock().unwrap().as_mut() {
+        uavs.forget(|_, uav| uav.owner == resource || uav.shadow == Some(resource));
+    }
+}
+
+pub(super) fn has_lineage_uavs() -> bool {
+    LINEAGE_UAVS.lock().unwrap().as_ref().is_some_and(|uavs| !uavs.by_index.is_empty())
+}
+
+pub(super) fn lineage_uavs_in_table(table: u32, first: u32, count: u32) -> Vec<(u32, u32, LineageUav)> {
+    let Some(u) = crate::gpu::uma::get() else { return Vec::new() };
+    let Some(start) = first.checked_mul(SLOT).and_then(|off| table.checked_add(off)).and_then(|off| u.base().checked_add(off as usize)) else {
+        return Vec::new();
+    };
+    let uavs = LINEAGE_UAVS.lock().unwrap();
+    let Some(uavs) = uavs.as_ref() else { return Vec::new() };
+    let Some((&base, &end)) = uavs.heaps.range(..=start).next_back() else {
+        return Vec::new();
+    };
+    if start >= end || (start - base) % SLOT as usize != 0 {
+        return Vec::new();
+    }
+    let count = count.min(((end - start) / SLOT as usize) as u32);
+    if count == 0 || !crate::gpu::shader::readable(start, count as usize * SLOT as usize) {
+        return Vec::new();
+    }
+    (0..count).filter_map(|i| {
+        let at = start + i as usize * SLOT as usize;
+        let words = unsafe { (at as *const [u32; 8]).read_unaligned() };
+        if words[3] >> 28 < 8 {
+            return None;
+        }
+        let source_at = uavs.by_index.get(&words[0])?;
+        let &(expected, uav, index) = uavs.by_slot.get(source_at)?;
+        (index == Some(words[0]) && expected == words).then_some((first + i, words[0], uav))
+    }).collect()
+}
+
 pub fn write(s: &Slot, words: &[u32]) {
+    write_view(s, words, None, None);
+}
+
+pub(super) fn write_view(s: &Slot, words: &[u32], view: Option<LineageUav>, native: Option<NativeView>) {
+    write_observed(s,words,view,native,Writer::Other)
+}
+
+pub(super) fn write_observed(s: &Slot, words: &[u32], view: Option<LineageUav>, native: Option<NativeView>, writer: Writer) {
+    if !s.sampler && vsharp::enabled() {vsharp::written(s.at,words,writer);}
     let n = words.len().min(if s.sampler { 4 } else { 8 });
+    if !s.sampler && material_gate_views::enabled() {
+        material_gate_views::note(s, words, native);
+    }
+    if !s.sampler && super::depth_lineage::enabled() {
+        let mut g = LINEAGE_UAVS.lock().unwrap();
+        if let Some(uavs) = g.as_mut() {
+            if let Some((_, _, Some(index))) = uavs.by_slot.remove(&s.at) {
+                uavs.by_index.remove(&index);
+            }
+        }
+        if let Some((view, words)) = view.zip(<[u32; 8]>::try_from(words).ok()).filter(|(_, w)| w[3] >> 28 >= 8) {
+            let uavs = g.get_or_insert_with(Default::default);
+            let index = (s.shared_srv != 0).then_some(s.index);
+            uavs.by_slot.insert(s.at, (words, view, index));
+            if let Some(index) = index {
+                uavs.by_index.insert(index, s.at);
+            }
+        }
+        unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), s.at as *mut u32, n) };
+        return;
+    }
     unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), s.at as *mut u32, n) };
 }
 
@@ -506,14 +680,32 @@ pub fn copy_words(src: &Slot, dst: &Slot) {
     let n = if src.sampler { 4 } else { 8 };
     let mut w = [0u32; 8];
     unsafe { std::ptr::copy_nonoverlapping(src.at as *const u32, w.as_mut_ptr(), n) };
+    let lineage = if !src.sampler && super::depth_lineage::enabled() {
+        LINEAGE_UAVS.lock().unwrap().as_ref().and_then(|uavs| uavs.by_slot.get(&src.at))
+            .and_then(|&(words, uav, _)| (w == words).then_some(uav))
+    } else {
+        None
+    };
+    let native = if !src.sampler && material_gate_views::enabled() {
+        material_gate_views::copied(src, &w)
+    } else {
+        None
+    };
     if src.sampler {
         w[3] = (w[3] & !0xFFF) | (dst.index & 0xFFF);
     } else if w[3] >> 28 >= 8 {
         w[0] = dst.index;
     }
-    write(dst, &w[..n]);
+    write_observed(dst, &w[..n], lineage, native,Writer::Copy(src.at));
     if !src.sampler {
         note_resource(dst, resource_at(src.at).unwrap_or(0));
+        if super::present::native_view_trace_configured() {
+            let (srv, uav) = RES.lock().unwrap().as_ref().map_or((None, None), |owners| {
+                (owners.native_srvs.get(&src.at).copied(), owners.native_uavs.get(&src.at).copied())
+            });
+            note_native_srv(dst, srv);
+            note_native_uav(dst, uav);
+        }
     }
 }
 
@@ -587,6 +779,27 @@ pub fn words_at(addr32: u32) -> Option<[u32; 8]> {
     let mut w = [0u32; 8];
     unsafe { std::ptr::copy_nonoverlapping(s.at as *const u32, w.as_mut_ptr(), if s.sampler { 4 } else { 8 }) };
     Some(w)
+}
+
+pub(super) fn material_input(table: u32, offset: u32) -> Option<(u32, [u32; 8], Option<Key>)> {
+    let u = crate::gpu::uma::get()?;
+    let addr = table.checked_add(offset)?;
+    let base = u.base().checked_add(table as usize)?;
+    let at = u.base().checked_add(addr as usize)?;
+    let heaps = HEAPS.lock().unwrap();
+    let h = heaps.iter().find(|h| !h.sampler && base >= h.shadow && at >= base
+        && (base - h.shadow) % SLOT as usize == 0 && (at - h.shadow) / (SLOT as usize) < h.n as usize)?;
+    if offset % SLOT != 0 || !crate::gpu::shader::readable(at, SLOT as usize) {
+        return None;
+    }
+    let words = unsafe { (at as *const [u32; 8]).read_unaligned() };
+    let key = if GLOBAL.lock().unwrap().is_some() {
+        Some(Key::Shared(words[0]))
+    } else {
+        let k = ((at - h.shadow) / SLOT as usize) as u32;
+        (h.visible && words[0] == 2 * k).then_some(Key::Local(at))
+    };
+    Some((addr, words, key))
 }
 
 #[cfg(test)]

@@ -324,6 +324,20 @@ fn clear_dynamic_depth_bias(d: &mut [u8; GFX_DESC]) {
     d[PSO_FLAGS..PSO_FLAGS + 4].copy_from_slice(&flags.to_le_bytes());
 }
 
+static LINEAGE_DEPTH_WRITE_PSOS: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+
+pub(super) fn note_lineage_depth_pso(pso: usize, enabled: bool, mask: D3D12_DEPTH_WRITE_MASK, func: D3D12_COMPARISON_FUNC) {
+    if super::depth_lineage::enabled() && pso != 0 && enabled
+        && mask == D3D12_DEPTH_WRITE_MASK_ALL && func != D3D12_COMPARISON_FUNC_NEVER
+    {
+        LINEAGE_DEPTH_WRITE_PSOS.lock().unwrap().get_or_insert_with(Default::default).insert(pso);
+    }
+}
+
+pub(super) fn lineage_depth_pso(pso: usize) -> bool {
+    LINEAGE_DEPTH_WRITE_PSOS.lock().unwrap().as_ref().is_some_and(|psos| psos.contains(&pso))
+}
+
 /// A graphics pipeline desc as bytes, aligned like the struct for the runtime's reads.
 #[repr(C, align(8))]
 #[derive(Clone, Copy)]
@@ -437,6 +451,11 @@ pub(super) fn register_test_base(pso: usize, dynamic_depth_bias: bool, static_bi
 
 /// A pipeline released for good is no longer a base; its cached depth-bias variants go with it.
 pub(super) fn forget_base(pso: usize) {
+    if super::depth_lineage::enabled() {
+        if let Some(psos) = LINEAGE_DEPTH_WRITE_PSOS.lock().unwrap().as_mut() {
+            psos.remove(&pso);
+        }
+    }
     if let Some(m) = BASES.lock().unwrap().as_mut() {
         m.remove(&pso);
     }
@@ -775,6 +794,80 @@ pub fn pc_shader_view_format(resource: u32, view: u32) -> u32 {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct LineageUav {
+    pub owner: usize,
+    pub range: super::depth_state::Range,
+    pub shadow: Option<usize>,
+    pub requested_format: i32,
+    pub native_format: i32,
+    pub plane: u32,
+}
+
+pub(super) unsafe fn lineage_uav(
+    owner: usize, rd: &D3D12_RESOURCE_DESC, requested: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>,
+    shadow: Option<(usize, i32)>,
+) -> Option<LineageUav> {
+    if !matches!(rd.Dimension, D3D12_RESOURCE_DIMENSION_TEXTURE1D | D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+        || !rd.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+        || rd.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+    {
+        return None;
+    }
+    let mips = u32::from(rd.MipLevels);
+    let slices = u32::from(rd.DepthOrArraySize);
+    let planes = if matches!(rd.Format.0, 19..=22 | 44..=47) { 2 } else { 1 };
+    let (mip, first, count, mut plane) = match requested {
+        Some(d) => match d.ViewDimension {
+            D3D12_UAV_DIMENSION_TEXTURE1D if rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D =>
+                (d.Anonymous.Texture1D.MipSlice, 0, 1, 0),
+            D3D12_UAV_DIMENSION_TEXTURE1DARRAY if rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D => {
+                let a = d.Anonymous.Texture1DArray;
+                (a.MipSlice, a.FirstArraySlice, a.ArraySize, 0)
+            }
+            D3D12_UAV_DIMENSION_TEXTURE2D if rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D => {
+                let a = d.Anonymous.Texture2D;
+                (a.MipSlice, 0, 1, a.PlaneSlice)
+            }
+            D3D12_UAV_DIMENSION_TEXTURE2DARRAY if rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D => {
+                let a = d.Anonymous.Texture2DArray;
+                (a.MipSlice, a.FirstArraySlice, a.ArraySize, a.PlaneSlice)
+            }
+            _ => return None,
+        },
+        None => (0, 0, slices, 0),
+    };
+    let requested_format = requested.map_or(rd.Format.0, |d| d.Format.0);
+    if planes == 2 && matches!(requested_format, 22 | 47 | 61 | 62) {
+        plane = 1;
+    }
+    let range = super::depth_state::Range::texture(
+        D3D12_BARRIER_SUBRESOURCE_RANGE {
+            IndexOrFirstMipLevel: mip, NumMipLevels: 1,
+            FirstArraySlice: first, NumArraySlices: count,
+            FirstPlane: plane, NumPlanes: 1,
+        },
+        mips, slices, planes,
+    )?;
+    Some(LineageUav { owner, range, shadow: shadow.map(|s| s.0), requested_format, native_format: shadow.map_or(0, |s| s.1), plane })
+}
+
+pub(super) fn note_depth_resource_created(owner: usize, flags: D3D12_RESOURCE_FLAGS, detail: impl FnOnce() -> String) {
+    if owner != 0 && flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) && super::depth_lineage::enabled()
+        && !super::depth_lineage::interested(owner)
+    {
+        super::depth_lineage::watch(owner);
+        super::depth_lineage::note(owner, 0, super::depth_state::Range::All, "resource-created", detail);
+    }
+}
+
+pub(super) fn watch_depth_first_view(owner: usize, view: &'static str) {
+    if owner != 0 && super::depth_lineage::enabled() && !super::depth_lineage::interested(owner) {
+        super::depth_lineage::watch(owner);
+        super::depth_lineage::note(owner, 0, super::depth_state::Range::All, "first-view", || format!("view={view} creation not observed"));
+    }
+}
+
 /// Whether a shader view in `pc_shader_view_format`'s format reads the stencil (plane 1 on the PC).
 pub fn stencil_view(resource: u32, view: u32) -> bool {
     matches!((resource, view), (19..=22, 22) | (44..=47, 47))
@@ -937,8 +1030,17 @@ pub(super) unsafe extern "system" fn create_placed_resource_layout_x(
             note_alias(va as usize, &x);
             let mut clear_buf = D3D12_CLEAR_VALUE::default();
             let clear = pc_clear(clear, &mut clear_buf, Some((&x, &d)));
-            super::vram::place(this, va as usize, &pc, super::vram::TextureInitial::Undefined, clear, None, riid, ppv).unwrap_or(E_NOTIMPL)
+            let hr = super::vram::place(this, va as usize, &pc, super::vram::TextureInitial::Undefined, clear, None, riid, ppv).unwrap_or(E_NOTIMPL);
+            if hr >= 0 {
+                note_depth_resource_created(*ppv as usize, pc.Flags, || format!(
+                    "route=console_placed_layout_vram host_layout={} title_address={va:#x} format={}", layout.0, pc.Format.0,
+                ));
+            }
+            hr
         };
+        if hr >= 0 {
+            super::title_textures::tag_created(ppv, va, x, [1, layout.0 as u32]);
+        }
         let dimension = 1 << pc.Dimension.0;
         let first = TEXTURE_DIMENSIONS_LOGGED.fetch_or(dimension, Ordering::Relaxed) & dimension == 0;
         let kind = 1 << (pc.Flags.0 & 7);
@@ -1004,6 +1106,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     note_alias(va as usize, &x);
     // console-only state bits (Unicorn Overlord's 4K display target: 0x100000) are not the
     // PC's: the PC refused the resource (E_INVALIDARG) and the title threw
+    let guest_state = state;
     let mut state = state & real::PC_RESOURCE_STATES;
     // (a depth buffer placed for unordered access – not a state the PC depth buffer has: the one
     // it is in while its shadow takes the unordered access, `depth_uav`)
@@ -1023,10 +1126,15 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     let mut placed_hr = None;
     if !buffer {
         let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
-        let console_bytes = crate::hle::xg::Texture::new(&x).ok().map(|t| t.size()).filter(|&s| s != u64::MAX && s != 0);
+        let console_texture = crate::hle::xg::Texture::new(&x).ok();
+        let console_bytes = console_texture.as_ref().map(|t| t.size()).filter(|&s| s != u64::MAX && s != 0);
         if super::vram::gpu_owned(flags) {
             if let Some(hr) = super::vram::place(this, va as usize, &pc, super::vram::TextureInitial::Legacy(state), clear, console_bytes, riid, ppv) {
                 if hr >= 0 && !(*ppv).is_null() {
+                    super::title_textures::tag_created(ppv, va, x, [0, guest_state]);
+                    note_depth_resource_created(*ppv as usize, pc.Flags, || format!(
+                        "route=console_placed_vram guest_state={guest_state:#x} host_state={state:#x} title_address={va:#x} format={}", pc.Format.0,
+                    ));
                     if let Some(bytes) = console_bytes {
                         super::title_textures::retire_overlapping(va as usize, bytes as usize);
                     }
@@ -1035,7 +1143,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
                 }
                 return hr;
             }
-        } else {
+        } else if !console_texture.as_ref().is_some_and(crate::hle::xg::Texture::has_packed_volume_mips) {
             placed_hr = super::vram::place_pages(this, va as usize, &pc, state, clear, console_bytes, riid, ppv);
         }
     }
@@ -1047,6 +1155,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         }
     };
     if hr >= 0 && !buffer && !(*ppv).is_null() {
+        super::title_textures::tag_created(ppv, va, x, [0, guest_state]);
         static M: AtomicU64 = AtomicU64::new(0);
         match super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32)) {
             Ok(()) => {
@@ -1162,7 +1271,7 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
             a[0] = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32;
         }
     }
-    let needs_root = list.iter().any(|a| (5..=8).contains(&a[0]));
+    let needs_root = list.iter().any(|a| matches!(a[0], 5..=8 | 11));
     pc[8..16].copy_from_slice(&(if list.is_empty() { 0 } else { list.as_ptr() as u64 }).to_le_bytes());
     let hr = real::dev_create_command_signature(this, pc.as_ptr() as usize, if needs_root { root } else { 0 }, riid, ppv);
     if hr >= 0 && !ppv.is_null() && needs_root {
@@ -1170,7 +1279,9 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
     }
     if hr >= 0 && !ppv.is_null() {
         if let Some(last) = list.last() {
-            super::indirect::note_signature(*ppv as usize, last[0], u32::from_le_bytes(pc[0..4].try_into().unwrap()), list.len() == 1);
+            let stride = u32::from_le_bytes(pc[0..4].try_into().unwrap());
+            super::indirect::store_record_layout(*ppv, if needs_root {root} else {0}, stride, &list);
+            super::indirect::note_signature(*ppv as usize, last[0], stride, list.len() == 1);
         }
     }
     hr

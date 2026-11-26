@@ -24,11 +24,17 @@ pub(super) const OPAQUE_METHODS: &[&str] = &[
 type Obj = *mut c_void;
 
 macro_rules! direct_uses {
-    ($($method:ident $vtbl:ident ($this:ident $(, $arg:ident: $ty:ty)*) $class:ident => $record:expr;)*) => {
+    ($($method:ident $vtbl:ident ($this:ident $(, $arg:ident: $ty:ty)*) $class:ident => $record:expr $(, $track:expr)? $(=> $writes:expr)?;)*) => {
         pub(super) fn overrides(v: &mut Vec<(&'static str, usize)>) {
             let timing = cfg!(test) || super::gpu_timing::enabled();
+            let residency = super::residency::eviction_enabled();
+            let state = super::depth_state::enabled();
+            let writeback = super::image_writeback::on();
             v.extend([$((stringify!($method), $method as usize)),*].into_iter().filter(|&(name, _)| {
-                timing || !matches!(name, "Barrier" | "WriteBufferImmediate" | "ClearUnorderedAccessViewUint" | "ClearUnorderedAccessViewFloat")
+                timing || state && matches!(name, "Barrier" | "ResourceBarrier")
+                    || residency && !matches!(name, "Barrier" | "WriteBufferImmediate" | "ClearUnorderedAccessViewUint" | "ClearUnorderedAccessViewFloat")
+                    || writeback && matches!(name, "CopyTextureRegion" | "CopyResource" | "CopyTiles" | "ResolveSubresource"
+                        | "ResolveSubresourceRegion" | "ClearUnorderedAccessViewUint" | "ClearUnorderedAccessViewFloat")
             }));
         }
 
@@ -42,7 +48,9 @@ macro_rules! direct_uses {
             if super::residency::eviction_enabled() {
                 $record;
             }
+            $($writes;)?
             direct_uses!(@emit $class, $this, || f($this $(, $arg)*));
+            $($track;)?
         })*
     };
     (@emit Untimed, $list:ident, $call:expr) => { ($call)() };
@@ -57,36 +65,45 @@ direct_uses! {
     CopyTextureRegion ID3D12GraphicsCommandList_Vtbl(list, dst: *const D3D12_TEXTURE_COPY_LOCATION, x: u32, y: u32, z: u32,
                       src: *const D3D12_TEXTURE_COPY_LOCATION, box_: *const D3D12_BOX) Transfer
         => note_list_resources(list as usize, [dst, src].into_iter().filter_map(|p|
-            p.as_ref()?.pResource.as_ref().map(|r| r.as_raw() as usize)));
+            p.as_ref()?.pResource.as_ref().map(|r| r.as_raw() as usize)))
+        => super::image_writeback::note_copy_region(list, dst, x, y, z, src, box_);
     CopyResource ID3D12GraphicsCommandList_Vtbl(list, dst: Obj, src: Obj) Transfer
-        => note_list_resources(list as usize, [dst as usize, src as usize]);
+        => note_list_resources(list as usize, [dst as usize, src as usize])
+        => super::image_writeback::note_write(list, dst, super::image_writeback::Covers::Whole);
     CopyTiles ID3D12GraphicsCommandList_Vtbl(list, tiled: Obj, coord: *const D3D12_TILED_RESOURCE_COORDINATE,
               region: *const D3D12_TILE_REGION_SIZE, buf: Obj, offset: u64, flags: D3D12_TILE_COPY_FLAGS) Transfer
-        => note_list_resources(list as usize, [tiled as usize, buf as usize]);
+        => note_list_resources(list as usize, [tiled as usize, buf as usize])
+        => if flags.0 & D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE.0 != 0 {
+            super::image_writeback::note_write(list, tiled, super::image_writeback::Covers::Part)
+        };
     ResolveSubresource ID3D12GraphicsCommandList_Vtbl(list, dst: Obj, dst_sub: u32, src: Obj, src_sub: u32, fmt: i32) Transfer
-        => note_list_resources(list as usize, [dst as usize, src as usize]);
+        => note_list_resources(list as usize, [dst as usize, src as usize])
+        => super::image_writeback::note_write(list, dst, super::image_writeback::Covers::Sub(dst_sub));
     ResourceBarrier ID3D12GraphicsCommandList_Vtbl(list, n: u32, barriers: *const D3D12_RESOURCE_BARRIER) Barrier
-        => note_barriers(list as usize, n, barriers);
+        => note_barriers(list as usize, n, barriers), super::depth_state::legacy(list as usize, n, barriers);
     DiscardResource ID3D12GraphicsCommandList_Vtbl(list, res: Obj, desc: *const D3D12_DISCARD_REGION) Barrier
-        => note_list_resources(list as usize, [res as usize]);
+        => note_list_resources(list as usize, [res as usize]), super::depth_state::native_discard(list as usize, res as usize, desc);
     ResolveQueryData ID3D12GraphicsCommandList_Vtbl(list, heap: Obj, ty: D3D12_QUERY_TYPE, first: u32, n: u32, dst: Obj, offset: u64) Transfer
         => note_list_resources(list as usize, [dst as usize]);
     SetPredication ID3D12GraphicsCommandList_Vtbl(list, buf: Obj, offset: u64, op: D3D12_PREDICATION_OP) Untimed
         => note_list_resources(list as usize, [buf as usize]);
     ResolveSubresourceRegion ID3D12GraphicsCommandList1_Vtbl(list, dst: Obj, dst_sub: u32, x: u32, y: u32, src: Obj, src_sub: u32,
                              rect: *const windows::Win32::Foundation::RECT, fmt: i32, mode: D3D12_RESOLVE_MODE) Transfer
-        => note_list_resources(list as usize, [dst as usize, src as usize]);
+        => note_list_resources(list as usize, [dst as usize, src as usize])
+        => super::image_writeback::note_write(list, dst, super::image_writeback::Covers::Part);
     RSSetShadingRateImage ID3D12GraphicsCommandList5_Vtbl(list, img: Obj) Untimed => note_list_resources(list as usize, [img as usize]);
     Barrier ID3D12GraphicsCommandList7_Vtbl(list, n: u32, groups: *const D3D12_BARRIER_GROUP) Barrier
-        => note_list_untracked(list as usize);
+        => note_list_untracked(list as usize), super::depth_state::enhanced(list as usize, n, groups);
     WriteBufferImmediate ID3D12GraphicsCommandList2_Vtbl(list, n: u32, args: *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, modes: *const D3D12_WRITEBUFFERIMMEDIATE_MODE) Transfer
         => note_list_untracked(list as usize);
     ClearUnorderedAccessViewUint ID3D12GraphicsCommandList_Vtbl(list, gpu: D3D12_GPU_DESCRIPTOR_HANDLE, cpu: D3D12_CPU_DESCRIPTOR_HANDLE, res: Obj,
                                 values: *const u32, n: u32, rect: *const windows::Win32::Foundation::RECT) Clear
-        => note_list_resources(list as usize, [res as usize]);
+        => note_list_resources(list as usize, [res as usize])
+        => super::image_writeback::note_write(list, res, super::image_writeback::Covers::Part);
     ClearUnorderedAccessViewFloat ID3D12GraphicsCommandList_Vtbl(list, gpu: D3D12_GPU_DESCRIPTOR_HANDLE, cpu: D3D12_CPU_DESCRIPTOR_HANDLE, res: Obj,
                                  values: *const f32, n: u32, rect: *const windows::Win32::Foundation::RECT) Clear
-        => note_list_resources(list as usize, [res as usize]);
+        => note_list_resources(list as usize, [res as usize])
+        => super::image_writeback::note_write(list, res, super::image_writeback::Covers::Part);
 }
 
 unsafe fn note_barriers(list: usize, n: u32, barriers: *const D3D12_RESOURCE_BARRIER) {

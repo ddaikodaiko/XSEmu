@@ -18,12 +18,13 @@ pub(super) enum Flow {
 
 pub(super) struct Em {
     opt: Options,
+    material_gate: Option<std::rc::Rc<super::pso::material_gate::Trace>>,
     out: String,
     pub indent: usize,
     /// `XCL_HLSL_COMMENTS`: each instruction's disassembly as a comment above its HLSL
     comments: bool,
     /// `XCL_DS_VALIDATE` with several memory windows: report lanes whose address leaves the
-    /// window of its scalar base (`check_carry`)
+    /// window of its scalar base (`effective_address`)
     carry_check: bool,
     /// the current instruction addresses memory per lane (a 64-bit VGPR address, several
     /// memory windows): its window is `xcl_wv` and its accesses go through `memv`
@@ -51,11 +52,25 @@ pub(super) struct Em {
     /// split wave64: pc → SGPRs whose whole value may be read after that instruction
     /// (`x64_masks`); a mask written to none of them stays in its half (no exchange)
     pub x64_whole_live: BTreeMap<u64, u128>,
+    /// pcs before which EXEC holds every lane the wave started with (`lane_guards::full_exec`)
+    pub exec_full: BTreeSet<u64>,
+    /// the instruction being written runs with every lane on (`exec_full`): no lane guard
+    full: bool,
+    /// pc → VGPR results whose lane guard can go (`lane_guards::loose_writes`)
+    pub loose: BTreeMap<u64, Vec<u64>>,
+    /// `loose` of the instruction being written
+    cur_loose: Vec<u64>,
+    /// pixel lane reads within the quad as quad reads (`quad_read`; off: `XCL_RECOMP_NO_QUAD_READS`)
+    quad_reads: bool,
     /// wave64 VS / PS on a GPU with 32-lane waves only: what the console's lanes 32..63 hold
     /// where the program reads them (`upper_lanes`), used when the wave has 32 lanes
     pub upper: Option<super::upper_lanes::UpperLanes>,
     /// pc of the instruction being emitted
     cur_pc: u64,
+    /// the program addresses the data in its code region (`Options::code_data`): an
+    /// `s_getpc_b64` address carries `CODE_HI` in its high dword, and a scalar load through it
+    /// reads the table (`xcl_code`), not guest memory
+    pub code_loads: bool,
     /// MIMG instruction address → its sampler's S# when the code builds it from constants
     pub static_ss: BTreeMap<u64, [u32; 4]>,
     /// the static samplers sampled with: (S#, comparison), in register order
@@ -86,6 +101,31 @@ pub(super) struct Em {
     force_spin: bool,
     /// console instructions emitted since the last `xcl_tick` (`waits`)
     since_tick: u32,
+    /// loads at constant offsets from one base share its page resolutions (`page_group`; off:
+    /// `XCL_RECOMP_NO_PAGE_GROUPS`)
+    page_groups: bool,
+    /// the page groups of the block being written
+    groups: Vec<PageGroup>,
+}
+
+/// Loads whose addresses are one base (unchanged registers `sgprs` / `vgprs`, `key`) plus a
+/// constant: the pages of `[anchor, anchor + 64 KiB)` are resolved once (`xcl_group_pages`) and
+/// each load takes its page from them (`xcl_group_at`) instead of resolving it again.
+struct PageGroup {
+    key: String,
+    sgprs: u128,
+    vgprs: Vec<u64>,
+    /// the constant offset of the load that opened the group, whose address is the anchor
+    anchor: i64,
+    /// the variables `{name}_g` (anchor address), `{name}_r` (its page and the next) once
+    /// declared
+    name: Option<String>,
+    /// until then: where the declaration goes (before the first load's calls), its indent, the
+    /// anchor address, and the first load's calls (method, address) to give the group to
+    at: usize,
+    indent: usize,
+    anchor_addr: String,
+    calls: Vec<(String, String)>,
 }
 
 /// Instructions without an effect in this execution model.
@@ -254,6 +294,10 @@ fn f16_const(code: u64) -> Option<u32> {
     })
 }
 
+/// the high dword of an address in the program's code region (`Em::code_loads`): no guest
+/// address has it (guest addresses are 48 bits)
+const CODE_HI: &str = "0xC0DE0000u";
+
 fn hex(v: u32) -> String {
     format!("0x{v:08X}u")
 }
@@ -343,6 +387,23 @@ fn dpp16_src(ctrl: u64) -> Option<String> {
         0x160..=0x16F => format!("(int)(lane_id ^ {n}u)"),
         _ => return None,
     })
+}
+
+/// The quad lane each lane of a quad reads with a DPP16 control, when every source lies in the
+/// reader's own quad (quad_perm, row_xmask below 4).
+fn dpp16_quad(ctrl: u64) -> Option<[u32; 4]> {
+    match ctrl {
+        0x000..=0x0FF => Some(std::array::from_fn(|i| (ctrl as u32 >> (2 * i)) & 3)),
+        0x160..=0x163 => Some(std::array::from_fn(|i| i as u32 ^ (ctrl as u32 & 3))),
+        _ => None,
+    }
+}
+
+/// The quad lane each lane of a quad reads, when the source lane `src(lane)` of every lane of
+/// a group of `n` lanes is in the reader's own quad and the same in every quad.
+fn quad_pattern(n: u32, src: impl Fn(u32) -> u32) -> Option<[u32; 4]> {
+    let p: [u32; 4] = std::array::from_fn(|i| src(i as u32) & 3);
+    (0..n).all(|i| src(i) >> 2 == i >> 2 && src(i) & 3 == p[(i & 3) as usize]).then_some(p)
 }
 
 /// The lane `lane` of a 32-lane half reads with `ds_swizzle_b32` (the RDNA ISA's DS_SWIZZLE_B32):
@@ -672,12 +733,41 @@ fn to_f16_expr(dynamic_rm: bool, e: &str) -> String {
     format!("f32_to_f16_rm({e}, {rm})")
 }
 
+#[cfg(test)]
+thread_local! {
+    /// tests: the lane reads of the earlier form (`XCL_RECOMP_NO_QUAD_READS`) on this thread
+    pub(super) static NO_QUAD_READS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn quad_reads() -> bool {
+    #[cfg(test)]
+    if NO_QUAD_READS.get() {
+        return false;
+    }
+    std::env::var_os("XCL_RECOMP_NO_QUAD_READS").is_none()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// tests: loads without page groups (`XCL_RECOMP_NO_PAGE_GROUPS`) on this thread
+    pub(super) static NO_PAGE_GROUPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn page_groups() -> bool {
+    #[cfg(test)]
+    if NO_PAGE_GROUPS.get() {
+        return false;
+    }
+    std::env::var_os("XCL_RECOMP_NO_PAGE_GROUPS").is_none()
+}
+
 impl Em {
     pub fn new(opt: Options) -> Self {
         let carry_check = opt.mem_windows > 1 && std::env::var("XCL_DS_VALIDATE").is_ok_and(|v| v != "0");
         let force_spin = opt.split_wave64 && std::env::var("XCL_WAVE64_SPIN").is_ok_and(|v| v.trim() != "0");
         Em {
             opt,
+            material_gate: super::pso::material_gate::current(),
             out: String::new(),
             indent: 1,
             comments: std::env::var_os("XCL_HLSL_COMMENTS").is_some(),
@@ -696,8 +786,14 @@ impl Em {
             uses_scratch: false,
             x64_words: 1,
             x64_whole_live: BTreeMap::new(),
+            exec_full: BTreeSet::new(),
+            full: false,
+            loose: BTreeMap::new(),
+            cur_loose: Vec::new(),
+            quad_reads: quad_reads(),
             upper: None,
             cur_pc: 0,
+            code_loads: false,
             static_ss: BTreeMap::new(),
             static_used: Vec::new(),
             max_vgpr: 0,
@@ -717,6 +813,8 @@ impl Em {
             mesh_divergent_lds: false,
             force_spin,
             since_tick: 0,
+            page_groups: page_groups(),
+            groups: Vec::new(),
         }
     }
 
@@ -833,10 +931,14 @@ impl Em {
     }
 
     pub fn take(&mut self) -> String {
+        self.groups.clear();
         std::mem::take(&mut self.out)
     }
 
     fn line(&mut self, s: &str) {
+        if !self.groups.is_empty() && (s.matches('{').count() != s.matches('}').count() || s.trim_start().starts_with('}')) {
+            self.groups.clear();
+        }
         self.out.push_str(pad(self.indent));
         let packed_test;
         let test = if self.packed_wave() && s.contains("exec_") {
@@ -921,6 +1023,122 @@ impl Em {
         }
     }
 
+    /// A lane read whose source is quad lane `p[lane & 3]` of the reader's own quad, where
+    /// `rla` would read it through quad reads anyway (a pixel shader's lanes, unpacked): the
+    /// quad reads alone, without the wave reads and the helper-lane fix-up `rla` only needs
+    /// for lanes of other quads. None elsewhere.
+    fn quad_read(&mut self, v: &str, p: Option<[u32; 4]>) -> Option<String> {
+        let p = p.filter(|_| self.quad_reads && matches!(self.opt.mode, Mode::Pixel(_)) && self.rla_half_fn() == "rla")?;
+        Some(match p {
+            [0, 1, 2, 3] => v.to_string(),
+            [k, ..] if p.iter().all(|&x| x == k) => format!("QuadReadLaneAt({v}, {k}u)"),
+            _ => {
+                let t = self.t();
+                let mut ks = p.to_vec();
+                ks.sort_unstable();
+                ks.dedup();
+                for k in ks {
+                    self.line(&format!("uint {t}_q{k} = QuadReadLaneAt({v}, {k}u);"));
+                }
+                let q = |i: usize| format!("{t}_q{}", p[i]);
+                format!("select((lane_id & 2u) != 0u, select((lane_id & 1u) != 0u, {}, {}), select((lane_id & 1u) != 0u, {}, {}))", q(3), q(2), q(1), q(0))
+            }
+        })
+    }
+
+    /// The page group of a load at constant offset `imm` from the base `key` names (registers
+    /// `sgprs`, `vgprs`), whose `calls` accessor calls read the bytes `[imm, imm + span)`, the
+    /// first of them at `anchor_addr`. A load joins the group of its base when its bytes lie in
+    /// the 64 KiB from the group's anchor on: at most that page and the next, both resolved once.
+    /// A group is declared when a second load joins it (or a load of three calls opens it), so a
+    /// lone load keeps its accessor. Before this load's calls.
+    #[allow(clippy::too_many_arguments)]
+    fn page_group(&mut self, key: String, sgprs: u128, vgprs: Vec<u64>, imm: i64, span: i64, anchor_addr: String, calls: usize) -> Option<usize> {
+        if !self.page_groups || self.opt.mem_windows <= 1 || self.packed_wave() || self.code_loads {
+            return None;
+        }
+        if let Some(i) = self.groups.iter().position(|g| g.key == key) {
+            let delta = imm - self.groups[i].anchor;
+            if delta >= 0 && delta % 4 == 0 && delta + span <= 65536 {
+                self.declare_group(i);
+                return Some(i);
+            }
+            self.groups.remove(i);
+        }
+        if span > 65536 {
+            return None;
+        }
+        self.groups.push(PageGroup { key, sgprs, vgprs, anchor: imm, name: None, at: self.out.len(), indent: self.indent, anchor_addr, calls: Vec::new() });
+        let i = self.groups.len() - 1;
+        if calls >= 3 {
+            self.declare_group(i);
+        }
+        Some(i)
+    }
+
+    /// Declare group `i`: its anchor and pages before the first load's calls, which then read
+    /// through it.
+    fn declare_group(&mut self, i: usize) {
+        if self.groups[i].name.is_some() {
+            return;
+        }
+        let g = self.t();
+        let group = &mut self.groups[i];
+        let mut from = group.at;
+        for (method, addr) in std::mem::take(&mut group.calls) {
+            let call = format!("{method}({addr})");
+            let Some(k) = self.out[from..].find(&call) else { continue };
+            let new = format!("{method}G({addr}, {g}_g, {g}_r)");
+            self.out.replace_range(from + k..from + k + call.len(), &new);
+            from += k + new.len();
+        }
+        let decl = format!("{}uint64_t {g}_g = xcl_operand_va({}); uint4 {g}_r = xcl_group_pages({g}_g);\n", pad(group.indent), group.anchor_addr);
+        self.out.insert_str(group.at, &decl);
+        let shift = decl.len();
+        let at = group.at;
+        group.name = Some(g);
+        for other in self.groups.iter_mut().filter(|o| o.name.is_none() && o.at >= at) {
+            other.at += shift;
+        }
+    }
+
+    /// The accessor call `mem.{method}(addr)` of a load in group `g` (None: no group).
+    fn group_call(&mut self, g: Option<usize>, method: &str, addr: &str) -> String {
+        let Some(group) = g.and_then(|i| self.groups.get_mut(i)) else { return format!("mem.{method}({addr})") };
+        match &group.name {
+            Some(n) => format!("mem.{method}G({addr}, {n}_g, {n}_r)"),
+            None => {
+                group.calls.push((method.to_string(), addr.to_string()));
+                format!("mem.{method}({addr})")
+            }
+        }
+    }
+
+    /// A four-address load (`xcl_loadx4`) whose addresses are each a constant offset below 16
+    /// from the start of the bytes of group `g`'s load, or 0: through the group's pages.
+    fn loadx4(&mut self, g: Option<usize>, addrs: &str) -> String {
+        match g.and_then(|i| self.groups.get(i)).and_then(|g| g.name.as_ref()) {
+            Some(n) => format!("xcl_loadx4G({addrs}, {n}_g, {n}_r)"),
+            None => format!("xcl_loadx4({addrs})"),
+        }
+    }
+
+    /// After an instruction: the groups whose base registers it may write end. A memory write
+    /// does not end them: the page directory is the recording's topology, which no program writes.
+    fn drop_page_groups(&mut self, d: &Decoded) {
+        if self.groups.is_empty() {
+            return;
+        }
+        let name = d.inst.name;
+        if name.starts_with("V_MOVREL") || name.starts_with("V_SWAPREL") {
+            self.groups.clear();
+            return;
+        }
+        let s = super::x64_masks::may_write(d);
+        let (_, v) = rdna2::vgpr_uses(d);
+        self.groups.retain(|g| g.sgprs & s == 0 && !g.vgprs.iter().any(|r| v.contains(r)));
+    }
+
     /// Lane read with the same lane index in every lane (v_readlane, v_readfirstlane).
     fn rla_uniform_fn(&self) -> &'static str {
         if self.x64() {
@@ -933,7 +1151,11 @@ impl Em {
     /// The lane's EXEC bit, kept in `xcl_on` (`track_exec`): one test per EXEC write instead of
     /// one per instruction, which DXC spent much of its time on in big programs.
     fn act(&self) -> &'static str {
-        "xcl_on"
+        if self.full {
+            "true"
+        } else {
+            "xcl_on"
+        }
     }
 
     fn exec_test(&self) -> &'static str {
@@ -1124,7 +1346,11 @@ impl Em {
             Dst::V(n) => {
                 let v = self.vreg(*n);
                 let a = self.act();
-                self.line(&format!("{v} = select({a}, {val}, {v});"));
+                if self.full || self.cur_loose.contains(n) {
+                    self.line(&format!("{v} = {val};"));
+                } else {
+                    self.line(&format!("{v} = select({a}, {val}, {v});"));
+                }
             }
             Dst::S(n) => {
                 let s = self.sreg(*n);
@@ -1139,7 +1365,11 @@ impl Em {
             Dst::V(n) => {
                 let (a, b) = (self.vreg(*n), self.vreg(*n + 1));
                 let act = self.act();
-                self.line(&format!("{a} = select({act}, {lo}, {a}); {b} = select({act}, {hi}, {b});"));
+                if self.full || (self.cur_loose.contains(n) && self.cur_loose.contains(&(*n + 1))) {
+                    self.line(&format!("{a} = {lo}; {b} = {hi};"));
+                } else {
+                    self.line(&format!("{a} = select({act}, {lo}, {a}); {b} = select({act}, {hi}, {b});"));
+                }
             }
             Dst::S(n) => {
                 let (a, b) = (self.sreg(*n), self.sreg(*n + 1));
@@ -1189,6 +1419,18 @@ impl Em {
     // ---------------------------------------------------------------- one instruction
 
     pub fn inst(&mut self, d: &Decoded, next: u64) -> Flow {
+        let packed = self.packed_wave();
+        self.full = !packed && self.exec_full.contains(&d.pc);
+        self.cur_loose = if packed { Vec::new() } else { self.loose.get(&d.pc).cloned().unwrap_or_default() };
+        let flow = self.inst_body(d, next);
+        self.drop_page_groups(d);
+        self.full = false;
+        self.cur_loose.clear();
+        flow
+    }
+
+    fn inst_body(&mut self, d: &Decoded, next: u64) -> Flow {
+        if let Some(line) = self.material_gate.as_ref().and_then(|gate| gate.before(d, self.packed_compute())) { self.line(&line); }
         if self.waits() {
             self.since_tick += 1;
             if self.since_tick >= TICK_EVERY {
@@ -1631,7 +1873,7 @@ impl Em {
         if name == "s_getpc_b64" {
             // the code region is addressed from 0 in this model
             let pc = d.pc + d.len as u64;
-            self.write64(&dst, &hex(pc as u32), "0u");
+            self.write64(&dst, &hex(pc as u32), if self.code_loads { CODE_HI } else { "0u" });
             return Ok(());
         }
         if matches!(name, "s_bitset0_b64" | "s_bitset1_b64") {
@@ -1741,7 +1983,13 @@ impl Em {
             _ => return Err("SALU"),
         };
         self.line(&format!("uint {t} = {res};"));
-        if let Some(c) = scc {
+        let lanes_left = matches!(name, "s_and_b32" | "s_andn2_b32")
+            && matches!(self.opt.mode, Mode::Pixel(_))
+            && d.enc.name == "ENC_SOP2"
+            && ["SSRC0", "SSRC1", "SDST"].iter().any(|f| matches!(Self::field(d, f), 106 | 126));
+        if lanes_left {
+            self.line(&format!("scc = (uint)(({t} & ballot(true).x) != 0u);"));
+        } else if let Some(c) = scc {
             self.line(&format!("scc = (uint)({c});"));
         }
         self.write32(&dst, &t);
@@ -1949,35 +2197,41 @@ impl Em {
         let sdata = Self::field(d, "SDATA");
         let sbase = Self::field(d, "SBASE");
         let imm = rdna2::field_value(d.enc, &d.words, "OFFSET").unwrap_or(0) as u32;
-        let soff = rdna2::field_value(d.enc, &d.words, "SOFFSET").unwrap_or(125);
-        let soff = if soff == 125 { "0u".to_string() } else { self.code32(soff, None, false).ok_or("op")? };
+        let soff_code = rdna2::field_value(d.enc, &d.words, "SOFFSET").unwrap_or(125);
+        let soff = if soff_code == 125 { "0u".to_string() } else { self.code32(soff_code, None, false).ok_or("op")? };
+        let soff_regs = if soff_code < 128 { 1u128 << soff_code } else { 0 };
         let t = self.t();
         let mut vals = Vec::new();
         if name.starts_with("s_buffer_load") {
             // V#: base = dw0 | dw1[15:0] << 32, stride = dw1[29:16], num_records = dw2
             let (d0, d1, d2) = (self.sreg(sbase), self.sreg(sbase + 1), self.sreg(sbase + 2));
-            self.line(&format!("uint {t}_off = {} + {soff};", hex(imm)));
+            let uint = if self.opt.mem_windows > 1 { "uint64_t" } else { "uint" };
+            self.line(&format!("{uint} {t}_off = ({uint}){} + {soff};", hex(imm)));
             self.line(&format!("uint {t}_st = ({d1} >> 16) & 0x3FFFu;"));
-            self.line(&format!("uint {t}_lim = select({t}_st == 0u, {d2}, {d2} * {t}_st);"));
+            self.line(&format!("{uint} {t}_lim = select({t}_st == 0u, ({uint}){d2}, ({uint}){d2} * {t}_st);"));
             if self.opt.mem_windows > 1 {
                 self.window_read(&format!("({d1} & 0xFFFFu)"));
-                self.check_carry(&format!("({d1} & 0xFFFFu)"), &format!("((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){t}_off"));
+                self.effective_address(&format!("({d1} & 0xFFFFu)"), &format!("((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){t}_off"));
             }
-            self.line(&format!("uint {t}_a = ({d0} + {t}_off) & ~3u;"));
+            self.line(&format!("uint {t}_a = ({d0} + (uint){t}_off) & ~3u;"));
             // Branch-free: a dword past num_records reads offset 0 (always in the window) and
             // comes out 0. HLSL 2021's `?:` is a branch, and with several memory windows every
             // access checks its window (`windowed`): one per dword made DXC several times
             // slower on big programs. Four dwords share one check (`xcl_loadx4`).
             if count == 1 {
                 self.line(&format!("bool {t}_in = {t}_off < {t}_lim;"));
-                self.line(&format!("uint {t}_0 = select({t}_in, mem.Load(select({t}_in, {t}_a, 0u)), 0u);"));
+                let group = self.page_group(format!("sbuf|{d0}|{d1}|{soff}"), 3u128 << sbase | soff_regs, Vec::new(), imm as i64, 4, format!("{t}_a"), 1);
+                let load = self.group_call(group, "Load", &format!("select({t}_in, {t}_a, 0u)"));
+                self.line(&format!("uint {t}_0 = select({t}_in, {load}, 0u);"));
                 vals.push(format!("{t}_0"));
             } else {
+                let group = self.page_group(format!("sbuf|{d0}|{d1}|{soff}"), 3u128 << sbase | soff_regs, Vec::new(), imm as i64, 4 * count as i64, format!("{t}_a"), 3);
                 for g in 0..count.div_ceil(4) {
                     let n = (count - 4 * g).min(4);
                     let o = (0..4).map(|k| format!("{}u", 16 * g + 4 * k.min(n - 1))).collect::<Vec<_>>().join(", ");
-                    self.line(&format!("bool4 {t}_in{g} = {t}_off + uint4({o}) < {t}_lim;"));
-                    self.line(&format!("uint4 {t}_g{g} = select({t}_in{g}, xcl_loadx4(select({t}_in{g}, {t}_a + uint4({o}), 0u)), 0u);"));
+                    self.line(&format!("bool4 {t}_in{g} = {t}_off + vector<{uint}, 4>({o}) < {t}_lim;"));
+                    let load = self.loadx4(group, &format!("select({t}_in{g}, {t}_a + uint4({o}), 0u)"));
+                    self.line(&format!("uint4 {t}_g{g} = select({t}_in{g}, {load}, 0u);"));
                     vals.extend(["x", "y", "z", "w"][..n].iter().map(|c| format!("{t}_g{g}.{c}")));
                 }
             }
@@ -1985,10 +2239,18 @@ impl Em {
             let imm = ((imm << 11) as i32 >> 11) as u32; // 21-bit signed
             let b = self.sreg(sbase);
             let hi = self.sreg(sbase + 1);
+            // an address in the code region is no guest address: its window is that of a null
+            // high dword, and its dwords come from the table
+            let hi = if self.code_loads {
+                self.line(&format!("bool {t}_pc = {hi} == {CODE_HI};"));
+                format!("select({t}_pc, 0u, {hi})")
+            } else {
+                hi
+            };
             // the dwords are contiguous: Load2 / Load4 (one window switch per four dwords)
             if self.opt.mem_windows > 1 {
                 self.window_read(&hi);
-                self.check_carry(&hi, &format!("((((uint64_t){hi}) << 32) | (uint64_t){b}) + (uint64_t)(int64_t)(int){} + (uint64_t){soff}", hex(imm)));
+                self.effective_address(&hi, &format!("((((uint64_t){hi}) << 32) | (uint64_t){b}) + (uint64_t)(int64_t)(int){} + (uint64_t){soff}", hex(imm)));
             }
             self.line(&format!("uint {t}_a = ({b} + {} + {soff}) & ~3u;", hex(imm)));
             let load = if matches!(self.mem_coherence, MemCoherence::CachedBefore(pc) if d.pc < pc) {
@@ -1996,18 +2258,46 @@ impl Em {
             } else {
                 "mem.Load"
             };
+            let group = if load == "mem.Load" {
+                self.page_group(format!("smem|{hi}|{b}|{soff}"), 3u128 << sbase | soff_regs, Vec::new(), imm as i32 as i64, 4 * count as i64, format!("{t}_a"), count.div_ceil(4))
+            } else {
+                None
+            };
+            let mut calls = Vec::new();
+            for g in 0..count.div_ceil(4) {
+                let (method, addr) = match count {
+                    1 => ("Load", format!("{t}_a")),
+                    2 => ("Load2", format!("{t}_a")),
+                    _ => ("Load4", format!("{t}_a + {}u", 16 * g)),
+                };
+                calls.push(match group {
+                    Some(_) => self.group_call(group, method, &addr),
+                    None => format!("{load}{}({addr})", &method[4..]),
+                });
+            }
+            let code_loads = self.code_loads;
+            // n dwords from the code region's dword first on: the table's when the address is the code's
+            let dwords = |n: usize, name: &str, first: usize, mem: String| {
+                let ty = if n == 1 { "uint".to_string() } else { format!("uint{n}") };
+                if !code_loads {
+                    return format!("{ty} {name} = {mem};");
+                }
+                let words: Vec<String> = (first..first + n).map(|k| format!("xcl_code({t}_a + {}u)", 4 * k)).collect();
+                let table = if n == 1 { words[0].clone() } else { format!("{ty}({})", words.join(", ")) };
+                format!("{ty} {name}; if ({t}_pc) {{ {name} = {table}; }} else {{ {name} = {mem}; }}")
+            };
             match count {
                 1 => {
-                    self.line(&format!("uint {t}_0 = {load}({t}_a);"));
+                    self.line(&dwords(1, &format!("{t}_0"), 0, calls[0].clone()));
                     vals.push(format!("{t}_0"));
                 }
                 2 => {
-                    self.line(&format!("uint2 {t}_g0 = {load}2({t}_a);"));
+                    self.line(&dwords(2, &format!("{t}_g0"), 0, calls[0].clone()));
                     vals.extend([format!("{t}_g0.x"), format!("{t}_g0.y")]);
                 }
                 _ => {
                     for g in 0..count / 4 {
-                        self.line(&format!("uint4 {t}_g{g} = {load}4({t}_a + {}u);", 16 * g));
+                        self.line(&dwords(4, &format!("{t}_g{g}"), 4 * g, calls[g].clone()));
                         vals.extend(["x", "y", "z", "w"].iter().map(|c| format!("{t}_g{g}.{c}")));
                     }
                 }
@@ -2042,7 +2332,7 @@ impl Em {
     fn window_read(&mut self, hi: &str) {
         if self.opt.mem_windows > 1 {
             let t = self.t();
-            self.line(&format!("uint {t}_hi = {hi}; uint {t}_w = select({t}_hi == 0u, 0u, {t}_hi - xcl_uma_base); {}", self.clamp_window(&format!("{t}_w"))));
+            self.line(&format!("uint {t}_hi = {hi}; xcl_origin = {t}_hi; uint {t}_w = select({t}_hi == 0u, 0u, {t}_hi - xcl_uma_base); {}", self.clamp_window(&format!("{t}_w"))));
         }
     }
 
@@ -2065,25 +2355,24 @@ impl Em {
     fn window_write(&mut self, hi: &str) {
         if self.opt.mem_windows > 1 {
             let t = self.t();
-            self.line(&format!("uint {t}_w = ({hi}) - xcl_uma_base; {}", self.clamp_window(&format!("{t}_w"))));
+            self.line(&format!("uint {t}_w = ({hi}) - xcl_uma_base; xcl_origin = select(({hi}) == 0u, 0xffffffffu, ({hi})); {}", self.clamp_window(&format!("{t}_w"))));
         }
     }
 
     /// `XCL_DS_VALIDATE`: an active lane whose 64-bit address `full` is not in the window of its
-    /// scalar base (high dword `base_hi`) reports it (`xcl_carried`): its access wrapped inside
-    /// that window, outside any allocation (none straddles windows).
-    fn check_carry(&mut self, base_hi: &str, full: &str) {
+    /// scalar base (high dword `base_hi`) reports it (`xcl_carried`): the resolver still uses the full sum.
+    fn effective_address(&mut self, base_hi: &str, full: &str) {
+        if self.opt.mem_windows > 1 {
+            self.line(&format!("xcl_ea = {full};"));
+        }
         if self.carry_check {
             let act = self.act();
-            self.line(&format!("if (and({act}, (uint)(({full}) >> 32) != {base_hi})) xcl_carried();"));
+            self.line(&format!("if (and({act}, (uint)(xcl_ea >> 32) != {base_hi})) xcl_carried();"));
         }
     }
 
-    /// Compute the effective address of a FLAT / GLOBAL access into `uint {t}_a` (masked by
-    /// `~align_mask` when non-zero) and, when `mem_windows > 1`, select its window: with an SGPR
-    /// base the window of the base for the whole wave (`xcl_w`, the offsets added in 32 bits: an
-    /// allocation never straddles windows); otherwise per lane from the exact 64-bit address
-    /// (`xcl_wv`, `lane_window`).
+    /// Compute the effective FLAT/GLOBAL address and the original window selector. Keep the
+    /// unaligned 64-bit sum for the resolver and the low dword for instruction helpers.
     #[allow(clippy::too_many_arguments)]
     fn emit_flat_addr(&mut self, global: bool, addtid: bool, saddr: u64, addr: u64, off: u32, align_mask: u32, is_write: bool, t: &str) {
         let has_saddr = (addtid || global) && saddr != 0x7D && saddr != 0x7F;
@@ -2099,14 +2388,28 @@ impl Em {
             self.line(&format!("uint64_t {t}_ea = {ea};"));
             if is_write {
                 self.window_write(&format!("(uint)({t}_ea >> 32)"));
+            } else if self.code_loads {
+                self.line(&format!("bool {t}_pc = (uint)({t}_ea >> 32) == {CODE_HI};"));
+                self.window_read(&format!("select({t}_pc, 0u, (uint)({t}_ea >> 32))"));
             } else {
                 self.window_read(&format!("(uint)({t}_ea >> 32)"));
+            }
+            self.line(&format!("xcl_ea = {t}_ea;"));
+            if !addtid {
+                let hi = self.vreg(addr + 1);
+                self.line(&format!("xcl_origin = select(or({hi} > 65535u, and({hi} == 0u, (uint)({t}_ea >> 32) != 0u)), 0xffffffffu, xcl_origin);"));
             }
             let mask = if align_mask == 0 { String::new() } else { format!(" & ~{align_mask}u") };
             self.line(&format!("uint {t}_a = (uint){t}_ea{mask};"));
         } else {
+            let tagged = self.code_loads && !is_write;
+            if tagged {
+                let hi = if has_saddr { self.sreg(saddr + 1) } else if addtid { "0u".into() } else { self.vreg(addr + 1) };
+                self.line(&format!("bool {t}_pc = {hi} == {CODE_HI};"));
+            }
             if self.opt.mem_windows > 1 {
                 let (s_lo, s_hi) = (self.sreg(saddr), self.sreg(saddr + 1));
+                let s_hi = if tagged { format!("select({t}_pc, 0u, {s_hi})") } else { s_hi };
                 if is_write {
                     self.window_write(&s_hi);
                 } else {
@@ -2114,7 +2417,7 @@ impl Em {
                 }
                 let lane = if addtid { "4u * lane_id".to_string() } else { self.vreg(addr) };
                 let off64 = if global { format!("(uint64_t)(int64_t)(int){}", hex(off)) } else { format!("(uint64_t){}", hex(off)) };
-                self.check_carry(&s_hi, &format!("((((uint64_t){s_hi}) << 32) | (uint64_t){s_lo}) + (uint64_t)({lane}) + {off64}"));
+                self.effective_address(&s_hi, &format!("((((uint64_t){s_hi}) << 32) | (uint64_t){s_lo}) + (uint64_t)({lane}) + {off64}"));
             }
             let base = if addtid {
                 if has_saddr {
@@ -2197,7 +2500,7 @@ impl Em {
             } else {
                 self.window_read(&format!("({d1} & 0xFFFFu)"));
             }
-            self.check_carry(&format!("({d1} & 0xFFFFu)"), &format!("((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){soff} + {t}_off + (uint64_t){t}_stride * (uint64_t){index}"));
+            self.effective_address(&format!("({d1} & 0xFFFFu)"), &format!("((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){soff} + {t}_off + (uint64_t){t}_stride * (uint64_t){index}"));
             self.line(&format!("uint {t}_a = {d0} + {soff} + (uint){t}_off + {t}_stride * {index};"));
         } else {
             self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
@@ -2237,13 +2540,25 @@ impl Em {
                     let ok = in_range("4u".into());
                     let v = self.vreg(vdata);
                     self.line(&format!("bool {t}_ok = {ok};"));
-                    self.line(&format!("uint {t}_v = mem.Load(select(and({t}_act, {t}_ok), {t}_a & ~3u, 0u));"));
+                    let soff_code = f("SOFFSET");
+                    let sgprs = 3u128 << srsrc | if soff_code < 128 { 1u128 << soff_code } else { 0 };
+                    let vgprs = (0..(idxen as u64 + offen as u64)).map(|k| vaddr + k).collect();
+                    let key = format!("mubuf|{d0}|{d1}|{soff}|{voff}|{index}");
+                    let group = self.page_group(key, sgprs, vgprs, f("OFFSET") as i64, 4, format!("{t}_a & ~3u"), 1);
+                    let load = self.group_call(group, "Load", &format!("select(and({t}_act, {t}_ok), {t}_a & ~3u, 0u)"));
+                    self.line(&format!("uint {t}_v = {load};"));
                     self.line(&format!("{v} = select({t}_act, select({t}_ok, {t}_v, 0u), {v});"));
                 } else {
                     let oks: Vec<String> = (0..4).map(|i| in_range(format!("{}u", 4 * i.min(count - 1) + 4))).collect();
                     let o = (0..4).map(|i| format!("{}u", 4 * i.min(count - 1))).collect::<Vec<_>>().join(", ");
                     self.line(&format!("bool4 {t}_ok = bool4({});", oks.join(", ")));
-                    self.line(&format!("uint4 {t}_v = xcl_loadx4(select(and({t}_act, {t}_ok), ({t}_a & ~3u) + uint4({o}), 0u));"));
+                    let soff_code = f("SOFFSET");
+                    let sgprs = 3u128 << srsrc | if soff_code < 128 { 1u128 << soff_code } else { 0 };
+                    let vgprs = (0..(idxen as u64 + offen as u64)).map(|k| vaddr + k).collect();
+                    let key = format!("mubuf|{d0}|{d1}|{soff}|{voff}|{index}");
+                    let group = self.page_group(key, sgprs, vgprs, f("OFFSET") as i64, 4 * count as i64, format!("{t}_a & ~3u"), 3);
+                    let load = self.loadx4(group, &format!("select(and({t}_act, {t}_ok), ({t}_a & ~3u) + uint4({o}), 0u)"));
+                    self.line(&format!("uint4 {t}_v = {load};"));
                     for i in 0..count {
                         let v = self.vreg(vdata + i);
                         let c = ["x", "y", "z", "w"][i as usize];
@@ -2628,16 +2943,29 @@ impl Em {
                 None => format!("((uint64_t)({node} & ~7u) << 3)"),
             };
             self.line(&format!("uint64_t {a} = ((((uint64_t)({d1} & 0xFFu) << 32) | (uint64_t){d0}) << 8) + {off};"));
-            if wide && self.opt.mem_windows > 1 {
-                self.lane_window = true;
-                self.window_read(&format!("(uint)({a} >> 32)"));
+            let hit = if self.opt.bvh_node_fix {
+                let d3 = self.sreg(srsrc + 3);
+                if self.opt.mem_windows > 1 {
+                    self.lane_window = true;
+                    self.window_read(&format!("(uint)({a} >> 32)"));
+                    self.line(&format!("xcl_ea = {a};"));
+                } else {
+                    self.effective_address(&format!("((({d1} & 0xFFu) << 8) | ({d0} >> 24))"), &a);
+                }
+                format!("bvh_intersect({node} & 7u, (uint){a}, {extent}, {origin}, {dir}, {inv}, {d1} >> 23, ({d3} & 0x01000000u) != 0u)")
             } else {
-                self.window_read(&format!("((({d1} & 0xFFu) << 8) | ({d0} >> 24))"));
-                self.check_carry(&format!("((({d1} & 0xFFu) << 8) | ({d0} >> 24))"), &a);
-            }
-            self.line(&format!("uint4 {t} = bvh_intersect({node} & 7u, (uint){a}, {extent}, {origin}, {dir}, {inv}, ({d1} >> 31) != 0u);"));
+                if wide && self.opt.mem_windows > 1 {
+                    self.lane_window = true;
+                    self.window_read(&format!("(uint)({a} >> 32)"));
+                    self.line(&format!("xcl_ea = {a};"));
+                } else {
+                    self.window_read(&format!("((({d1} & 0xFFu) << 8) | ({d0} >> 24))"));
+                    self.effective_address(&format!("((({d1} & 0xFFu) << 8) | ({d0} >> 24))"), &a);
+                }
+                format!("bvh_intersect({node} & 7u, (uint){a}, {extent}, {origin}, {dir}, {inv}, ({d1} >> 31) != 0u)")
+            };
             let st: Vec<String> = (0..4).map(|c| format!("{} = {t}.{};", self.vreg(vdata + c), ["x", "y", "z", "w"][c as usize])).collect();
-            self.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
+            self.line(&format!("if ({act}) {{ uint4 {t} = {hit}; {} }}", st.join(" ")));
             return Ok(());
         }
         // body coordinates per DIM: 1D, 2D, 3D, CUBE, 1D_ARRAY, 2D_ARRAY, 2D_MSAA, 2D_MSAA_ARRAY
@@ -2808,14 +3136,15 @@ impl Em {
                 5 => ("Texture2DArray<float4>", format!("float3({}, {}, round({}))", coords[0], coords[1], coords[2])),
                 _ => return Err("MIMG dim"),
             };
-            if f("UNORM") != 0 && dim != 3 {
+            let gather_lod = lod.as_ref().filter(|_| base.starts_with("gather4") && matches!(dim, 1 | 5));
+            if f("UNORM") != 0 && dim != 3 && gather_lod.is_none() {
                 return Err("MIMG unorm");
             }
             let samp = if has_c { "SamplerComparisonState" } else { "SamplerState" };
             self.line(&format!("{ty} {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];"));
             let sampler = self.sampler_ref(d.pc, has_c, &s3);
             self.line(&format!("{samp} {t}_S = {sampler};"));
-            if let Some(o) = &offset {
+            if let (Some(o), None) = (&offset, gather_lod) {
                 // the mip the console reads: the given LOD, else that of the given gradients or the
                 // pixel's own (none outside PS), plus the bias
                 let level = if has_lz || base.starts_with("gather4") {
@@ -2860,9 +3189,63 @@ impl Em {
                     return Err("gather4 dmask");
                 }
                 let ch = ["Red", "Green", "Blue", "Alpha"][comps[0] as usize];
-                match &cmp {
-                    Some(z) => format!("{t}_T.GatherCmp{ch}({t}_S, {coord}, {z})"),
-                    None => format!("{t}_T.Gather{ch}({t}_S, {coord})"),
+                match (&cmp, gather_lod) {
+                    (_, Some(level)) => {
+                        let [w0, w1, w2, w3] = match self.static_ss.get(&d.pc) {
+                            Some(w) => w.map(|x| format!("{x}u")),
+                            None => [self.sreg(ssamp), self.sreg(ssamp + 1), self.sreg(ssamp + 2), s3],
+                        };
+                        let dims = |m: &str| {
+                            let layer = if dim == 5 { format!("{t}_gd, ") } else { String::new() };
+                            format!("{t}_T.GetDimensions({m}, {t}_gw, {t}_gh, {layer}{t}_gn);")
+                        };
+                        self.line(&format!("uint {t}_gw = 1u, {t}_gh = 1u, {t}_gd = 1u, {t}_gn = 1u; {}", dims("0u")));
+                        self.line(&format!("float {t}_gt = (float)(({tw1} >> 8) & 4095u) / 256.0f;"));
+                        self.line(&format!(
+                            "float {t}_glo = (float)({w1} & 4095u) / 256.0f; float {t}_ghi = (float)(({w1} >> 12) & 4095u) / 256.0f; float {t}_gb = (float)(((int)({w2} << 18)) >> 18) / 256.0f;"
+                        ));
+                        self.line(&format!(
+                            "float {t}_gm = max(clamp({level} + {t}_gb, {t}_glo, max({t}_glo, {t}_ghi)), {t}_gt); uint {t}_gl = min((uint)floor((({w2} >> 26) & 3u) == 0u ? {t}_gt : {t}_gm + 0.501953125f), max({t}_gn, 1u) - 1u); {}",
+                            dims(&format!("{t}_gl"))
+                        ));
+                        let offset = offset.as_ref().map(|o| format!(" + int2(((int)({o} << 26)) >> 26, ((int)({o} << 18)) >> 26)")).unwrap_or_default();
+                        let scale = if f("UNORM") == 0 { format!(" * ((({w0} >> 15) & 1u) == 0u ? float2({t}_gw, {t}_gh) : float2(1.0f, 1.0f))") } else { String::new() };
+                        self.line(&format!(
+                            "int2 {t}_gp = int2(floor(float2({}, {}){scale} - 0.5f)){offset}; int2 {t}_gs = int2(max({t}_gw, 1u), max({t}_gh, 1u));",
+                            coords_unmoved[0], coords_unmoved[1]
+                        ));
+                        self.line(&format!(
+                            "int4 {t}_ga = int4(gather_axis({t}_gp.x, {t}_gs.x, {w0} & 7u), gather_axis({t}_gp.x + 1, {t}_gs.x, {w0} & 7u), gather_axis({t}_gp.y, {t}_gs.y, ({w0} >> 3) & 7u), gather_axis({t}_gp.y + 1, {t}_gs.y, ({w0} >> 3) & 7u));"
+                        ));
+                        let c = ["r", "g", "b", "a"][comps[0] as usize];
+                        let border = if c == "a" { format!("((({w3} >> 30) - 1u < 2u) ? 1.0f : 0.0f)") } else { format!("(({w3} >> 30) == 2u ? 1.0f : 0.0f)") };
+                        let (load, layer) = if dim == 5 {
+                            self.line(&format!("int {t}_ga_layer = clamp((int)round({}), 0, (int)max({t}_gd, 1u) - 1);", coords_unmoved[2]));
+                            ("int4", format!(", {t}_ga_layer"))
+                        } else {
+                            ("int3", String::new())
+                        };
+                        let tap = |x: char, y: char| {
+                            let (x, y) = (format!("{t}_ga.{x}"), format!("{t}_ga.{y}"));
+                            let value = format!("(({x} < 0 || {y} < 0) ? {border} : {t}_T.Load({load}({x}, {y}{layer}, (int){t}_gl)).{c})");
+                            match &cmp {
+                                Some(z) => format!("gather_compare({z}, {value}, ({w0} >> 12) & 7u)"),
+                                None => value,
+                            }
+                        };
+                        format!("float4({}, {}, {}, {})", tap('x', 'w'), tap('y', 'w'), tap('y', 'z'), tap('x', 'z'))
+                    }
+                    (Some(z), _) => format!("{t}_T.GatherCmp{ch}({t}_S, {coord}, {z})"),
+                    (None, _) => {
+                        let typed = |vt: &str, v: &str| format!("{} {t}_T{v} = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})]; {t}_gi = asuint({t}_T{v}.Gather{ch}({t}_S, {coord}));", ty.replace("float4", vt));
+                        self.line(&format!("uint {t}_gc = img_cls(({tw1} >> 20) & 0x1FFu); uint4 {t}_gi;"));
+                        self.line(&format!(
+                            "if ({t}_gc == 1u) {{ {} }} else if ({t}_gc == 2u) {{ {} }} else {{ {t}_gi = asuint({t}_T.Gather{ch}({t}_S, {coord})); }}",
+                            typed("uint4", "u"),
+                            typed("int4", "i")
+                        ));
+                        format!("asfloat({t}_gi)")
+                    }
                 }
             } else {
                 // outside PS there are no implicit derivatives: LOD 0 (bias = LOD), raised by the clamp
@@ -3008,6 +3391,7 @@ impl Em {
                 if base == "store_mip" {
                     return Err("image_store_mip");
                 }
+                if let Some(line) = self.material_gate.as_ref().and_then(|gate| gate.store(self.cur_pc, dim, &tw0, &icoord, act)) { self.line(&line); }
                 let mut vals = Vec::new();
                 for c in 0..4u64 {
                     vals.push(match comps.iter().position(|&x| x == c) {
@@ -3029,7 +3413,22 @@ impl Em {
                     uav("float")
                 ));
             }
-            _ if base.starts_with("atomic_") && matches!(&base[7..], "cmpswap" | "sub" | "inc" | "dec" | "fcmpswap" | "fmin" | "fmax") => {
+            _ if matches!(base, "atomic_fcmpswap" | "atomic_fmin" | "atomic_fmax") => {
+                let (v, cmp) = (self.vreg(vdata), self.vreg(vdata + 1));
+                let dst = format!("{t}_U[{icoord}]");
+                let old = format!("{t}_old");
+                let float = rmw32(&base[7..], &At::FloatRef(dst.clone()), &v, &cmp, &old, &t).ok_or("image_atomic")?;
+                let raw = rmw32(&base[7..], &At::Ref(dst), &v, &cmp, &old, &t).ok_or("image_atomic")?;
+                let view = |ty| format!("RWTexture{rty}<{ty}> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];");
+                self.line(&format!(
+                    "uint {old} = 0u; if ({act}) {{ if ({t}_cls == 0u) {{ {} {float} }} else {{ {} {raw} }} }}",
+                    view("float"), view("uint")
+                ));
+                if f("GLC") == 1 {
+                    self.line(&format!("if ({act}) {v} = {old};"));
+                }
+            }
+            _ if base.starts_with("atomic_") && matches!(&base[7..], "cmpswap" | "sub" | "inc" | "dec") => {
                 // the operations without an int view: on the uint texel (CAS loops where needed)
                 let (v, cmp) = (self.vreg(vdata), self.vreg(vdata + 1));
                 self.line(&format!("RWTexture{rty}<uint> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];"));
@@ -3198,23 +3597,32 @@ impl Em {
                     self.line(&format!(
                         "bool {t}_ok = and({t}_l >= 0, or({fi}, lanebit_at({el}, {eh}, (uint){t}_l)));"
                     ));
-                    let rla = self.rla_half_fn();
-                    self.line(&format!("uint {t} = {rla}({v}, (uint)max({t}_l, 0));"));
+                    let read = match self.quad_read(&v, dpp16_quad(ctrl)) {
+                        Some(q) => q,
+                        None => format!("{}({v}, (uint)max({t}_l, 0))", self.rla_half_fn()),
+                    };
+                    self.line(&format!("uint {t} = {read};"));
                     let (rm, bm) = (fv("ROW_MASK"), fv("BANK_MASK"));
                     // write enable: row/bank masks, and an invalid source either reads 0 (bound_ctrl) or disables
-                    let mut en = format!("((({rm}u >> (lane_id >> 4)) & 1u) != 0u && (({bm}u >> ((lane_id >> 2) & 3u)) & 1u) != 0u)");
+                    let mut en = vec![if rm == 0xF { "lane_id < 64u".to_string() } else { format!("(({rm}u >> (lane_id >> 4)) & 1u) != 0u") }];
+                    if bm != 0xF {
+                        en.push(format!("(({bm}u >> ((lane_id >> 2) & 3u)) & 1u) != 0u"));
+                    }
                     if bound {
                         self.line(&format!("{t} = select({t}_ok, {t}, 0u);"));
                     } else {
-                        en = format!("({en} && {t}_ok)");
+                        en.push(format!("{t}_ok"));
                     }
-                    self.dpp_enable = Some(en);
+                    self.dpp_enable = Some(en.into_iter().reduce(|a, b| format!("and({a}, {b})")).unwrap());
                 } else {
                     let sel: u64 = (0..8).map(|i| fv(&format!("LANE_SEL_{i}")) << (3 * i)).sum();
                     let fi = rdna2::field_value(d.enc, &d.words, "SRC0").unwrap_or(0) == 0xEA;
                     self.line(&format!("uint {t}_l = (lane_id & ~7u) | (({sel}u >> (3u * (lane_id & 7u))) & 7u);"));
-                    let rla = self.rla_half_fn();
-                    self.line(&format!("uint {t} = {rla}({v}, {t}_l);"));
+                    let read = match self.quad_read(&v, quad_pattern(8, |i| (sel >> (3 * i)) as u32 & 7)) {
+                        Some(q) => q,
+                        None => format!("{}({v}, {t}_l)", self.rla_half_fn()),
+                    };
+                    self.line(&format!("uint {t} = {read};"));
                     if !fi {
                         self.line(&format!("{t} = select(lanebit_at({el}, {eh}, {t}_l), {t}, 0u);"));
                     }
@@ -4395,8 +4803,9 @@ impl Em {
         if self.opt.mem_windows > 1 {
             self.line(&format!("uint64_t {t}_off = (uint64_t){voff} + (uint64_t){}u;", f("OFFSET")));
             self.window_write(&format!("({d1} & 0xFFFFu)"));
-            self.check_carry(&format!("({d1} & 0xFFFFu)"), &format!("((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){soff} + {t}_off + (uint64_t){t}_stride * (uint64_t){index}"));
+            self.effective_address(&format!("({d1} & 0xFFFFu)"), &format!("((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){soff} + {t}_off + (uint64_t){t}_stride * (uint64_t){index}"));
             self.line(&format!("uint {t}_a = ({d0} + {soff} + (uint){t}_off + {t}_stride * {index}) & ~{}u;", bytes - 1));
+            self.line(&format!("xcl_origin = select(((uint)xcl_ea & {}u) != 0u, 0xffffffffu, xcl_origin);", bytes - 1));
             self.line(&format!("bool {t}_ok = select({t}_stride == 0u, {t}_off + (uint64_t){bytes}u <= (uint64_t){d2}, {index} < {d2});"));
         } else {
             self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
@@ -4452,7 +4861,7 @@ impl Em {
             } else {
                 self.window_read(&format!("({d1} & 0xFFFFu)"));
             }
-            self.check_carry(&format!("({d1} & 0xFFFFu)"), &format!("((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){soff} + {t}_off + (uint64_t){t}_stride * (uint64_t){index}"));
+            self.effective_address(&format!("({d1} & 0xFFFFu)"), &format!("((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){soff} + {t}_off + (uint64_t){t}_stride * (uint64_t){index}"));
             self.line(&format!("uint {t}_a = {d0} + {soff} + (uint){t}_off + {t}_stride * {index};"));
         } else {
             self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
@@ -4498,7 +4907,9 @@ impl Em {
                 self.line(&format!("if ({act}) st_bytes({t}_a, uint4({}, 0u, 0u, 0u), {n}u);", d16_data(&v, half)));
             } else {
                 let v = self.vreg(f("VDST"));
-                self.line(&format!("if ({act}) {v} = {};", d16_merge(&v, &format!("ld_raw({t}_a).x"), n, signed, half)));
+                let mem = format!("ld_raw({t}_a).x");
+                let raw = if self.code_loads { format!("({t}_pc ? xcl_code_unaligned({t}_a) : {mem})") } else { mem };
+                self.line(&format!("if ({act}) {v} = {};", d16_merge(&v, &raw, n, signed, half)));
             }
             return Ok(());
         }
@@ -4521,7 +4932,17 @@ impl Em {
         let raw = f("OFFSET") as u32;
         let off = if global { (((raw << 20) as i32) >> 20) as u32 } else { raw };
         let t = self.t();
-        self.emit_flat_addr(global, op.ends_with("_addtid"), saddr, f("ADDR"), off, 0, store, &t);
+        let addtid = op.ends_with("_addtid");
+        self.emit_flat_addr(global, addtid, saddr, f("ADDR"), off, 0, store, &t);
+        let group = if store || addtid {
+            None
+        } else {
+            let has_saddr = global && saddr != 0x7D && saddr != 0x7F;
+            let (sgprs, vgprs) = if has_saddr { (3u128 << saddr, vec![f("ADDR")]) } else { (0, vec![f("ADDR"), f("ADDR") + 1]) };
+            let imm = if global { off as i32 as i64 } else { off as i64 };
+            let key = format!("flat|{global}|{has_saddr}|{saddr}|{}", f("ADDR"));
+            self.page_group(key, sgprs, vgprs, imm, 4 * count as i64, format!("{t}_a & ~3u"), count as usize)
+        };
         let act = self.act();
         let mut st = Vec::new();
         for i in 0..count {
@@ -4530,7 +4951,10 @@ impl Em {
                 st.push(format!("mem.Store(({t}_a + {}u) & ~3u, {v});", 4 * i));
             } else {
                 let v = self.vreg(f("VDST") + i);
-                st.push(format!("{v} = mem.Load(({t}_a + {}u) & ~3u);", 4 * i));
+                let a = format!("({t}_a + {}u) & ~3u", 4 * i);
+                let mem = self.group_call(group, "Load", &a);
+                let word = if self.code_loads { format!("{t}_pc ? xcl_code({a}) : {mem}") } else { mem };
+                st.push(format!("{v} = {word};"));
             }
         }
         self.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
@@ -4593,6 +5017,9 @@ impl Em {
         let x2 = op.ends_with("_x2");
         let op = op.trim_end_matches("_x2");
         self.emit_flat_addr(global, false, saddr, f("ADDR"), off, if x2 { 7 } else { 3 }, true, &t);
+        if self.opt.mem_windows > 1 {
+            self.line(&format!("xcl_origin = select(((uint)xcl_ea & {}u) != 0u, 0xffffffffu, xcl_origin);", if x2 { 7 } else { 3 }));
+        }
         let act = self.act();
         if x2 {
             let data = f("DATA");
@@ -4602,7 +5029,7 @@ impl Em {
         self.line(&format!("uint {t}_old = 0u;"));
         let cmpv = self.vreg(f("DATA") + 1);
         let body = match op {
-            "inc" | "dec" | "csub" | "fcmpswap" => rmw32(op, &At::Mem(format!("{t}_a")), &v, &cmpv, &format!("{t}_old"), &t).ok_or("FLAT atomic")?,
+            "inc" | "dec" | "csub" | "fcmpswap" | "fmin" | "fmax" => rmw32(op, &At::Mem(format!("{t}_a")), &v, &cmpv, &format!("{t}_old"), &t).ok_or("FLAT atomic")?,
             "add" => format!("mem.InterlockedAdd({t}_a, {v}, {t}_old);"),
             "sub" => format!("mem.InterlockedAdd({t}_a, 0u - {v}, {t}_old);"),
             "and" => format!("mem.InterlockedAnd({t}_a, {v}, {t}_old);"),
@@ -4617,7 +5044,6 @@ impl Em {
                 let cmp = self.vreg(f("DATA") + 1);
                 format!("mem.InterlockedCompareExchange({t}_a, {cmp}, {v}, {t}_old);")
             }
-            "fmin" | "fmax" => float_minmax_mem(op == "fmin", false, &format!("{t}_a"), &v, &format!("{t}_old"), &t),
             _ => return Err("FLAT atomic"),
         };
         self.line(&format!("if ({act}) {{ {body} }}"));
@@ -4645,8 +5071,11 @@ impl Em {
                 let (el, eh) = (self.sreg(126), self.sreg(127));
                 let eh = if self.opt.wave64 { eh } else { "0u".into() };
                 self.line(&format!("uint {t}_l = {src};"));
-                let rla = self.rla_half_fn();
-                self.line(&format!("uint {t} = {rla}({a}, {t}_l);"));
+                let read = match self.quad_read(&a, quad_pattern(32, |i| swizzle_lane(off16, i))) {
+                    Some(q) => q,
+                    None => format!("{}({a}, {t}_l)", self.rla_half_fn()),
+                };
+                self.line(&format!("uint {t} = {read};"));
                 self.line(&format!("{t} = select(lanebit_at({el}, {eh}, {t}_l), {t}, 0u);"));
                 let dst = Dst::V(f("VDST"));
                 self.write32(&dst, &t);
@@ -5096,6 +5525,13 @@ impl Em {
             h.push_str("static uint xcl_w = 0u;\nstatic uint xcl_wv = 0u;\nstatic uint xcl_uma_base = 0u;\n");
         }
         h.push_str(MEM_ACCESSORS_HERE);
+        if let Some(data) = self.opt.code_data.as_ref().filter(|_| self.code_loads) {
+            let n = data.words.len();
+            let words: Vec<String> = data.words.iter().map(|&w| hex(w)).collect();
+            let _ = writeln!(h, "static const uint xcl_code_d[{n}] = {{ {} }};", words.join(", "));
+            let _ = writeln!(h, "uint xcl_code(uint a) {{ uint i = (a - {}) >> 2; return i < {n}u ? xcl_code_d[i] : 0u; }}", hex(data.at));
+            h.push_str("uint xcl_code_unaligned(uint a) { uint b = a & ~3u; uint s = (a & 3u) * 8u; uint lo = xcl_code(b); return s == 0u ? lo : ((lo >> s) | (xcl_code(b + 4u) << ((32u - s) & 31u))); }\n");
+        }
         if self.carry_check {
             let _ = writeln!(
                 h,
@@ -5151,9 +5587,18 @@ impl Em {
             .collect();
         let _ = writeln!(h, "static const uint4 FMT_COMP[{}] = {{ {} }};", comps.len(), comps.join(", "));
         h.push_str(PRELUDE_MEM);
-        h.push_str(PRELUDE_MEM_ACCESS);
+        let fixed_mem_access;
+        let mem_access = if self.opt.bvh_node_fix {
+            let (_, helpers) = PRELUDE_MEM_ACCESS.split_once("
+uint4 ld_raw(").unwrap();
+            fixed_mem_access = format!("{PRELUDE_BVH_NODE_FIX}uint4 ld_raw({helpers}");
+            fixed_mem_access.as_str()
+        } else {
+            PRELUDE_MEM_ACCESS
+        };
+        h.push_str(mem_access);
         if windows > 1 {
-            h.push_str(&lane_helpers(PRELUDE_MEM_ACCESS));
+            h.push_str(&lane_helpers(mem_access));
         }
         if self.uses_scratch {
             h.push_str(PRELUDE_SCRATCH);
@@ -5168,12 +5613,21 @@ impl Em {
         sg.extend([106, 107, 124, 126, 127]);
         sg.extend(&self.fmt_regs);
         let load_sgprs = |h: &mut String| {
+            let ngg = matches!(self.opt.mode, Mode::Mesh(_));
+            if ngg {
+                let delta = super::NGG_USER_DISPLACEMENT;
+                let _ = writeln!(h, "    uint xcl_ngg_displacement = select(io.Load({}u) == {delta}u, {delta}u, 0u);", super::IO_NGG_USER_DISPLACEMENT * 4);
+            }
             let _ = writeln!(h, "    xcl_mem_views = io.Load({}u);", super::IO_MEM_VIEWS * 4);
             if windows > 1 {
-                let _ = writeln!(h, "    xcl_w = 0u;\n    xcl_uma_base = io.Load({}u);", super::IO_UMA_BASE_HI * 4);
+                let _ = writeln!(h, "    xcl_w = 0u;\n    xcl_uma_base = io.Load({}u);\n    xcl_page_table = xcl_topology_for_recording(io.Load({}u));", super::IO_UMA_BASE_HI * 4, super::IO_PHYSICAL_TABLE * 4);
             }
             for &c in &sg {
-                let _ = writeln!(h, "    uint {} = io.Load({}u);", sname(c).unwrap(), c * 4);
+                if ngg && (8..32).contains(&c) {
+                    let _ = writeln!(h, "    uint {} = io.Load(xcl_ngg_displacement + {}u);", sname(c).unwrap(), c * 4);
+                } else {
+                    let _ = writeln!(h, "    uint {} = io.Load({}u);", sname(c).unwrap(), c * 4);
+                }
             }
         };
         match &self.opt.mode {
@@ -5302,6 +5756,7 @@ impl Em {
                     h,
                     "[WaveSize({hw_lanes})]\n[numthreads({hx}, {hy}, {hz})]\nvoid main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)\n{{"
                 );
+                if self.material_gate.is_some() { h.push_str(super::pso::material_gate::ENTRY); }
                 if self.safe_barrier {
                     h.push_str("    xcl_s_barrier_init(gi);\n");
                 }
@@ -6005,6 +6460,13 @@ fn cmp_op(rest: &str) -> Option<(&'static str, bool)> {
 enum At {
     Mem(String),
     Ref(String),
+    FloatRef(String),
+}
+
+fn atomic_retry(ty: &str, load: &str, cx: &str, new: &str, old: &str, t: &str) -> String {
+    format!(
+        "{ty} {t}_c = {load}; [allow_uav_condition] for (uint {t}_i = 0u; {t}_i < 1024u; {t}_i++) {{ {ty} {t}_n = {new}; {ty} {t}_p = 0; {cx} if ({t}_p == {t}_c) break; {t}_c = {t}_p; if ({t}_i == 1023u) xcl_trip(3u); }} {old} = {t}_c;"
+    )
 }
 
 /// A 32-bit atomic read-modify-write: HLSL statements leaving the old value in `old` (a
@@ -6015,20 +6477,21 @@ fn rmw32(op: &str, at: &At, v: &str, v2: &str, old: &str, t: &str) -> Option<Str
     let direct = |f: &str, val: &str| match at {
         At::Mem(a) => format!("mem.{f}({a}, {val}, {old});"),
         At::Ref(r) => format!("{f}({r}, {val}, {old});"),
+        At::FloatRef(_) => unreachable!("integer atomic on a float view"),
     };
     let cas = |new: String| {
         let (load, cx) = match at {
             At::Mem(a) => (format!("mem.Load({a})"), format!("mem.InterlockedCompareExchange({a}, {t}_c, {t}_n, {t}_p);")),
             At::Ref(r) => (r.clone(), format!("InterlockedCompareExchange({r}, {t}_c, {t}_n, {t}_p);")),
+            At::FloatRef(r) => (format!("asuint({r})"), format!("float {t}_fp; InterlockedCompareExchangeFloatBitwise({r}, asfloat({t}_c), asfloat({t}_n), {t}_fp); {t}_p = asuint({t}_fp);")),
         };
-        format!(
-            "uint {t}_c = {load}; [allow_uav_condition] for (uint {t}_i = 0u; {t}_i < 1024u; {t}_i++) {{ uint {t}_n = {new}; uint {t}_p = 0u; {cx} if ({t}_p == {t}_c) break; {t}_c = {t}_p; if ({t}_i == 1023u) xcl_trip(3u); }} {old} = {t}_c;"
-        )
+        atomic_retry("uint", &load, &cx, &new, old, t)
     };
     let c = format!("{t}_c");
     let signed = |f: &str, pick: &str| match at {
         At::Mem(a) => format!("int {t}_s = 0; mem.{f}({a}, (int){v}, {t}_s); {old} = (uint){t}_s;"),
         At::Ref(_) => cas(format!("(uint){pick}((int){c}, (int){v})")),
+        At::FloatRef(_) => unreachable!("signed atomic on a float view"),
     };
     Some(match op {
         "add" | "add_u32" => direct("InterlockedAdd", v),
@@ -6039,19 +6502,17 @@ fn rmw32(op: &str, at: &At, v: &str, v2: &str, old: &str, t: &str) -> Option<Str
         "swap" | "wrxchg_b32" => direct("InterlockedExchange", v),
         "umin" | "min_u32" => direct("InterlockedMin", v),
         "umax" | "max_u32" => direct("InterlockedMax", v),
-        // float compare-swap compares bits (differs only for -0 / NaN)
-        "cmpswap" | "fcmpswap" | "cmpst_b32" | "cmpst_f32" => match at {
+        "cmpswap" | "cmpst_b32" => match at {
             At::Mem(a) => format!("mem.InterlockedCompareExchange({a}, {v2}, {v}, {old});"),
             At::Ref(r) => format!("InterlockedCompareExchange({r}, {v2}, {v}, {old});"),
+            At::FloatRef(_) => unreachable!("integer compare-swap on a float view"),
         },
+        "fcmpswap" | "cmpst_f32" => cas(format!("(xcl_atomic_order({c}, {v2}) == 0 ? {v} : {c})")),
         "smin" | "min_i32" => signed("InterlockedMin", "min"),
         "smax" | "max_i32" => signed("InterlockedMax", "max"),
         "fmin" | "fmax" | "min_f32" | "max_f32" => {
-            let min = op == "fmin" || op == "min_f32";
-            match at {
-                At::Mem(a) => float_minmax_mem(min, false, a, v, old, t),
-                At::Ref(_) => cas(format!("asuint({}(asfloat({c}), asfloat({v})))", if min { "min" } else { "max" })),
-            }
+            let order = if op == "fmin" || op == "min_f32" { -1 } else { 1 };
+            cas(format!("(xcl_atomic_order({v}, {c}) == {order} ? {v} : {c})"))
         }
         "rsub" | "rsub_u32" => cas(format!("{v} - {c}")),
         "inc" | "inc_u32" => cas(format!("select({c} >= {v}, 0u, {c} + 1u)")),
@@ -6066,16 +6527,18 @@ fn rmw32(op: &str, at: &At, v: &str, v2: &str, old: &str, t: &str) -> Option<Str
 /// A 64-bit atomic at byte address `a` of the flat memory (SM 6.6 InterlockedXxx64);
 /// `v`, `cmp`, `old` are uint64_t variables.
 fn rmw64(op: &str, a: &str, v: &str, cmp: &str, old: &str, t: &str) -> Option<String> {
-    if matches!(op, "inc" | "dec") {
+    if matches!(op, "inc" | "dec" | "fmin" | "fmax" | "fcmpswap") {
         let c = format!("{t}_c");
-        let new = if op == "inc" {
-            format!("({c} >= {v}) ? (uint64_t)0 : {c} + (uint64_t)1")
-        } else {
-            format!("({c} == (uint64_t)0 || {c} > {v}) ? {v} : {c} - (uint64_t)1")
+        let new = match op {
+            "inc" => format!("({c} >= {v}) ? (uint64_t)0 : {c} + (uint64_t)1"),
+            "dec" => format!("({c} == (uint64_t)0 || {c} > {v}) ? {v} : {c} - (uint64_t)1"),
+            "fmin" => format!("xcl_atomic_order({v}, {c}) == -1 ? {v} : {c}"),
+            "fmax" => format!("xcl_atomic_order({v}, {c}) == 1 ? {v} : {c}"),
+            _ => format!("xcl_atomic_order({c}, {cmp}) == 0 ? {v} : {c}"),
         };
-        return Some(format!(
-            "uint2 {t}_l = mem.Load2({a}); uint64_t {t}_c = (uint64_t){t}_l.x | ((uint64_t){t}_l.y << 32); [allow_uav_condition] for (uint {t}_i = 0u; {t}_i < 1024u; {t}_i++) {{ uint64_t {t}_n = {new}; uint64_t {t}_p = 0; mem.InterlockedCompareExchange64({a}, {t}_c, {t}_n, {t}_p); if ({t}_p == {t}_c) break; {t}_c = {t}_p; if ({t}_i == 1023u) xcl_trip(3u); }} {old} = {t}_c;"
-        ));
+        let load = format!("(uint64_t){t}_l.x | ((uint64_t){t}_l.y << 32)");
+        let cx = format!("mem.InterlockedCompareExchange64({a}, {t}_c, {t}_n, {t}_p);");
+        return Some(format!("uint2 {t}_l = mem.Load2({a}); {}", atomic_retry("uint64_t", &load, &cx, &new, old, t)));
     }
     let f = match op {
         "add" | "sub" => "InterlockedAdd64",
@@ -6089,32 +6552,11 @@ fn rmw64(op: &str, a: &str, v: &str, cmp: &str, old: &str, t: &str) -> Option<St
             let f = if op == "smin" { "InterlockedMin64" } else { "InterlockedMax64" };
             return Some(format!("int64_t {t}_s = 0; mem.{f}({a}, (int64_t){v}, {t}_s); {old} = (uint64_t){t}_s;"));
         }
-        // float compare-swap compares the whole 64-bit payload bitwise (like rmw32's
-        // fcmpswap): differs from a numeric f64 compare only for -0 / NaN
-        "cmpswap" | "fcmpswap" => return Some(format!("mem.InterlockedCompareExchange64({a}, {cmp}, {v}, {old});")),
-        "fmin" | "fmax" => return Some(float_minmax_mem(op == "fmin", true, a, v, old, t)),
+        "cmpswap" => return Some(format!("mem.InterlockedCompareExchange64({a}, {cmp}, {v}, {old});")),
         _ => return None,
     };
     let val = if op == "sub" { format!("((uint64_t)0 - {v})") } else { v.to_string() };
     Some(format!("mem.{f}({a}, {val}, {old});"))
-}
-
-/// Float min / max at byte address `a` of the flat memory as one integer atomic (no CAS loop:
-/// a program with 168 such loops was too much for the driver's compiler). Non-negative floats
-/// order like signed ints, negative ones like unsigned ints in reverse. The operand takes the
-/// signed path iff its bits are at most those of +inf: +0.0 … +inf. -0.0 (sign bit set)
-/// compares equal to 0.0 as a float but orders below every non-negative value here, so it
-/// takes the unsigned path, as do negative values and NaNs. `x2`: f64 (`v`, `old` are
-/// uint64_t), else f32 (uint).
-fn float_minmax_mem(min: bool, x2: bool, a: &str, v: &str, old: &str, t: &str) -> String {
-    let (pos, neg) = if min { ("InterlockedMin", "InterlockedMax") } else { ("InterlockedMax", "InterlockedMin") };
-    if x2 {
-        format!(
-            "if ({v} <= 0x7FF0000000000000ull) {{ int64_t {t}_s = 0; mem.{pos}64({a}, (int64_t){v}, {t}_s); {old} = (uint64_t){t}_s; }} else {{ mem.{neg}64({a}, {v}, {old}); }}"
-        )
-    } else {
-        format!("if ({v} <= 0x7F800000u) {{ int {t}_s = 0; mem.{pos}({a}, asint({v}), {t}_s); {old} = asuint({t}_s); }} else {{ mem.{neg}({a}, {v}, {old}); }}")
-    }
 }
 
 /// Placeholder where the memory window accessors go (after the `xcl_mem_views` declaration).
@@ -6146,19 +6588,24 @@ fn windowed(h: &str, windows: u32, coherence: MemCoherence) -> String {
         }
     }
     out.push_str(rest);
-    out.replacen(MEM_ACCESSORS_HERE, &mem_accessors(windows, coherence), 1)
+    let groups = out.contains("xcl_group_pages(");
+    out.replacen(MEM_ACCESSORS_HERE, &mem_accessors(windows, coherence, groups), 1)
 }
 
 /// The accessor functions: one per `mem` method (and overload) the translator emits, each on
 /// the raw view of its window in the descriptor heap (`IO_MEM_VIEWS`: window k at
 /// `xcl_mem_views + k`, a 4 GB view each) – one memory access per access, where root
 /// descriptors (not indexable) took a switch over the windows that cost the driver four times
-/// the code. With several windows an out-of-range window is the null view `MEM_NULL_VIEW`
-/// (`clamp_window`: reads return 0, stores and atomics are dropped, atomics return 0), so
-/// out-of-UMA pointers never wrap onto live memory windows – with no branch per access.
+/// the code. The multi-window path resolves explicit mappings before the default UMA view.
+/// Misses use `MEM_NULL_VIEW`.
 /// `xcl_m` accessors index with the wave's window (`xcl_w`, from scalar registers: a uniform
 /// index), `xcl_v` ones with a lane's (`xcl_wv`, `NonUniformResourceIndex`).
-fn mem_accessors(windows: u32, coherence: MemCoherence) -> String {
+#[cfg(test)]
+pub(super) fn plain_mem_accessors(windows: u32, groups: bool) -> String {
+    mem_accessors(windows, MemCoherence::Plain, groups)
+}
+
+fn mem_accessors(windows: u32, coherence: MemCoherence, groups: bool) -> String {
     let mut sigs: Vec<(&str, String, &str, &str)> = vec![
         ("uint", "Load".into(), "uint a", "a"),
         ("uint2", "Load2".into(), "uint a", "a"),
@@ -6189,24 +6636,155 @@ fn mem_accessors(windows: u32, coherence: MemCoherence) -> String {
     };
     let mut s = String::new();
     let coherent = if matches!(coherence, MemCoherence::Plain) { "" } else { "globallycoherent " };
-    for &(prefix, view) in families {
-        let get = format!("{coherent}RWByteAddressBuffer xcl_mb = ResourceDescriptorHeap[{view}];");
-        if prefix == "xcl_m" {
-            let _ = writeln!(s, "uint4 xcl_loadx4(uint4 a) {{ {get} return uint4(xcl_mb.Load(a.x), xcl_mb.Load(a.y), xcl_mb.Load(a.z), xcl_mb.Load(a.w)); }}");
-        }
-        for (ret, name, params, args) in &sigs {
-            let ret_kw = if *ret == "void" { "" } else { "return " };
-            let _ = writeln!(s, "{ret} {prefix}{name}({params}) {{ {get} {ret_kw}xcl_mb.{name}({args}); }}");
+    if windows > 1 {
+        let _ = writeln!(s, "static const uint xcl_windows = {windows}u;");
+        s.push_str(super::GPU_PAGE_DIRECTORY_HLSL);
+        s.push_str(PHYSICAL_ACCESS);
+        if groups {
+            s.push_str(&PAGE_GROUPS.replace("XCL_NULL_VIEW", &super::MEM_NULL_VIEW.to_string()));
         }
     }
-    if matches!(coherence, MemCoherence::CachedBefore(_)) {
-        let view = families[0].1;
-        for (name, ret) in [("Load", "uint"), ("Load2", "uint2"), ("Load4", "uint4")] {
-            let _ = writeln!(s, "{ret} xcl_m_cached{name}(uint a) {{ RWByteAddressBuffer xcl_mb = ResourceDescriptorHeap[{view}]; return xcl_mb.{name}(a); }}");
+    for &(prefix, view) in families {
+        let w = if prefix == "xcl_m" { "xcl_w" } else { "xcl_wv" };
+        for cached in [false, true] {
+            if cached && (prefix != "xcl_m" || !matches!(coherence, MemCoherence::CachedBefore(_))) {
+                continue;
+            }
+            let prefix = if cached { "xcl_m_cached" } else { prefix };
+            let qual = if cached { "" } else { coherent };
+            let get = format!("{qual}RWByteAddressBuffer xcl_mb = ResourceDescriptorHeap[{view}];");
+            for (ret, name, params, args) in &sigs {
+                if cached && !matches!(name.as_str(), "Load" | "Load2" | "Load4") {
+                    continue;
+                }
+                let ret_kw = if *ret == "void" { "" } else { "return " };
+                let _ = write!(s, "{ret} {prefix}{name}({params}) {{ {get} ");
+                if windows > 1 {
+                    let n = name.strip_prefix("Load").or_else(|| name.strip_prefix("Store")).and_then(|x| x.parse::<u32>().ok()).unwrap_or(1);
+                    let bytes = if name.ends_with("64") { 8 } else { n * 4 };
+                    let _ = write!(s, "uint64_t va = xcl_operand_va(a); if (and(xcl_page_table == 0u, xcl_direct(va, {w}, {bytes}u))) {{ {ret_kw}xcl_mb.{name}({args}); ");
+                    if *ret == "void" { s.push_str("return; "); }
+                    s.push_str("} ");
+                    s.push_str("uint2 p = xcl_resolve_va(va); ");
+                    if n > 1 {
+                        let _ = write!(s, "if ((a & 65535u) > {}u) {{ uint2 q = xcl_resolve_va(xcl_operand_va((a | 65535u) + 2u)); ", 65536 - bytes);
+                        for k in 0..n {
+                            let o = 4 * k;
+                            let _ = write!(
+                                s,
+                                "uint a{k} = a + {o}u; bool f{k} = and(xcl_page_table == 0u, xcl_direct(xcl_operand_va(a{k}), {w}, 4u)); bool h{k} = (a{k} >> 16) == (a >> 16); \
+                                 {qual}RWByteAddressBuffer b{k} = ResourceDescriptorHeap[NonUniformResourceIndex(select(f{k}, xcl_mem_views + {w}, select(h{k}, p.x, q.x)))]; \
+                                 uint o{k} = select(f{k}, a{k}, select(h{k}, select(p.y == 0u, 0u, p.y + {o}u), select(q.y == 0u, 0u, q.y + ((a{k} & 65535u) - 1u)))); "
+                            );
+                        }
+                        if name.starts_with("Load") {
+                            let words = (0..n).map(|k| format!("b{k}.Load(o{k})")).collect::<Vec<_>>().join(", ");
+                            let _ = write!(s, "return {ret}({words}); ");
+                        } else {
+                            for k in 0..n {
+                                let _ = write!(s, "b{k}.Store(o{k}, v[{k}]); ");
+                            }
+                            s.push_str("return; ");
+                        }
+                        s.push_str("} ");
+                    }
+                    let _ = writeln!(s, "{qual}RWByteAddressBuffer b = ResourceDescriptorHeap[NonUniformResourceIndex(p.x)]; {ret_kw}b.{name}(p.y{}); }}", &args[1..]);
+                } else {
+                    let _ = writeln!(s, "{ret_kw}xcl_mb.{name}({args}); }}");
+                }
+            }
         }
+        if !groups {
+            continue;
+        }
+        let get = format!("{coherent}RWByteAddressBuffer xcl_mb = ResourceDescriptorHeap[{view}];");
+        for (n, ret) in [(1u32, "uint"), (2, "uint2"), (3, "uint3"), (4, "uint4")] {
+            let name = if n == 1 { "Load".to_string() } else { format!("Load{n}") };
+            let bytes = 4 * n;
+            let _ = write!(s, "{ret} {prefix}{name}G(uint a, uint64_t g, uint4 r) {{ {get} uint64_t va = xcl_operand_va(a); if (and(xcl_page_table == 0u, xcl_direct(va, {w}, {bytes}u))) {{ return xcl_mb.{name}(a); }} ");
+            if n > 1 {
+                let _ = write!(s, "if ((a & 65535u) > {}u) {{ ", 65536 - bytes);
+                for k in 0..n {
+                    let _ = write!(
+                        s,
+                        "uint a{k} = a + {}u; bool f{k} = and(xcl_page_table == 0u, xcl_direct(xcl_operand_va(a{k}), {w}, 4u)); uint2 p{k} = xcl_group_at(xcl_operand_va(a{k}), g, r); \
+                         {coherent}RWByteAddressBuffer b{k} = ResourceDescriptorHeap[NonUniformResourceIndex(select(f{k}, xcl_mem_views + {w}, p{k}.x))]; uint o{k} = select(f{k}, a{k}, p{k}.y); ",
+                        4 * k
+                    );
+                }
+                let words = (0..n).map(|k| format!("b{k}.Load(o{k})")).collect::<Vec<_>>().join(", ");
+                let _ = write!(s, "return {ret}({words}); }} ");
+            }
+            let _ = writeln!(s, "uint2 p = xcl_group_at(va, g, r); {coherent}RWByteAddressBuffer b = ResourceDescriptorHeap[NonUniformResourceIndex(p.x)]; return b.{name}(p.y); }}");
+        }
+    }
+    let view = families[0].1;
+    let _ = writeln!(s, "uint4 xcl_loadx4(uint4 a) {{ {coherent}RWByteAddressBuffer b = ResourceDescriptorHeap[{view}];");
+    if windows > 1 {
+        s.push_str("if (all((a >> 16) == (a.x >> 16))) { uint64_t va = xcl_operand_va(a.x); if (or(xcl_page_table != 0u, !xcl_direct(va, xcl_w, 4u))) { uint2 p = xcl_resolve_va(va); ");
+        let _ = writeln!(s, "{coherent}RWByteAddressBuffer x = ResourceDescriptorHeap[NonUniformResourceIndex(p.x)]; a = (p.y & 0xffff0000u) | (a & 65535u); return uint4(x.Load(a.x), x.Load(a.y), x.Load(a.z), x.Load(a.w)); }} }} else {{ return uint4(xcl_mLoad(a.x), xcl_mLoad(a.y), xcl_mLoad(a.z), xcl_mLoad(a.w)); }}");
+    }
+    s.push_str("return uint4(b.Load(a.x), b.Load(a.y), b.Load(a.z), b.Load(a.w)); }\n");
+    if windows > 1 && groups {
+        let _ = write!(s, "uint4 xcl_loadx4G(uint4 a, uint64_t g, uint4 r) {{ {coherent}RWByteAddressBuffer b = ResourceDescriptorHeap[{view}]; uint2 z = xcl_resolve_va(xcl_operand_va(0u)); ");
+        for (k, c) in ["x", "y", "z", "w"].iter().enumerate() {
+            let _ = write!(s, "uint64_t v{k} = xcl_operand_va(a.{c}); uint2 q{k} = xcl_group_at(v{k}, g, r); uint2 p{k} = uint2(select(a.{c} == 0u, z.x, q{k}.x), select(a.{c} == 0u, z.y, q{k}.y)); ");
+        }
+        let _ = write!(s, "if (all((a >> 16) == (a.x >> 16))) {{ if (or(xcl_page_table != 0u, !xcl_direct(v0, xcl_w, 4u))) {{ {coherent}RWByteAddressBuffer x = ResourceDescriptorHeap[NonUniformResourceIndex(p0.x)]; a = (p0.y & 0xffff0000u) | (a & 65535u); return uint4(x.Load(a.x), x.Load(a.y), x.Load(a.z), x.Load(a.w)); }} }} else {{ ");
+        for (k, c) in ["x", "y", "z", "w"].iter().enumerate() {
+            let _ = write!(s, "bool f{k} = and(xcl_page_table == 0u, xcl_direct(v{k}, xcl_w, 4u)); {coherent}RWByteAddressBuffer b{k} = ResourceDescriptorHeap[NonUniformResourceIndex(select(f{k}, xcl_mem_views + xcl_w, p{k}.x))]; uint o{k} = select(f{k}, a.{c}, p{k}.y); ");
+        }
+        s.push_str("return uint4(b0.Load(o0), b1.Load(o1), b2.Load(o2), b3.Load(o3)); }\nreturn uint4(b.Load(a.x), b.Load(a.y), b.Load(a.z), b.Load(a.w)); }\n");
     }
     s
 }
+
+/// The instruction helpers carry the low word of a byte address. Their component offsets are
+/// small signed deltas from the full effective address (alignment can round down by 3 bytes).
+/// Apply those deltas before selecting a page, including when the low word wraps.
+pub(super) const PHYSICAL_ACCESS: &str = r#"
+static uint xcl_page_table = 0u;
+static uint64_t xcl_ea = 0;
+static uint xcl_origin = 0u;
+
+uint xcl_topology_for_recording(uint locator) {
+    if (locator == 0u) return 0u;
+    ByteAddressBuffer selected = ResourceDescriptorHeap[locator];
+    return selected.Load(0u);
+}
+
+uint64_t xcl_operand_va(uint a) {
+    return select(and(xcl_ea == 0, xcl_origin == 0u), (uint64_t)a, xcl_ea + (uint64_t)(int64_t)(int)(a - (uint)xcl_ea));
+}
+bool xcl_direct(uint64_t va, uint w, uint bytes) {
+    uint hi = (uint)(va >> 32);
+    return and(and(xcl_origin <= 65535u, w < xcl_windows), and((uint)va <= 0xffffffffu - (bytes - 1u),
+        select(xcl_origin == 0u, and(hi == 0u, w == 0u), hi == xcl_uma_base + w)));
+}
+uint2 xcl_resolve_va(uint64_t va) {
+    uint hi = (uint)(va >> 32), lo = (uint)va;
+    uint2 miss = uint2(xcl_mem_views + 4u, 0u);
+    if (or(or(hi > 65535u, xcl_origin > 65535u), (xcl_origin == 0u) != (hi == 0u))) return miss;
+    return xcl_raw_gpuva(uint2(lo, select(hi == 0u, xcl_uma_base, hi)), xcl_page_table, xcl_mem_views, xcl_uma_base, xcl_windows);
+}
+uint2 xcl_resolve_read(uint a) { return xcl_resolve_va(xcl_operand_va(a)); }
+"#;
+
+/// A page group's pages (`Em::page_group`): those of the anchor `g` and the next, each resolved
+/// at the address 1 of its page, so a resolved offset of 0 is a miss and nothing else; and the
+/// page of an address `va` in them: `xcl_resolve_va(va)` for an address in the two pages, the
+/// null view elsewhere (an address a load's result is not taken from).
+pub(super) const PAGE_GROUPS: &str = r#"uint4 xcl_group_pages(uint64_t g) {
+    uint64_t s = g & ~0xffffull;
+    return uint4(xcl_resolve_va(s | 1ull), xcl_resolve_va(s + 0x10001ull));
+}
+uint2 xcl_group_at(uint64_t va, uint64_t g, uint4 r) {
+    uint64_t k = (va - (g & ~0xffffull)) >> 16;
+    uint x = select(k == 0ull, r.x, select(k == 1ull, r.z, xcl_mem_views + XCL_NULL_VIEWu));
+    uint y = select(k == 0ull, r.y, select(k == 1ull, r.w, 0u));
+    return uint2(x, select(y == 0u, 0u, y - 1u + ((uint)va & 65535u)));
+}
+"#;
 
 /// The memory helpers of `src` (`PRELUDE_MEM_ACCESS`, or a line of the program) on the
 /// per-lane window: `memv` and the helpers' `_v` forms.
@@ -6330,6 +6908,23 @@ uint fmt_comp(uint4 r, uint4 e) {
 // box32 (5) / box16 (4): 4 child ids + boxes → hit children (closest first when sorting),
 // misses 0xFFFFFFFF; triangle (0..3): (t numerator, denominator, i, j numerators), miss t = inf;
 // instance / AABB nodes are left to the shader (all 0xFFFFFFFF).
+int gather_axis(int i, int n, uint mode) {
+    if (mode <= 1u) {
+        int period = mode == 0u ? n : 2 * n;
+        int at = i % period;
+        at += at < 0 ? period : 0;
+        return at < n ? at : period - at - 1;
+    }
+    int at = ((mode & 1u) != 0u && i < 0) ? ~i : i;
+    if (mode >= 4u && (at < 0 || at >= n)) return -1;
+    return clamp(at, 0, n - 1);
+}
+float gather_compare(float reference, float texel, uint func) {
+    bool pass = func == 1u ? reference < texel : func == 2u ? reference == texel :
+        func == 3u ? reference <= texel : func == 4u ? reference > texel :
+        func == 5u ? reference != texel : func == 6u ? reference >= texel : func == 7u;
+    return pass ? 1.0f : 0.0f;
+}
 uint img_cls(uint fmt) { uint ty = select(fmt <= 77u, (FMT_INFO[min(fmt, 77u)] >> 3) & 7u, 6u); return select(ty == 4u, 1u, select(ty == 5u, 2u, 0u)); }
 void put_bits(inout uint4 r, uint off, uint w, uint v) {
     uint m = w >= 32u ? 0xFFFFFFFFu : ((1u << w) - 1u); v &= m;
@@ -6435,6 +7030,63 @@ void st_bytes(uint a, uint4 r, uint n) {
             if (s != 0u && s + 8u * rem > 32u) st_part(b + 4u * k + 4u, m >> (32u - s), w >> (32u - s));
         }
     }
+}
+"#;
+
+const PRELUDE_BVH_NODE_FIX: &str = r#"
+uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 inv, uint box_info, bool bary_mode) {
+    if (type == 4u || type == 5u) {
+        uint4 child = mem.Load4(at);
+        float tn[4]; uint id[4];
+        float grow = 1.0f + (box_info & 0xFFu) * 5.960464477539063e-8f;
+        bool3 negative = (asuint(inv) & 0x80000000u) != 0u;
+        [unroll] for (uint k = 0u; k < 4u; k++) {
+            float3 mn, mx;
+            if (type == 5u) { mn = asfloat(mem.Load3(at + 16u + 24u * k)); mx = asfloat(mem.Load3(at + 28u + 24u * k)); }
+            else { uint3 h = mem.Load3(at + 16u + 12u * k); mn = float3(f16tof32(h.x), f16tof32(h.x >> 16), f16tof32(h.y)); mx = float3(f16tof32(h.y >> 16), f16tof32(h.z), f16tof32(h.z >> 16)); }
+            float3 t1 = (mn - o) * inv, t2 = (mx - o) * inv;
+            float3 lo = select(negative, t2, t1);
+            float3 hi = select(negative, t1, t2);
+            float a = max(0.0f, max(max(lo.x, lo.y), lo.z));
+            float b = min(tmax, min(min(hi.x, hi.y), hi.z));
+            bool valid = and(child[k] != 0xFFFFFFFFu, !or(isnan(tmax), or(all(isnan(lo)), all(isnan(hi)))));
+            bool hit = and(valid, a <= b * grow);
+            tn[k] = hit ? a : asfloat(0x7F800000u);
+            id[k] = hit ? child[k] : 0xFFFFFFFFu;
+        }
+        if ((box_info & 0x100u) != 0u) {
+            uint2 pairs[5] = { uint2(0, 2), uint2(1, 3), uint2(0, 1), uint2(2, 3), uint2(1, 2) };
+            [unroll] for (uint p = 0u; p < 5u; p++) {
+                uint i = pairs[p].x, j = pairs[p].y;
+                if (tn[j] < tn[i]) { float ft = tn[i]; tn[i] = tn[j]; tn[j] = ft; uint ui = id[i]; id[i] = id[j]; id[j] = ui; }
+            }
+        }
+        return uint4(id[0], id[1], id[2], id[3]);
+    }
+    if (type <= 3u) {
+        const uint3 offsets[4] = { uint3(0, 12, 24), uint3(12, 36, 24), uint3(24, 36, 48), uint3(24, 48, 0) };
+        uint3 off = offsets[type];
+        float3 v0 = asfloat(mem.Load3(at + off.x)), v1 = asfloat(mem.Load3(at + off.y)), v2 = asfloat(mem.Load3(at + off.z));
+        float3 e1 = v1 - v0, e2 = v2 - v0, p = cross(d, e2);
+        float det = dot(e1, p);
+        float3 sv = o - v0, q = cross(sv, e1);
+        float i = dot(sv, p), j = dot(d, q), t = dot(e2, q);
+        // inside when i, j, 1 - i - j >= 0 relative to det (either winding); avoid det * det underflow/overflow
+        bool hit = det > 0.0f ? (t >= 0.0f && i >= 0.0f && j >= 0.0f && i + j <= det) : (det < 0.0f && t <= 0.0f && i <= 0.0f && j <= 0.0f && i + j >= det);
+        // barycentrics back to the original vertex order: triangle id @60, per triangle I / J source
+        float bc[4] = { det - i - j, i, j, det - i - j };
+        uint tid = mem.Load(at + 60u) >> (8u * type);
+        uint4 res = uint4(asuint(t), asuint(det), asuint(bc[tid & 3u]), asuint(bc[(tid >> 2) & 3u]));
+        if (bary_mode && (any(isnan(d)) || any(isnan(inv)) || isnan(tmax) || !all(isfinite(o))))
+            return uint4(0x7F800000u, asuint(1.0f), 0u, 0u);
+        if (hit) return res;
+        if (bary_mode && det != 0.0f && all(isfinite(float4(t, det, i, j)))) {
+            res.x = (res.y & 0x80000000u) | 0x7F800000u;
+            return res;
+        }
+        return uint4(0x7F800000u, asuint(1.0f), 0u, 0u);
+    }
+    return uint4(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
 }
 "#;
 
@@ -6727,7 +7379,7 @@ void xcl_trip(uint k) {
 }
 "#;
 
-const PRELUDE: &str = r#"// the high half of a 32 x 32-bit product, from 16-bit parts: DXC turns
+pub(super) const PRELUDE: &str = r#"// the high half of a 32 x 32-bit product, from 16-bit parts: DXC turns
 // `(uint)(((uint64_t)a * b) >> 32) != 0` (the console's integer division code) into
 // umul.with.overflow, which DXIL does not allow (validation fails)
 uint mul_hi_u32(uint a, uint b) {
@@ -6755,7 +7407,7 @@ uint rla(uint v, uint l) {
     // do not before SM 6.7), and the console's derivatives (DPP quad_perm, ds_swizzle) read the
     // helper pixels of a quad a primitive's edge splits.
     uint q0 = QuadReadLaneAt(v, 0u), q1 = QuadReadLaneAt(v, 1u), q2 = QuadReadLaneAt(v, 2u), q3 = QuadReadLaneAt(v, 3u);
-    uint q = (l & 2u) != 0u ? ((l & 1u) != 0u ? q3 : q2) : ((l & 1u) != 0u ? q1 : q0);
+    uint q = select((l & 2u) != 0u, select((l & 1u) != 0u, q3, q2), select((l & 1u) != 0u, q1, q0));
     // A helper lane of another quad: after s_wqm the console's v_readfirstlane often picks
     // one (the first lane of EXEC on a primitive's edge), and a wave read of it is undefined
     // here (0 in practice: every other quad of the wave got the wrong value, e.g. a shader's
@@ -6765,25 +7417,25 @@ uint rla(uint v, uint l) {
     uint nib = (xcl_lv[min(h >> 5, 3u)] >> (h & 28u)) & 15u;
     uint src = select(nib != 0u, (h & ~3u) + firstbitlow(nib), lane);
     uint r0 = WaveReadLaneAt(q0, src), r1 = WaveReadLaneAt(q1, src), r2 = WaveReadLaneAt(q2, src), r3 = WaveReadLaneAt(q3, src);
-    uint r = (l & 2u) != 0u ? ((l & 1u) != 0u ? r3 : r2) : ((l & 1u) != 0u ? r1 : r0);
-    if (nib != 0u && ((nib >> (h & 3u)) & 1u) == 0u) w = r;
-    if ((l >> 2) == (lane_id >> 2)) w = q;
+    uint r = select((l & 2u) != 0u, select((l & 1u) != 0u, r3, r2), select((l & 1u) != 0u, r1, r0));
+    w = select(and(nib != 0u, ((nib >> (h & 3u)) & 1u) == 0u), r, w);
+    w = select((l >> 2) == (lane_id >> 2), q, w);
 #endif
     return select(in_range, w, 0u);
 }
 bool lanebit_at(uint lo, uint hi, uint l) { return ((select(l < 32u, lo, hi) >> (l & 31u)) & 1u) != 0u; }
 uint sdwa_sel(uint x, uint sel, bool sext) {
     if (sel >= 6u) return x;
-    uint sh = sel < 4u ? 8u * sel : 16u * (sel - 4u); uint w = sel < 4u ? 8u : 16u;
+    uint sh = select(sel < 4u, 8u * sel, 16u * (sel - 4u)); uint w = select(sel < 4u, 8u, 16u);
     uint v = (x >> sh) & ((1u << w) - 1u);
-    return sext ? (uint)(((int)(v << (32u - w))) >> (32u - w)) : v;
+    return select(sext, (uint)(((int)(v << (32u - w))) >> (32u - w)), v);
 }
 uint sdwa_dst(uint r, uint old, uint sel, uint unused) {
     if (sel >= 6u) return r;
-    uint sh = sel < 4u ? 8u * sel : 16u * (sel - 4u); uint w = sel < 4u ? 8u : 16u;
+    uint sh = select(sel < 4u, 8u * sel, 16u * (sel - 4u)); uint w = select(sel < 4u, 8u, 16u);
     uint m = ((1u << w) - 1u) << sh; uint v = (r << sh) & m;
     if (unused == 2u) return (old & ~m) | v;
-    if (unused == 1u) { uint top = sh + w; bool s = ((r >> (w - 1u)) & 1u) != 0u; return v | ((s && top < 32u) ? (0xFFFFFFFFu << top) : 0u); }
+    if (unused == 1u) { uint top = sh + w; bool s = ((r >> (w - 1u)) & 1u) != 0u; return v | select(and(s, top < 32u), 0xFFFFFFFFu << top, 0u); }
     return v;
 }
 float cube_id(float x, float y, float z) { if (abs(z) >= abs(x) && abs(z) >= abs(y)) return z < 0.0f ? 5.0f : 4.0f; if (abs(y) >= abs(x)) return y < 0.0f ? 3.0f : 2.0f; return x < 0.0f ? 1.0f : 0.0f; }
@@ -6856,6 +7508,20 @@ float xcl_fmin(float a, float b) {
 float xcl_fmax(float a, float b) {
     uint aa = asuint(a), bb = asuint(b);
     return asfloat(select(((aa | bb) & 0x7FFFFFFFu) == 0u, aa & bb, asuint(max(a, b))));
+}
+int xcl_atomic_order(uint a, uint b) {
+    uint ax = a & 0x7fffffffu, bx = b & 0x7fffffffu;
+    if (ax > 0x7f800000u || bx > 0x7f800000u) return 2;
+    if (a == b || (ax | bx) == 0) return 0;
+    bool an = a != ax, bn = b != bx;
+    return (an != bn ? an : (an ? ax > bx : ax < bx)) ? -1 : 1;
+}
+int xcl_atomic_order(uint64_t a, uint64_t b) {
+    uint64_t ax = a & 0x7fffffffffffffffull, bx = b & 0x7fffffffffffffffull;
+    if (ax > 0x7ff0000000000000ull || bx > 0x7ff0000000000000ull) return 2;
+    if (a == b || (ax | bx) == 0) return 0;
+    bool an = a != ax, bn = b != bx;
+    return (an != bn ? an : (an ? ax > bx : ax < bx)) ? -1 : 1;
 }
 // IEEE-754 binary32 -> binary16 under RDNA2 MODE[3:2]: 0 = RNE, 1 = +inf, 2 = -inf, 3 = RTZ.
 uint f32_to_f16_rm(float f, uint rm) {

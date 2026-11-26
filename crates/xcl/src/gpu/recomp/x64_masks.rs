@@ -32,10 +32,10 @@ use crate::gpu::rdna2::{self, Decoded, Variant, F_CONDITIONAL, F_INDIRECT, F_TER
 /// SGPR set: bit n = s<n> (106/107 VCC, 124 M0, 126/127 EXEC).
 pub type Regs = u128;
 
-const VCC: Regs = 3 << 106;
-const M0: Regs = 1 << 124;
-const EXEC: Regs = 3 << 126;
-const ALL: Regs = !0;
+pub(super) const VCC: Regs = 3 << 106;
+pub(super) const M0: Regs = 1 << 124;
+pub(super) const EXEC: Regs = 3 << 126;
+pub(super) const ALL: Regs = !0;
 
 fn range(first: u64, n: u64) -> Regs {
     (first..(first + n).min(128)).fold(0, |m, r| m | 1u128 << r)
@@ -67,21 +67,38 @@ fn keeps_destination(name: &str) -> bool {
 /// (read whole, overwritten) SGPRs of one instruction. Lane-by-lane mask reads are left out
 /// of the first, writes that keep anything of the old value out of the second.
 pub fn uses(d: &Decoded) -> (Regs, Regs) {
+    let u = sgpr_use(d);
+    (u.whole, u.written)
+}
+
+/// The SGPRs an instruction reads and writes, as the emitter treats them.
+pub struct SgprUse {
+    /// read as a whole value
+    pub whole: Regs,
+    /// read lane by lane (a mask's own bit)
+    pub lane: Regs,
+    /// overwritten whatever their old value
+    pub written: Regs,
+    /// possibly written (`written` and partial or indirect writes)
+    pub maybe: Regs,
+}
+
+pub fn sgpr_use(d: &Decoded) -> SgprUse {
     let name = d.inst.name;
     if name.starts_with("S_MOVREL") {
         // `smovrel`: s[src + m0] is read, s[dst + m0] written (s_movrelsd_2: both) – any
         // register from the encoded one up to s123, VCC included; nothing for certain
         // overwritten
         let src = rdna2::field_value(d.enc, &d.words, "SSRC0").unwrap_or(0).min(124);
-        return (range(src, 124 - src) | M0 | EXEC, 0);
+        return SgprUse { whole: range(src, 124 - src) | M0 | EXEC, lane: 0, written: 0, maybe: ALL };
     }
-    let (mut whole, mut written) = (0 as Regs, 0 as Regs);
+    let (mut whole, mut lane, mut written, mut maybe) = (0 as Regs, 0 as Regs, 0 as Regs, 0 as Regs);
     let per_lane = reads_mask_per_lane(name);
     let keeps = keeps_destination(name);
     // SDWA: scalar sources and the compare's destination are in the extension dword
     let mut sdwa_dst = None;
     if d.variant == Variant::Sdwa {
-        let Some(e) = ext_encoding(d) else { return (ALL, 0) };
+        let Some(e) = ext_encoding(d) else { return SgprUse { whole: ALL, lane: 0, written: 0, maybe: ALL } };
         let fv = |n: &str| rdna2::field_value(e, &d.words, n).unwrap_or(0);
         if fv("S0") == 1 {
             whole |= scalar_code(fv("VSRC0"), 1);
@@ -112,19 +129,23 @@ pub fn uses(d: &Decoded) -> (Regs, Regs) {
             }
         };
         if o.output {
+            maybe |= regs;
             if keeps {
                 whole |= regs;
             } else {
                 written |= regs;
             }
-        } else if !(per_lane && (o.ty == "OPR_VCC" || o.field == Some("SRC2"))) {
+        } else if per_lane && (o.ty == "OPR_VCC" || o.field == Some("SRC2")) {
+            lane |= regs;
+        } else {
             whole |= regs;
         }
     }
     if let Some(dst) = sdwa_dst {
         written = (written & !VCC) | dst;
+        maybe |= dst;
     }
-    (whole, written)
+    SgprUse { whole, lane, written, maybe }
 }
 
 /// SGPRs an instruction may write, in whole or in part: `uses`' overwritten ones, or all of them
@@ -138,13 +159,28 @@ pub fn may_write(d: &Decoded) -> Regs {
     written
 }
 
+/// Where each emitted loop's iteration guard (`LOOP_GUARD`) may leave it to: the address
+/// ranges of its instructions and the address it continues at (None: the end of the program).
+pub type GuardExits = Vec<(Vec<(u64, u64)>, Option<u64>)>;
+
+/// The guard exits of the `pc` chain's loops (`loop_ranges`): a loop may be left at its top,
+/// before the head instruction, and before every block of it in the dispatcher form – to the
+/// code after it or to the end of the program (no later block matches the `pc` it leaves with).
+pub fn range_exits(insts: &[Decoded]) -> GuardExits {
+    super::loop_ranges(insts).into_iter().map(|(a, b)| (vec![(a, b)], insts.iter().map(|d| d.pc).find(|&pc| pc >= b))).collect()
+}
+
 /// For each instruction (index in `insts`): the SGPRs whose whole value may be read after it.
 /// `end_reads_all`: the program's end reads every SGPR (kernel mode).
 pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
+    whole_live_out_with(insts, end_reads_all, &range_exits(insts))
+}
+
+/// Each instruction's successors (None: unknown, an indirect jump) and the instructions its
+/// loops' guards may leave to before it (None: the end of the program).
+pub(super) fn graph(insts: &[Decoded], guard: &GuardExits) -> (Vec<Option<Vec<usize>>>, Vec<Vec<Option<usize>>>) {
     let pcs: BTreeMap<u64, usize> = insts.iter().enumerate().map(|(i, d)| (d.pc, i)).collect();
-    let at_end = if end_reads_all { ALL } else { EXEC };
-    // successors; None = unknown (indirect): everything is live
-    let succ: Vec<Option<Vec<usize>>> = insts
+    let succ = insts
         .iter()
         .enumerate()
         .map(|(i, d)| {
@@ -168,16 +204,23 @@ pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
             Some(out)
         })
         .collect();
-    // `LOOP_GUARD`: a loop may be left where its guard runs – at its top, before the head
-    // instruction, and in the `pc` dispatcher form before every block of it – to the code
-    // after it (structured) or the end of the program (dispatcher: no later block matches
-    // the `pc` it leaves with). Taken as: before any instruction of a loop, whatever is live
-    // after the loop or at the end may be read.
-    let loops = super::loop_ranges(insts);
-    let exits: Vec<Vec<Option<usize>>> = insts
-        .iter()
-        .map(|d| loops.iter().filter(|&&(a, b)| a <= d.pc && d.pc < b).map(|&(_, b)| pcs.range(b..).next().map(|(_, &j)| j)).collect())
-        .collect();
+    let mut exits = vec![Vec::new(); insts.len()];
+    for (ranges, to) in guard {
+        let to = to.and_then(|t| pcs.get(&t).copied());
+        for &(a, b) in ranges {
+            for e in &mut exits[insts.partition_point(|d| d.pc < a)..insts.partition_point(|d| d.pc < b)] {
+                e.push(to);
+            }
+        }
+    }
+    (succ, exits)
+}
+
+/// `whole_live_out` for the loops of `guard`: before any instruction of a loop, whatever is
+/// live where its guard leaves to, or at the end, may be read.
+pub fn whole_live_out_with(insts: &[Decoded], end_reads_all: bool, guard: &GuardExits) -> Vec<Regs> {
+    let at_end = if end_reads_all { ALL } else { EXEC };
+    let (succ, exits) = graph(insts, guard);
     let gen_kill: Vec<(Regs, Regs)> = insts.iter().map(uses).collect();
     let mut live_in = vec![0 as Regs; insts.len()];
     let mut live_out = vec![0 as Regs; insts.len()];
@@ -205,8 +248,8 @@ pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
 }
 
 /// pc → SGPRs whole-live after that instruction, for the emitter.
-pub fn by_pc(insts: &[Decoded], end_reads_all: bool) -> BTreeMap<u64, Regs> {
-    insts.iter().map(|d| d.pc).zip(whole_live_out(insts, end_reads_all)).collect()
+pub fn by_pc(insts: &[Decoded], end_reads_all: bool, guard: &GuardExits) -> BTreeMap<u64, Regs> {
+    insts.iter().map(|d| d.pc).zip(whole_live_out_with(insts, end_reads_all, guard)).collect()
 }
 
 #[cfg(test)]

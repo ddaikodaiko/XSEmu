@@ -167,8 +167,13 @@ struct Bound {
 
 /// Heap index of the first memory window's raw view (io[`IO_MEM_VIEWS`]), after the SRV / UAV
 /// pairs of `textures` test textures.
-fn mem_views_at(textures: usize) -> u32 {
+pub(super) fn mem_views_at(textures: usize) -> u32 {
     (2 * textures).max(2) as u32
+}
+
+fn set_memory_views(io: &mut [u32], textures: usize) {
+    io[super::IO_MEM_VIEWS] = mem_views_at(textures);
+    io[super::IO_PHYSICAL_TABLE] = 0;
 }
 
 /// Descriptors `mem_views` writes: the four windows and the null view.
@@ -194,12 +199,12 @@ unsafe fn mem_views(dev: &ID3D12Device, heap: &ID3D12DescriptorHeap, textures: u
 /// Create the descriptor heaps (always, so the directly indexed root signature is valid),
 /// the test textures and samplers, and the views of the memory windows `mem`; record the
 /// uploads into `list`.
-unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, textures: &[TestTexture], samplers: &[TestSampler], mem: &[&ID3D12Resource]) -> Result<Bound, String> {
+unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, textures: &[TestTexture], samplers: &[TestSampler], mem: &[&ID3D12Resource], directory: &[ID3D12Resource]) -> Result<Bound, String> {
     let n = mem_views_at(textures.len()) + MEM_VIEWS;
     let heap: ID3D12DescriptorHeap = dev
         .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
             Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            NumDescriptors: n,
+            NumDescriptors: n + directory.len() as u32,
             Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
             NodeMask: 0,
         })
@@ -337,6 +342,19 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
         out.push((r, rfps, readable));
     }
     mem_views(dev, &heap, textures.len(), mem);
+    for (i, resource) in directory.iter().enumerate() {
+        let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Buffer: D3D12_BUFFER_SRV {
+                NumElements: (resource.GetDesc().Width / 4) as u32,
+                Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                ..Default::default()
+            } },
+        };
+        dev.CreateShaderResourceView(resource, Some(&srv), at(&heap, n as usize + i, inc));
+    }
     list.SetDescriptorHeaps(&[Some(heap.clone()), Some(sheap.clone())]);
     Ok(Bound { _heaps: [heap, sheap], textures: out, _upload: upload })
 }
@@ -496,7 +514,7 @@ pub fn run_with_statics(
     let mut io: Vec<u32> = state.sgpr.clone();
     io.resize(KERNEL_SGPRS, 0);
     io[KERNEL_SCC_SLOT] = state.scc;
-    io[super::IO_MEM_VIEWS] = mem_views_at(textures.len());
+    set_memory_views(&mut io, textures.len());
     for lane in 0..KERNEL_LANES {
         let mut regs = state.vgpr.get(lane).cloned().unwrap_or_default();
         regs.resize(KERNEL_VGPRS, 0);
@@ -537,7 +555,7 @@ pub fn run_with_statics(
             transition(&mem_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
             transition(&res_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         ]);
-        let bound = bind_resources(dev, &list, textures, samplers, &[&mem_buf])?;
+        let bound = bind_resources(dev, &list, textures, samplers, &[&mem_buf], &[])?;
         list.SetComputeRootSignature(&rs);
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
@@ -630,8 +648,11 @@ pub fn run_code_with(code: &[u8], state: &KernelState, mem: &[u32], textures: &[
 
 /// Translate + compile + run RDNA2 code as a kernel.
 pub fn run_code(code: &[u8], state: &KernelState, mem: &[u32]) -> Result<KernelResult, String> {
-    let opt = options(super::Mode::Kernel);
-    let t = super::translate(code, &opt)?;
+    run_code_with_options(code, state, mem, &options(super::Mode::Kernel))
+}
+
+pub(super) fn run_code_with_options(code: &[u8], state: &KernelState, mem: &[u32], opt: &super::Options) -> Result<KernelResult, String> {
+    let t = super::translate(code, opt)?;
     if !t.complete() {
         return Err(format!("unsupported instructions: {:?}", t.unsupported));
     }
@@ -951,7 +972,7 @@ fn draw_indexed_on(
         for d in draws {
             let mut r = d.sgprs.clone();
             r.resize(KERNEL_SGPRS, 0);
-            r[super::IO_MEM_VIEWS] = mem_views_at(textures.len());
+            set_memory_views(&mut r, textures.len());
             io.extend_from_slice(&r);
         }
         let io_bytes = (io.len() * 4) as u64;
@@ -1233,7 +1254,7 @@ fn mesh_draw_with(
 
         let mut io = sgprs.to_vec();
         io.resize(KERNEL_SGPRS, 0);
-        io[super::IO_MEM_VIEWS] = mem_views_at(0);
+        set_memory_views(&mut io, 0);
         let io_bytes = (io.len() * 4) as u64;
         let mem_len = mem.len().max(64);
         let mem_bytes = (mem_len * 4) as u64;
@@ -1285,7 +1306,7 @@ fn mesh_draw_with(
                 Some((sig.ok_or("mesh command signature")?, max, args, bytes - 4, up))
             }
         };
-        let _bound = bind_resources(dev, &list, &[], &[], &[&mem_buf])?;
+        let _bound = bind_resources(dev, &list, &[], &[], &[&mem_buf], &[])?;
         if cpso.is_some() {
             // pass 1: the console program as a compute shader
             list.SetComputeRootSignature(&gpu.rs);
@@ -1350,13 +1371,17 @@ unsafe impl Sync for Arena {}
 /// `run` with a unified memory region as `mem`: the GPU works on the process memory
 /// itself, no copies.
 pub fn run_in_arena(dxil: &[u8], state: &KernelState, arena: &crate::gpu::uma::Uma) -> Result<KernelResult, String> {
+    run_arena_kernel(dxil, state, arena, &[])
+}
+
+pub(super) fn run_arena_kernel(dxil: &[u8], state: &KernelState, arena: &crate::gpu::uma::Uma, directory: &[Vec<u32>]) -> Result<KernelResult, String> {
     let arena = Arena { windows: (0..arena.windows()).map(|k| (arena.window(k).0 as *mut u8, arena.window(k).1)).collect() };
-    let r = run_in_region(dxil, state, &arena);
+    let r = run_in_region(dxil, state, &arena, directory);
     std::mem::forget(arena); // owned by the Uma
     r
 }
 
-fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<KernelResult, String> {
+fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena, directory: &[Vec<u32>]) -> Result<KernelResult, String> {
     let mut g = GPU.lock().unwrap();
     let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
     let mut io: Vec<u32> = state.sgpr.clone();
@@ -1365,7 +1390,10 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
     if let Some(&(base, _)) = arena.windows.first() {
         io[super::IO_UMA_BASE_HI] = ((base as usize) >> 32) as u32;
     }
-    io[super::IO_MEM_VIEWS] = mem_views_at(0);
+    set_memory_views(&mut io, 0);
+    if !directory.is_empty() {
+        io[super::IO_PHYSICAL_TABLE] = mem_views_at(0) + MEM_VIEWS;
+    }
     for lane in 0..KERNEL_LANES {
         let mut regs = state.vgpr.get(lane).cloned().unwrap_or_default();
         regs.resize(KERNEL_VGPRS, 0);
@@ -1422,7 +1450,16 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
             list.ResourceBarrier(&[transition(b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
         }
         let views: Vec<&ID3D12Resource> = (0..4).map(|k| bufs.get(k).unwrap_or(&mem_buf)).collect();
-        let _bound = bind_resources(dev, &list, &[], &[], &views)?;
+        let mut tables = Vec::new();
+        for words in directory {
+            let r = buffer(dev, (4 * words.len()) as u64, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false)?;
+            let mut mapped = std::ptr::null_mut();
+            r.Map(0, None, Some(&mut mapped)).map_err(e)?;
+            std::ptr::copy_nonoverlapping(words.as_ptr(), mapped as *mut u32, words.len());
+            r.Unmap(0, None);
+            tables.push(r);
+        }
+        let _bound = bind_resources(dev, &list, &[], &[], &views, &tables)?;
         list.SetComputeRootSignature(&gpu.rs);
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
@@ -1606,7 +1643,7 @@ fn dispatch_with(
 ) -> Result<(Vec<u32>, Vec<f64>), String> {
     let mut io = sgprs.to_vec();
     io.resize(KERNEL_SGPRS, 0);
-    io[super::IO_MEM_VIEWS] = mem_views_at(0);
+    set_memory_views(&mut io, 0);
     let mem_len = mem.len().max(64);
     unsafe {
         let (io_bytes, mem_bytes) = ((io.len() * 4) as u64, (mem_len * 4) as u64);
@@ -1631,7 +1668,7 @@ fn dispatch_with(
             transition(&mem_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
             transition(&res_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         ]);
-        let _bound = bind_resources(dev, &list, &[], &[], &[&mem_buf])?;
+        let _bound = bind_resources(dev, &list, &[], &[], &[&mem_buf], &[])?;
         list.SetComputeRootSignature(rs);
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());

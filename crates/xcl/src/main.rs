@@ -51,6 +51,27 @@ Usage:
       cancels and keeps what is built (docs/launcher-protocol.md).
   XSEmu warm-up --mesh-only [--recent-used N]
       Builds only missing driver blobs for the mesh pipelines kept in the manifest.
+  XSEmu warm-up --blocking [--budget-s N] [--targets FILE] [--max-keys N] [--fresh] [--in-process]
+                         [--pool-children N] [--giant-children N] [--recycle-keys N] [--recycle-mb N]
+                         [--key-timeout-s N]
+      Replays every captured descriptor that held a bind or first use (the first N with
+      --max-keys) on one worker per logical core: translation, DXC and driver compiles run at
+      once within the memory governor; a waiting giant keeps smaller compiles from taking its
+      memory. Keys with a measured wait go first, longest first, then --targets keys listed
+      without one (a line with the key alone) in file order. Keys made ready in an earlier pass
+      of the same translation and driver are skipped; --fresh replays them.
+      The compiles run in child processes of XSEmu.exe, one governor across them: pool children
+      (--pool-children, default 2 from 8 logical cores) share the cores and are replaced after
+      --recycle-keys keys (default 400) or --recycle-mb MB of private commit (default 8192);
+      a predicted giant (43,691 B of console shaders or more, or slow before) gets a child of
+      its own, at most --giant-children (1–96, default half the logical cores) at once, each started
+      when its expected peak fits in the RAM available less 1 GB. A key running past --key-timeout-s
+      (default 1800) is taken for a hang and its child killed. Each key in flight in a child
+      that crashed or hung is tried again alone; one that ends its child again is listed in
+      blocking-bad.txt and left out of later passes until --fresh. --in-process (or
+      XCL_WARM_CHILDREN=0): every compile in this process.
+      Default budget: 120 seconds. Ctrl+C stops before the next driver call; an active call may finish.
+      With --targets, reads exact manifest keys and observed wait times (key in hex, milliseconds).
   XSEmu warm-up --giants-only --floor-mb N
       Builds, one at a time, the driver blob of each giant compute program (over 1 MB of DXIL,
       no blob kept yet) that the normal 6 GB floor leaves no room for now, keeping N MB
@@ -209,9 +230,15 @@ fn warm_up(args: xcl::warm_up_json::Args) -> i32 {
     };
     let dxil = std::sync::atomic::AtomicU64::new(0);
     let last = std::sync::Mutex::new(None::<std::time::Instant>);
+    let monitor = xcl::progress_window::Monitor::start("warm-up", "driver blobs", 0, None);
     let report = |done: usize, total: usize, len: usize, took: std::time::Duration, hash: u64| {
         let dxil = dxil.fetch_add(len as u64, Ordering::Relaxed) + len as u64;
         xcl::progress::warm_up(done, total);
+        monitor.set_total(total);
+        monitor.advance(done, 0);
+        if monitor.console() && std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+            return;
+        }
         if !xcl::progress::enabled() {
             if done % 25 == 0 || took.as_secs() >= 30 || done == total {
                 println!("  {done}/{total} (last: {hash:016x}, {len} B, {:.1} s)", took.as_secs_f32());
@@ -234,7 +261,9 @@ fn warm_up(args: xcl::warm_up_json::Args) -> i32 {
             took.as_secs_f32()
         );
     };
-    match xcl::hle::d3d12x::real::warm_up(full, report, &status) {
+    let result = xcl::hle::d3d12x::real::warm_up(full, report, &status);
+    drop(monitor);
+    match result {
         Ok(w) => {
             println!(
                 "warm-up{}: {} pipelines earlier runs made ({} kept entries dropped), {} last made in this translation, {} stale left out (none made by the last {} of {} runs){}; {} compute programs, {} driver blobs kept already, {} too big for the memory limits; {} stale blobs deleted ({} MB); {:.0} s on {} threads, peak commit {} MB",
@@ -301,6 +330,122 @@ fn warm_up(args: xcl::warm_up_json::Args) -> i32 {
     }
 }
 
+/// Ctrl+C or Ctrl+Break stops a blocking warm-up (its children included) before its next driver call.
+unsafe extern "system" fn cancel_blocking_warm_up(event: u32) -> i32 {
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
+    if !matches!(event, CTRL_C_EVENT | CTRL_BREAK_EVENT) {
+        return 0;
+    }
+    xcl::hle::d3d12x::real::cancel_blocking_warm_up();
+    1
+}
+
+/// `value` as a number within `range`.
+fn in_range(value: &str, range: std::ops::RangeInclusive<u64>) -> Option<u64> {
+    value.parse::<u64>().ok().filter(|n| range.contains(n))
+}
+
+fn warm_up_blocking(args: &[String]) -> i32 {
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+    let (mut budget, mut targets, mut max_keys, mut fresh) = (None, None, None, false);
+    let mut in_process = std::env::var("XCL_WARM_CHILDREN").is_ok_and(|v| v.trim() == "0");
+    let mut children = xcl::hle::d3d12x::warm_children::ChildOptions::default();
+    let (mut pool, mut giants, mut recycle_keys, mut recycle_mb, mut key_timeout) = (None, None, None, None, None);
+    let mut args = args.iter();
+    let invalid = || {
+        eprintln!("usage: xcl warm-up --blocking [--budget-s N (1–86400)] [--targets FILE] [--max-keys N (1–1000000)] [--fresh] [--in-process] [--pool-children N (1–16)] [--giant-children N (1–96)] [--recycle-keys N (1–1000000)] [--recycle-mb N (512–1048576)] [--key-timeout-s N (10–86400)]");
+        1
+    };
+    while let Some(flag) = args.next() {
+        if flag == "--fresh" && !fresh {
+            fresh = true;
+            continue;
+        }
+        if flag == "--in-process" {
+            in_process = true;
+            continue;
+        }
+        let numbered = match flag.as_str() {
+            "--pool-children" => Some((&mut pool, 1..=16)),
+            "--giant-children" => Some((&mut giants, 1..=96)),
+            "--recycle-keys" => Some((&mut recycle_keys, 1..=1_000_000)),
+            "--recycle-mb" => Some((&mut recycle_mb, 512..=1_048_576)),
+            "--key-timeout-s" => Some((&mut key_timeout, 10..=86_400)),
+            _ => None,
+        };
+        if let Some((slot, range)) = numbered {
+            match args.next().and_then(|value| in_range(value, range)) {
+                Some(n) if slot.is_none() => *slot = Some(n),
+                _ => return invalid(),
+            }
+            continue;
+        }
+        match (flag.as_str(), args.next()) {
+            ("--budget-s", Some(value)) if budget.is_none() => {
+                budget = in_range(value, 1..=86400);
+                if budget.is_none() {
+                    return invalid();
+                }
+            }
+            ("--targets", Some(value)) if targets.is_none() => targets = Some(std::path::Path::new(value)),
+            ("--max-keys", Some(value)) if max_keys.is_none() => {
+                max_keys = in_range(value, 1..=1_000_000).map(|n| n as usize);
+                if max_keys.is_none() {
+                    return invalid();
+                }
+            }
+            _ => return invalid(),
+        }
+    }
+    children.pool_children = pool.map(|n| n as usize);
+    children.giant_children = giants.map(|n| n as usize).or(children.giant_children);
+    children.recycle_keys = recycle_keys.map_or(children.recycle_keys, |n| n as usize);
+    children.recycle_mb = recycle_mb.unwrap_or(children.recycle_mb);
+    children.key_timeout_s = key_timeout.unwrap_or(children.key_timeout_s);
+    if !other_xcl_processes().is_empty() {
+        eprintln!("xcl warm-up --blocking: another XCL process or game is running");
+        return 3;
+    }
+    if unsafe { SetConsoleCtrlHandler(Some(cancel_blocking_warm_up), 1) } == 0 {
+        eprintln!("xcl warm-up --blocking: could not install Ctrl+C handling");
+        return 2;
+    }
+    match xcl::hle::d3d12x::real::warm_up_blocking(targets, std::time::Duration::from_secs(budget.unwrap_or(120)), max_keys, fresh, (!in_process).then_some(children)) {
+        Ok(cancelled) => if cancelled { 130 } else { 0 },
+        Err(e) => {
+            eprintln!("xcl warm-up --blocking: {e}");
+            2
+        }
+    }
+}
+
+/// `xcl warm-up --blocking-child --threads N --budget-s N [--leave-giants]`: one child process of `xcl warm-up --blocking`
+/// (keys on stdin, a line per key on stdout); started by it, not by hand.
+fn warm_up_blocking_child(args: &[String]) -> i32 {
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+    let (threads, budget, leave_giants) = match args {
+        [t, threads, b, budget, rest @ ..] if t == "--threads" && b == "--budget-s" && rest.iter().all(|flag| flag == "--leave-giants") && rest.len() <= 1 => {
+            (in_range(threads, 1..=256), in_range(budget, 1..=86400), !rest.is_empty())
+        }
+        _ => (None, None, false),
+    };
+    let (Some(threads), Some(budget)) = (threads, budget) else {
+        eprintln!("usage: xcl warm-up --blocking-child --threads N (1–256) --budget-s N (1–86400) [--leave-giants], started by xcl warm-up --blocking");
+        return 1;
+    };
+    if unsafe { SetConsoleCtrlHandler(Some(cancel_blocking_warm_up), 1) } == 0 {
+        eprintln!("xcl warm-up --blocking-child: could not install Ctrl+C handling");
+        return 2;
+    }
+    match xcl::hle::d3d12x::real::warm_up_blocking_child(threads as usize, std::time::Duration::from_secs(budget), leave_giants) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("xcl warm-up --blocking-child: {e}");
+            2
+        }
+    }
+}
+
 fn main() {
     // keep the TLS callback from being discarded by the linker
     unsafe { std::ptr::read_volatile(&XCL_TLS_CALLBACK) };
@@ -330,6 +475,8 @@ fn main() {
         Some("shaders") if args.len() >= 2 => xcl::shaders::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("rpf") if args.len() >= 2 => xcl::rpf::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("minidump") => xcl::eh::write_minidump_of(&args[1..]),
+        Some("warm-up") if args.get(1).is_some_and(|a| a == "--blocking") => warm_up_blocking(&args[2..]),
+        Some("warm-up") if args.get(1).is_some_and(|a| a == "--blocking-child") => warm_up_blocking_child(&args[2..]),
         Some("warm-up") if args.iter().any(|a| a == "--mesh-only") => {
             match &args[1..] {
                 [mesh] if mesh == "--mesh-only" => warm_up_mesh(None),

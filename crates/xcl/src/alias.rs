@@ -429,12 +429,20 @@ unsafe fn payloads_at(a: usize, now: Option<Backing>) -> Vec<String> {
 /// and for a 4 KiB page already looked at (the first 128 pages XCL has an account of are
 /// reported).
 pub unsafe fn report(p: usize) -> Option<String> {
+    report_inner(p, false)
+}
+
+pub(crate) fn crash_ownership(p: usize) -> Option<String> {
+    unsafe { report_inner(p, true) }
+}
+
+unsafe fn report_inner(p: usize, compact: bool) -> Option<String> {
     if p < 0x1_0000 || p >> 47 != 0 {
         return None;
     }
     static SEEN: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
     static REPORTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    {
+    if !compact {
         let mut g = try_lock(&SEEN)?;
         let seen = g.get_or_insert_with(HashSet::new);
         if seen.len() >= 4096 || REPORTED.load(std::sync::atomic::Ordering::Relaxed) >= 128 || !seen.insert(p & !(SMALL - 1)) {
@@ -445,7 +453,11 @@ pub unsafe fn report(p: usize) -> Option<String> {
     let mut lines: Vec<String> = Vec::new();
     // (64 KiB address, what it is): the other addresses showing this memory
     let mut aliases: Vec<(usize, String)> = Vec::new();
-    let physical = crate::hle::kernelx::alias_facts(p);
+    let physical = if compact {
+        crate::hle::kernelx::crash_alias_facts(p)
+    } else {
+        crate::hle::kernelx::alias_facts(p)
+    };
     let backing = physical.as_ref().and_then(|f| f.backing);
     if let Some(f) = physical {
         lines.push(f.what);
@@ -459,6 +471,14 @@ pub unsafe fn report(p: usize) -> Option<String> {
     }
     let views = crate::hle::d3d12x::page_mappings::alias_facts(p, backing.map(|b| b.page).filter(|&p| p != 0));
     lines.extend(views.here);
+    lines.extend(crate::hle::d3d12x::sparse::alias_facts(p));
+    if !compact || crate::gpu::uma::made().is_some() {
+        lines.extend(crate::hle::d3d12x::real::console_buffers_at(p));
+        lines.extend(crate::gpu::uma::history_at(p));
+    }
+    if compact {
+        return (!lines.is_empty()).then(|| lines.join("\n"));
+    }
     for (a, what) in views.aliases {
         match aliases.iter_mut().find(|x| x.0 == a) {
             Some(x) => x.1 = format!("{}, {what}", x.1),
@@ -472,7 +492,6 @@ pub unsafe fn report(p: usize) -> Option<String> {
             lines.push(format!("{what} {a:#x}: {there}"));
         }
     }
-    lines.extend(crate::hle::d3d12x::sparse::alias_facts(p));
     for a in std::iter::once(page).chain(aliases.iter().map(|x| x.0)) {
         lines.extend(crate::hle::d3d12x::title_textures::placed_over(a, PAGE));
         lines.extend(crate::hle::d3d12x::placed_buffers_over(a, PAGE));

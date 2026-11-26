@@ -17,7 +17,9 @@ use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::{Once, RwLock};
 
-use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
+use windows_sys::Win32::Foundation::{
+    GetLastError, ERROR_COMMITMENT_LIMIT, ERROR_NOT_ENOUGH_MEMORY, ERROR_NO_SYSTEM_RESOURCES, ERROR_WORKING_SET_QUOTA, EXCEPTION_ACCESS_VIOLATION, NTSTATUS,
+};
 use windows_sys::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, EXCEPTION_POINTERS};
 use windows_sys::Win32::System::Memory::{
     VirtualAlloc, VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
@@ -32,6 +34,11 @@ const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 static LAZY: RwLock<BTreeMap<usize, usize>> = RwLock::new(BTreeMap::new());
 /// views of physical pages' sections: start → end
 static VIEWS: RwLock<BTreeMap<usize, usize>> = RwLock::new(BTreeMap::new());
+
+/// The handler is in place (d3d12x::image_writeback guards pages it answers for).
+pub(crate) fn install_handler() {
+    install();
+}
 
 fn install() {
     static ONCE: Once = Once::new();
@@ -48,11 +55,44 @@ fn committed(a: usize) -> bool {
     unsafe { VirtualQuery(a as *const c_void, &mut m, std::mem::size_of_val(&m)) != 0 && m.State == MEM_COMMIT }
 }
 
+/// Whether a commit Windows refused with `error` can succeed a moment later: the system's commit or
+/// the working set was short, which passes when another allocation is freed. (An address that
+/// cannot be committed at all stays refused.)
+fn refusal_passes(error: u32) -> bool {
+    matches!(error, ERROR_NOT_ENOUGH_MEMORY | ERROR_COMMITMENT_LIMIT | ERROR_WORKING_SET_QUOTA | ERROR_NO_SYSTEM_RESOURCES)
+}
+
+/// `len` bytes at `a` committed read-write (false: Windows refused). The console's pages are
+/// backed from their allocation on, so an access to one never fails; here the backing is committed
+/// at first use, and a refusal that passes (`refusal_passes`) is asked again for about half a
+/// second before the access or the call it is for fails.
+pub(super) unsafe fn commit_memory(a: usize, len: usize) -> bool {
+    static REFUSED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let mut wait = 1;
+    loop {
+        if !VirtualAlloc(a as *const c_void, len, MEM_COMMIT, PAGE_READWRITE).is_null() {
+            if wait > 1 && REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                crate::xlog_info!("memory: Windows committed {len:#x} bytes at {a:#x} after refusing for up to {} ms (commit short)", wait - 1);
+            }
+            return true;
+        }
+        let error = GetLastError();
+        if !refusal_passes(error) || wait > 256 {
+            if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                crate::xlog_warn!("memory: Windows refused to commit {len:#x} bytes at {a:#x} (error {error}): the access or call it is for fails");
+            }
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(wait));
+        wait *= 2;
+    }
+}
+
 /// Commit `page` if it is a lazy one, with its contents (true: it was).
 unsafe fn commit(page: usize) -> bool {
     let mut g = LAZY.write().unwrap_or_else(|e| e.into_inner());
     let Some(&from) = g.get(&page) else { return false };
-    if VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null() {
+    if !commit_memory(page, PAGE) {
         return false;
     }
     crate::memmap::committed(page, PAGE, PAGE_READWRITE);
@@ -89,13 +129,16 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS || r.NumberParameters < 2 {
         return EXCEPTION_CONTINUE_SEARCH;
     }
+    if crate::hle::d3d12x::image_writeback::fault(r.ExceptionInformation[1]) {
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     let page = r.ExceptionInformation[1] & !(PAGE - 1);
     let lazy = LAZY.read().unwrap_or_else(|e| e.into_inner()).contains_key(&page);
     if lazy && commit(page) || allows(r.ExceptionInformation[0], r.ExceptionInformation[1]) {
         return EXCEPTION_CONTINUE_EXECUTION;
     }
     // a section's page used for the first time
-    if in_view(page) && !VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null() {
+    if in_view(page) && commit_memory(page, PAGE) {
         crate::memmap::committed(page, PAGE, PAGE_READWRITE);
         return EXCEPTION_CONTINUE_EXECUTION;
     }
@@ -188,7 +231,7 @@ pub fn ensure(p: usize, len: usize) {
     for (lo, hi) in views {
         let mut page = lo & !(PAGE - 1);
         while page < hi {
-            if !committed(page) && !unsafe { VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+            if !committed(page) && unsafe { commit_memory(page, PAGE) } {
                 crate::memmap::committed(page, PAGE, PAGE_READWRITE);
             }
             page += PAGE;
@@ -200,6 +243,21 @@ pub fn ensure(p: usize, len: usize) {
 mod tests {
     use super::*;
     use windows_sys::Win32::System::Memory::{VirtualFree, MEM_RELEASE, MEM_RESERVE};
+
+    /// A commit refused because memory was short is asked again; one refused for its address is
+    /// not. Memory that can be committed is, at the first asking.
+    #[test]
+    fn a_commit_refused_for_want_of_memory_is_asked_again() {
+        assert!([ERROR_NOT_ENOUGH_MEMORY, ERROR_COMMITMENT_LIMIT, ERROR_WORKING_SET_QUOTA, ERROR_NO_SYSTEM_RESOURCES].into_iter().all(refusal_passes));
+        assert!(!refusal_passes(windows_sys::Win32::Foundation::ERROR_INVALID_ADDRESS) && !refusal_passes(0));
+        unsafe {
+            let r = VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert!(commit_memory(r, PAGE));
+            std::ptr::write_volatile(r as *mut u32, 7);
+            assert_eq!(std::ptr::read_volatile(r as *const u32), 7);
+            VirtualFree(r as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
 
     /// A lazy page reads as zeros on first touch, keeps what is written; `ensure` commits it
     /// without a fault. (Filling from a used physical page: `physical`'s and `dstorage`'s tests.)

@@ -408,6 +408,28 @@ unsafe impl Send for State {}
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 static UNAVAILABLE: AtomicBool = AtomicBool::new(false);
 
+#[cfg(test)]
+pub(super) struct SnapshotForTest {
+    state: bool,
+    unavailable: bool,
+    early: BTreeMap<usize, usize>,
+}
+
+#[cfg(test)]
+pub(super) fn snapshot_for_test() -> SnapshotForTest {
+    SnapshotForTest { state: STATE.lock().unwrap().is_some(), unavailable: UNAVAILABLE.load(Ordering::Acquire), early: EARLY.lock().unwrap().clone() }
+}
+
+/// Gives sparse memory back the state `snapshot_for_test` saw, dropping a state made since.
+#[cfg(test)]
+pub(super) fn restore_for_test(snapshot: SnapshotForTest) {
+    if !snapshot.state {
+        drop(STATE.lock().unwrap().take());
+    }
+    UNAVAILABLE.store(snapshot.unavailable, Ordering::Release);
+    *EARLY.lock().unwrap() = snapshot.early;
+}
+
 type PoolTile = (u32, u32);
 type ReleasedPins = Arc<Mutex<Vec<PoolTile>>>;
 
@@ -576,6 +598,9 @@ unsafe fn open(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
         let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
         let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None)?;
         rb_list.Close()?;
+        let _ = queue.SetName(windows::core::w!("xcl sparse queue"));
+        let _ = rb_list.SetName(windows::core::w!("xcl sparse readback list"));
+        let _ = rb_alloc.SetName(windows::core::w!("xcl sparse readback allocator"));
         Ok(State {
             dev: dev.clone(),
             queue,
@@ -859,6 +884,16 @@ impl State {
         windows::Win32::System::Threading::WaitForSingleObject(self.event, 5000);
     }
 
+    unsafe fn wait_for_readback(&self) -> bool {
+        match crate::gpu::fence::wait(&self.fence, self.rb_last_fence, &self.dev, Some(self.event), 5000) {
+            Ok(()) => true,
+            Err(e) => {
+                crate::xlog_warn!("sparse: readback fence {} did not complete; staging bytes not published: {e}", self.rb_last_fence);
+                false
+            }
+        }
+    }
+
     #[inline]
     unsafe fn reclaim_ring(&mut self) {
         if self.inflight.is_empty() {
@@ -1065,27 +1100,40 @@ impl State {
     }
 
     /// Copy `ranges` (address, bytes) from sparse VRAM back into the CPU view and refresh
-    /// `sent` hashes. Caller has already ordered `self.queue` after any GPU writes if needed.
-    unsafe fn readback_ranges(&mut self, ranges: &[(usize, usize)]) {
+    /// `sent` hashes.
+    unsafe fn readback_ranges(&mut self, ranges: &[(usize, usize)], mut title_queue: Option<&ID3D12CommandQueue>) {
+        if !self.wait_for_readback() {
+            return;
+        }
         let Some((rb, p)) = self.readback_buf() else { return };
         let mut pending: Vec<(usize, usize, usize)> = Vec::new(); // (va, rb_off, chunk)
         let mut used = 0usize;
         let mut open = false;
-        let flush_and_copy = |s: &mut State, open: &mut bool, pending: &mut Vec<(usize, usize, usize)>, used: &mut usize, p: *mut u8| {
-            if *open {
-                *open = false;
-                if s.rb_list.Close().is_ok() {
-                    if let Ok(l) = s.rb_list.cast::<ID3D12CommandList>() {
-                        super::title_textures::own_work(|| {
-                            s.queue.ExecuteCommandLists(&[Some(l)]);
-                        });
-                    }
-                }
-                s.signal();
-                s.rb_last_fence = s.value;
-                s.wait_for(s.value);
-                s.reclaim_ring();
+        let mut flush_and_copy = |s: &mut State, pending: &mut Vec<(usize, usize, usize)>, used: &mut usize| {
+            if s.rb_list.Close().is_err() {
+                return false;
             }
+            let Ok(list) = s.rb_list.cast::<ID3D12CommandList>() else { return false };
+            if let Some(queue) = title_queue.take() {
+                s.rb_value += 1;
+                let v = s.rb_value;
+                if let Err(e) = queue.Signal(&s.rb_fence, v).and_then(|()| s.queue.Wait(&s.rb_fence, v)) {
+                    crate::xlog_warn!("sparse: could not order readback after title fence {v}: {e}");
+                    return false;
+                }
+                super::markers::queue_fence(s.queue.as_raw() as usize, "sparse readback (after a title queue)", &s.rb_fence, v);
+            }
+            super::title_textures::own_work(|| s.queue.ExecuteCommandLists(&[Some(list)]));
+            s.value += 1;
+            s.rb_last_fence = s.value;
+            if let Err(e) = s.queue.Signal(&s.fence, s.rb_last_fence) {
+                crate::xlog_warn!("sparse: could not signal readback fence {}: {e}", s.rb_last_fence);
+                return false;
+            }
+            if !s.wait_for_readback() {
+                return false;
+            }
+            s.reclaim_ring();
             for &(dst, off, len) in pending.iter() {
                 // copy only committed (non-hole) bytes
                 let mut at = dst;
@@ -1107,6 +1155,7 @@ impl State {
             }
             pending.clear();
             *used = 0;
+            true
         };
         for &(a, n) in ranges {
             if n == 0 {
@@ -1124,14 +1173,17 @@ impl State {
                     continue;
                 }
                 if used == READBACK_STAGING {
-                    flush_and_copy(self, &mut open, &mut pending, &mut used, p);
+                    if !flush_and_copy(self, &mut pending, &mut used) {
+                        return;
+                    }
+                    open = false;
                 }
                 let to_win_end = (b + crate::gpu::uma::WINDOW) - cur;
                 let chunk = (n - done).min(READBACK_STAGING - used).min(to_tile_end).min(to_win_end);
                 if !open {
-                    self.wait_for(self.rb_last_fence);
-                    let _ = self.rb_alloc.Reset();
-                    let _ = self.rb_list.Reset(&self.rb_alloc, None);
+                    if self.rb_alloc.Reset().and_then(|()| self.rb_list.Reset(&self.rb_alloc, None)).is_err() {
+                        return;
+                    }
                     open = true;
                 }
                 self.rb_list.CopyBufferRegion(&rb, used as u64, &self.windows[wi].1, (cur - b) as u64, chunk as u64);
@@ -1141,7 +1193,7 @@ impl State {
             }
         }
         if open {
-            flush_and_copy(self, &mut open, &mut pending, &mut used, p);
+            flush_and_copy(self, &mut pending, &mut used);
         }
     }
 
@@ -1314,13 +1366,7 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
             _ => merged.push((a, n)),
         }
     }
-    s.rb_value += 1;
-    let v = s.rb_value;
-    if queue.Signal(&s.rb_fence, v).is_ok() {
-        let _ = s.queue.Wait(&s.rb_fence, v);
-        super::markers::queue_fence(s.queue.as_raw() as usize, "sparse readback (after a title queue)", &s.rb_fence, v);
-    }
-    crate::eh::with_write_context(|| format!("GPU writes of a submitted list: {} ranges, the first {:#x} + {:#x}", merged.len(), merged[0].0, merged[0].1), || s.readback_ranges(&merged));
+    crate::eh::with_write_context(|| format!("GPU writes of a submitted list: {} ranges, the first {:#x} + {:#x}", merged.len(), merged[0].0, merged[0].1), || s.readback_ranges(&merged, Some(queue)));
 }
 
 /// Synchronize `[va, va + len)` in a sparse window for a CPU read (`ID3D12Resource::Map` with
@@ -1366,7 +1412,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     if !dirty_runs.is_empty() {
         s.upload_dirty(&dirty_runs);
     }
-    crate::eh::with_write_context(|| format!("a CPU read of {va:#x} + {len:#x} (Map)"), || s.readback_ranges(&[(va, len)]));
+    crate::eh::with_write_context(|| format!("a CPU read of {va:#x} + {len:#x} (Map)"), || s.readback_ranges(&[(va, len)], None));
 }
 
 /// The title committed `[a, a + n)` in a sparse window. The pages of tiles mapped for it that
@@ -2217,7 +2263,7 @@ mod tests {
             assert_eq!(s.mapped[&(base + TILE)].holes, 0xFFFF, "fully reserved tile must have all 16 holes set");
 
             // Reading back the full 2-tile span must not fault on uncommitted pages.
-            s.readback_ranges(&[(base, 2 * TILE)]);
+            s.readback_ranges(&[(base, 2 * TILE)], None);
 
             // Now incrementally commit [base, base + 4*PAGE) and clear its hole bits (as `committed` does).
             assert!(!VirtualAlloc(base as *const c_void, 4 * PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());

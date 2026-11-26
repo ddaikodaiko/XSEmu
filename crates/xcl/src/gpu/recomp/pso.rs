@@ -15,6 +15,8 @@ use windows::Win32::Graphics::Direct3D12::*;
 use super::{dxc, interface, translate, Mode, Options};
 use crate::gpu::xbox;
 
+pub mod material_gate;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     Vertex,
@@ -196,10 +198,17 @@ mod translated {
         } else {
             base
         };
+        let base = if super::super::bvh_node_fix() {
+            identity_for(&format!("{base:016x}"), "bvh-node-fix")
+        } else {
+            base
+        };
         let nan = if super::nan_guards() { "nan-guards" } else { "" };
         let guard = super::super::loop_guard();
         let trip_counters = crate::config::gpu_markers_enabled();
         let static_cap = super::super::loop_profile::static_cap();
+        // the A/B switches of the structured form, the lane-guard proofs, the quad reads and the page groups change the HLSL
+        let nan = ["XCL_RECOMP_NO_CFG", "XCL_RECOMP_NO_EXEC_PROOF", "XCL_RECOMP_NO_QUAD_READS", "XCL_RECOMP_NO_PAGE_GROUPS"].iter().filter(|v| std::env::var_os(v).is_some()).fold(nan.to_string(), |s, v| format!("{s}\0{v}"));
         if legacy {
             return identity_for(&format!("{base:016x}"), &format!("{nan}\0loop-guard={guard}\0trip-counters={trip_counters}\0loop-profile={profile}\0static-loop-cap={static_cap}\0legacy-compute-wave64"));
         }
@@ -659,7 +668,7 @@ fn with_console_code<R>(blob: &[u8], stage: Stage, sampler_base: u32, windows: u
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    run(code, Options { mode, wave64: super::fssm_wave64(f, code), ..options }, profile)
+    run(code, Options { mode, wave64: super::fssm_wave64(f, code), code_data: super::code_data(f, p), ..options }, profile)
 }
 
 fn check_console_translation(blob: &[u8], t: super::Translation) -> Result<super::Translation, String> {
@@ -739,7 +748,7 @@ pub fn console_mesh_native(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -
         ps_inputs: ps.map(|p| crate::gpu::dxbc::signatures(p).0),
         lds_bytes: crate::gpu::dxbc::psv(blob).map_or(0, |p| p.ms_groupshared),
     };
-    let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, mem_windows: mem_windows(), nan_guards: nan_guards(), mesh_native: Some(native), ..Default::default() })?;
+    let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, mem_windows: mem_windows(), nan_guards: nan_guards(), mesh_native: Some(native), code_data: super::code_data(f, p), ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -958,6 +967,11 @@ mod shader_cache_tests {
         for option in ["XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN"] {
             assert!(!cache_allowed(Stage::Compute, |name| name == option));
         }
+    }
+
+    #[test]
+    fn translator_fingerprint_covers_the_dxil_backend() {
+        assert_eq!(env!("XCL_DXIL_SOURCE_ID"), xcl_dxil::BUILD_ID);
     }
 
     #[test]

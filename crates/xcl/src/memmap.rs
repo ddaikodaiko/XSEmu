@@ -330,6 +330,7 @@ pub(crate) unsafe fn committed_runs(at: usize, len: usize) -> Vec<(usize, usize)
 /// Every read XCL makes of the title's memory on its own schedule goes through here or through
 /// `title_bytes` (a fault-safe copy, not one moment's picture of a batch of mappings).
 pub fn copy_title(at: usize, out: &mut [u8]) {
+    crate::hle::d3d12x::image_writeback::before_read(at, out.len());
     // SAFETY: Windows writes `out` only, and reads the title's memory for itself
     unsafe { copy_title_now(at, out) }
 }

@@ -188,6 +188,22 @@ pub(super) unsafe fn register(res: usize, title: usize, mirror: usize, bytes: us
     GENERATION.fetch_add(1, Ordering::Release);
 }
 
+pub(super) fn view_owners(va:usize,len:usize)->Option<(usize, Vec<(usize,usize,usize,usize,usize,Option<usize>)>)> {
+    let end=va.checked_add(len)?;
+    let g=crate::alias::try_lock(&BUFFERS)?;
+    let mut out=Vec::new();
+    let mut total=0;
+    if let Some(t)=g.as_ref() {
+        for (&res,b) in &t.buffers {
+            let Some(hi)=b.title.checked_add(b.bytes) else {continue};
+            if b.title>=end || hi<=va {continue}
+            total+=1;
+            if out.len()<8 {out.push((res,b.title,b.bytes,b.mirror,b.block,(b.title<=va && end<=hi).then(|| b.mirror.checked_add(va-b.title)).flatten()));}
+        }
+    }
+    Some((total,out))
+}
+
 /// (diagnostics, `alias::report`) The buffers the title placed over `[va, va + len)` outside unified
 /// memory, the first 4: a Map with a read range copies each one's mirror over its memory.
 pub(super) fn placed_over(va: usize, len: usize) -> Vec<String> {

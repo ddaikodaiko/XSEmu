@@ -10,6 +10,8 @@
 //! and the binding to the console API that creates textures in title memory (and tells when
 //! the title rewrote one) – that comes with the game executable.
 
+pub(crate) mod image_bridge;
+
 use super::desc::{self, Image, ImageType};
 use super::fence;
 use super::tiling::{self, Chain, PipeConfig};

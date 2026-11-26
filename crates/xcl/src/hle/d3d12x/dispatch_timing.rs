@@ -28,21 +28,34 @@ fn capture_selection() -> Option<(u64, u32)> {
     })
 }
 
+fn loop_profile_matches(hash: u64) -> bool {
+    if !crate::gpu::recomp::loop_profile_enabled() {
+        return false;
+    }
+    static SELECT: OnceLock<Option<Vec<u64>>> = OnceLock::new();
+    SELECT.get_or_init(|| {
+        let value = std::env::var("XCL_LOOP_PROFILE").unwrap_or_default();
+        (value.trim() != "1").then(|| {
+            value.split(',').filter_map(|p| u64::from_str_radix(p.trim(), 16).ok()).collect()
+        })
+    }).as_ref().is_none_or(|matches| matches.contains(&hash))
+}
+
 pub(super) fn note(pso: usize, shader: &[u8]) {
     let selected = selection();
     let capture = capture_selection().map(|(hash, _)| hash);
-    let profile = super::gpu_timing::enabled();
-    if selected.is_empty() && capture.is_none() && !profile {
+    let profile = super::gpu_timing::enabled() || super::bind::draw_gate_hashes();
+    if selected.is_empty() && capture.is_none() && !profile && !crate::gpu::recomp::loop_profile_enabled() {
         return;
     }
     let hash = crate::gpu::shader::fnv64(shader);
-    if profile || selected.contains(&hash) || capture == Some(hash) {
+    if profile || selected.contains(&hash) || capture == Some(hash) || loop_profile_matches(hash) {
         SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, hash);
     }
 }
 
 pub(super) fn forget(pso: usize) {
-    if !selection().is_empty() || capture_selection().is_some() || super::gpu_timing::enabled() {
+    if !selection().is_empty() || capture_selection().is_some() || super::gpu_timing::enabled() || super::bind::draw_gate_hashes() || crate::gpu::recomp::loop_profile_enabled() {
         if let Some(h) = SHADERS.lock().unwrap().as_mut() {
             h.remove(&pso);
         }
@@ -51,6 +64,13 @@ pub(super) fn forget(pso: usize) {
 
 pub(super) fn profile_shader(pso: usize) -> Option<u64> {
     SHADERS.lock().unwrap().as_ref()?.get(&pso).copied()
+}
+
+pub(super) fn loop_shader(pso: usize) -> Option<u64> {
+    if !crate::gpu::recomp::loop_profile_enabled() {
+        return None;
+    }
+    profile_shader(pso).filter(|&hash| loop_profile_matches(hash))
 }
 
 struct Queries {

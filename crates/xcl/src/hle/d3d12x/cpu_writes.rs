@@ -72,10 +72,20 @@ fn spawn_queue_worker(dev: ID3D12Device, fence: ID3D12Fence) -> std::io::Result<
                 _ => false,
             };
             if !complete {
+                let mut first_pending = true;
                 loop {
                     match fence::completed_value(&fence, &dev) {
                         Ok(value) if value >= job.value => break,
-                        Ok(_) => std::thread::sleep(Duration::from_millis(20)),
+                        Ok(value) => {
+                            if std::mem::take(&mut first_pending) {
+                                static DEFERRED: AtomicU64 = AtomicU64::new(0);
+                                let total = DEFERRED.fetch_add(1, Ordering::Relaxed) + 1;
+                                if total.is_power_of_two() {
+                                    crate::xlog_warn!("D3D12.X: deferred GPU writes still waiting ({total} jobs so far; fence at {value}, needed {}; {} writes held)", job.value, job.writes.len());
+                                }
+                            }
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
                         Err(_) => return,
                     }
                 }

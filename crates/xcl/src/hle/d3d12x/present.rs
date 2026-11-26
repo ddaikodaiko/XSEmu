@@ -3,8 +3,8 @@
 //! Console titles do not use DXGI swap chains: they render into their own back buffers
 //! and call `PresentX` – command queue slot 30, `PresentX(planeCount, planes, parameters)`
 //! with plane 0 `{ u64 frame token; u32 resource count @8; ID3D12Resource** @0x10 }` (as
-//! observed on Fortnite). XCL presents that resource in its own window at once and tells the
-//! frame clock (`frame`) the token flipped.
+//! observed on Fortnite). XCL queues the composition before telling the frame clock (`frame`)
+//! the token flipped. The host window presents retired compositions on its own queue.
 //!
 //! Until a title's first `PresentX`, a fallback guesses the frame: XCL remembers which
 //! resource every RTV descriptor points to and the first render target of each command list,
@@ -19,11 +19,11 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::{Mutex, Once, OnceLock, TryLockError};
+use std::sync::{Arc, Mutex, Once, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 
 use windows::core::{Interface, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, DXGI_STATUS_OCCLUDED, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, S_OK, WPARAM};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
@@ -39,6 +39,10 @@ static RTVS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 static LISTS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 static CANDIDATE: Mutex<Option<(usize, usize)>> = Mutex::new(None); // (queue, resource) – resource AddRef'd
 static PRESENTS: AtomicU64 = AtomicU64::new(0);
+static HOST_PRESENTS: AtomicU64 = AtomicU64::new(0);
+static TITLE_PRESENT_CALLS: AtomicU64 = AtomicU64::new(0);
+static HOST_OCCLUDED: AtomicU64 = AtomicU64::new(0);
+static HOST_STILL_DRAWING: AtomicU64 = AtomicU64::new(0);
 static LAST_FRAME_DUMP: Mutex<Option<FrameDumpSample>> = Mutex::new(None);
 static BOUNDARIES: AtomicU64 = AtomicU64::new(0);
 static LAST_BOUNDARY_MS: AtomicU64 = AtomicU64::new(0);
@@ -56,6 +60,7 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
     let token = (planes as *const u64).read_unaligned();
     crate::control::wait_while_paused();
     let _present = PRESENTX_LOCK.lock().unwrap();
+    TITLE_PRESENT_CALLS.fetch_add(1, Ordering::Relaxed);
     present_x_frame(queue, plane_count, planes);
     // The title can use flip statistics to decide when to reuse its buffer.
     // Queue our copy before reporting the flip.
@@ -231,6 +236,11 @@ pub(super) fn writer_trace_configured() -> bool {
     !writer_frames().is_empty() || plane_schedule().is_some()
 }
 
+pub(super) fn draw_gate_capture(lead: u64) -> Option<(u64, u64)> {
+    let slot = plane_schedule()?.due((crate::log::uptime() as u64).saturating_add(lead), NEXT_PLANE_CAPTURE.load(Ordering::Relaxed))?;
+    Some((BOUNDARIES.load(Ordering::Relaxed), slot))
+}
+
 pub(super) fn writer_trace_active() -> bool {
     let frame = PRESENTS.load(Ordering::Relaxed);
     writer_frames().iter().any(|&target| (target.saturating_sub(3)..=target).contains(&frame))
@@ -248,12 +258,24 @@ struct PlaneWriter {
     pso: usize,
     inputs: Vec<String>,
     read_resources: Vec<usize>,
+    candidate_args: Option<super::bind::LineageArgs>,
 }
 
 type SubmittedPlaneWriter = (u64, usize, Option<usize>, PlaneWriter);
 static PLANE_WRITES: Mutex<Option<HashMap<usize, Vec<PlaneWriter>>>> = Mutex::new(None);
 static PLANE_SUBMITS: Mutex<std::collections::VecDeque<SubmittedPlaneWriter>> = Mutex::new(std::collections::VecDeque::new());
 static PLANE_INPUTS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+pub(super) fn native_view_trace_configured() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("XCL_PRESENT_UPSTREAM_DESCS").is_some() || std::env::var_os("XCL_GPU_IMAGE_PROBES").is_some())
+}
+
+pub(super) fn lineage_depth() -> usize {
+    static DEPTH: OnceLock<usize> = OnceLock::new();
+    *DEPTH.get_or_init(|| std::env::var("XCL_PRESENT_UPSTREAM_DEPTH").ok()
+        .and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(2).clamp(1, 8))
+}
 
 pub(super) fn watch_plane_input(res: usize) {
     let mut resources = PLANE_INPUTS.lock().unwrap();
@@ -265,15 +287,19 @@ pub(super) fn watch_plane_input(res: usize) {
     }
 }
 
-pub(super) fn is_writer_target(res: usize) -> bool {
+pub(super) fn is_known_writer_target(res: usize) -> bool {
     res != 0 && (is_presented(res) || PLANE_INPUTS.lock().unwrap().contains(&res))
 }
 
-pub(super) fn record_plane_write(list: usize, resource: usize, kind: &'static str, pso: usize, inputs: Vec<String>) {
-    record_plane_write_with_reads(list, resource, kind, pso, inputs, Vec::new());
+pub(super) fn is_writer_target(res: usize) -> bool {
+    res != 0 && (lineage_depth() > 2 || is_known_writer_target(res))
 }
 
-pub(super) fn record_plane_write_with_reads(list: usize, resource: usize, kind: &'static str, pso: usize, inputs: Vec<String>, read_resources: Vec<usize>) {
+pub(super) fn record_plane_write(list: usize, resource: usize, kind: &'static str, pso: usize, inputs: Vec<String>) {
+    record_plane_write_with_reads(list, resource, kind, pso, inputs, Vec::new(), None);
+}
+
+pub(super) fn record_plane_write_with_reads(list: usize, resource: usize, kind: &'static str, pso: usize, inputs: Vec<String>, read_resources: Vec<usize>, candidate_args: Option<super::bind::LineageArgs>) {
     if !writer_trace_active() || !is_writer_target(resource) {
         return;
     }
@@ -284,13 +310,41 @@ pub(super) fn record_plane_write_with_reads(list: usize, resource: usize, kind: 
         return;
     }
     let writes = lists.entry(list).or_default();
-    if writes.len() == 32 {
+    if lineage_depth() > 2 {
+        if let Some(prev) = writes.last_mut().filter(|w| w.resource == resource && w.kind == kind && w.pso == pso) {
+            *prev = PlaneWriter { resource, kind, shaders, pso, inputs, read_resources, candidate_args };
+            return;
+        }
+    }
+    if writes.len() == if lineage_depth() > 2 { 256 } else { 32 } {
         writes.remove(0);
     }
-    writes.push(PlaneWriter { resource, kind, shaders, pso, inputs, read_resources });
+    writes.push(PlaneWriter { resource, kind, shaders, pso, inputs, read_resources, candidate_args });
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ScalarProbe {
+    pub selector: (usize, u32, u32),
+    pub words: u32,
+    pub va: Option<u64>,
+}
+
+type ScalarBindings = (u64, Vec<ScalarProbe>);
+type ScalarSubmission = (u64, usize, ScalarBindings);
+static SCALAR_LISTS: OnceLock<Mutex<HashMap<(usize, u64), Vec<ScalarProbe>>>> = OnceLock::new();
+static SCALAR_SUBMITS: Mutex<Vec<ScalarSubmission>> = Mutex::new(Vec::new());
+
+pub(super) fn record_scalar_probes(list: usize, shader: u64, values: Vec<ScalarProbe>) {
+    let mut lists = SCALAR_LISTS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    if lists.len() < 128 || lists.contains_key(&(list, shader)) {
+        lists.insert((list, shader), values);
+    }
 }
 
 pub(super) fn reset_plane_writes(list: usize) {
+    if let Some(probes) = SCALAR_LISTS.get() {
+        probes.lock().unwrap().retain(|&(l, _), _| l != list);
+    }
     if writer_trace_configured() {
         if let Some(lists) = PLANE_WRITES.lock().unwrap().as_mut() {
             lists.remove(&list);
@@ -305,11 +359,25 @@ pub(super) unsafe fn submit_plane_writes(queue: *mut c_void, lists: &[*mut c_voi
     let queue_id = super::list_x::queue_id(queue as usize);
     let timing_id = super::gpu_timing::queue_stamp(queue).map(|(_, id)| id);
     let frame = PRESENTS.load(Ordering::Relaxed);
+    if let Some(recorded) = SCALAR_LISTS.get() {
+        let recorded = recorded.lock().unwrap();
+        let mut submitted = SCALAR_SUBMITS.lock().unwrap();
+        for &list in lists {
+            for (&(_, shader), values) in recorded.iter().filter(|&(&(l, _), _)| l == list as usize) {
+                let item = (frame, queue as usize, (shader, values.clone()));
+                if let Some(prev) = submitted.iter_mut().find(|(_, q, (h, _))| *q == queue as usize && *h == shader) {
+                    *prev = item;
+                } else if submitted.len() < 16 {
+                    submitted.push(item);
+                }
+            }
+        }
+    }
     let recorded = PLANE_WRITES.lock().unwrap();
     let Some(recorded) = recorded.as_ref() else { return };
     let mut submits = PLANE_SUBMITS.lock().unwrap();
     for write in lists.iter().filter_map(|list| recorded.get(&(*list as usize))).flatten() {
-        if submits.len() == 2048 {
+        if submits.len() == if lineage_depth() > 2 { 32768 } else { 2048 } {
             submits.pop_front();
         }
         submits.push_back((frame, queue_id, timing_id, write.clone()));
@@ -323,7 +391,9 @@ unsafe fn log_plane_writers(queue: *mut c_void, shown: &[usize], timed: bool) {
     }
     let present_q = super::list_x::queue_id(queue as usize);
     let timing_q = super::gpu_timing::queue_stamp(queue).map(|(_, id)| id);
-    let submits = PLANE_SUBMITS.lock().unwrap();
+    let submits = PLANE_SUBMITS.lock().unwrap().clone();
+    let mut budget = 128;
+    let mut visited = std::collections::HashSet::new();
     for (i, &resource) in shown.iter().enumerate() {
         crate::xlog_info!("present writer: frame {frame} p{i} resource {resource:#x}, present q{present_q}, timing q{timing_q:?}");
         let mut queues = Vec::new();
@@ -333,25 +403,64 @@ unsafe fn log_plane_writers(queue: *mut c_void, shown: &[usize], timed: bool) {
             }
             queues.push((q, w.kind));
             crate::xlog_info!("present writer: p{i}, submitted at frame {recorded_frame}, q{q} timing q{timing:?}: {} PSO {:#x} shader hashes {:x?}, candidates [{}]", w.kind, w.pso, w.shaders, w.inputs.join("; "));
-            for &input in &w.read_resources {
-                let mut logged = [false; 2];
-                for (input_frame, q, timing, producer) in submits.range(..at).rev().filter(|(seen, _, _, producer)| *seen >= frame.saturating_sub(4) && producer.resource == input) {
-                    let kind = usize::from(producer.kind == "compute binding candidate");
-                    if !std::mem::replace(&mut logged[kind], true) {
-                        crate::xlog_info!("present input producer: p{i} input {input:#x}, submitted at frame {input_frame}, q{q} timing q{timing:?}: {} PSO {:#x} shader hashes {:x?}", producer.kind, producer.pso, producer.shaders);
-                    }
-                    if logged == [true; 2] {
-                        break;
-                    }
-                }
-                if logged == [false; 2] {
-                    crate::xlog_info!("present input producer: p{i} input {input:#x}, no prior matching CPU submission in the trace");
-                }
-            }
+            log_input_producers(&submits, i, frame, at, w, 1, &mut budget, &mut visited);
         }
         if queues.is_empty() {
             crate::xlog_info!("present writer: p{i}, no matching submitted writer in the capture window");
         }
+    }
+    if budget == 0 {
+        crate::xlog_info!("present upstream inputs: frame {frame} reached the lineage row budget");
+    }
+}
+
+fn log_input_producers(submits: &std::collections::VecDeque<SubmittedPlaneWriter>, plane: usize, frame: u64, at: usize, writer: &PlaneWriter, depth: usize, budget: &mut usize, visited: &mut std::collections::HashSet<usize>) {
+    if depth > lineage_depth() || !visited.insert(at) {
+        return;
+    }
+    let mut candidates = if writer.read_resources.is_empty() && lineage_depth() > 2 {
+        writer.candidate_args.as_ref().map_or_else(Vec::new, super::bind::lineage_candidates)
+    } else {
+        writer.read_resources.iter().map(|&r| (r, String::new())).collect()
+    };
+    if !candidates.is_empty() && candidates[0].1.len() != 0 {
+        candidates.sort_by_key(|(r, _)| !submits.range(..at).rev().any(|(seen, _, _, w)| *seen >= frame.saturating_sub(4) && w.resource == *r));
+        candidates.truncate(8);
+    }
+    let mut next = Vec::new();
+    for (input, description) in candidates {
+        if *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+        let mut logged = [false; 2];
+        let written = submits.iter().filter(|(seen, _, _, w)| *seen == frame && w.resource == input)
+            .fold(0, |seen, (_, _, _, w)| seen | if w.kind == "compute binding candidate" { 1 } else { 2 });
+        let observed = match written { 0 => "not-observed", 1 => "compute-binding-only", _ => "draw/copy/clear" };
+        crate::xlog_info!("present input state: p{plane} depth {depth} input {input:#x} this-frame-submitted={observed} {description}");
+        for (producer_at, (input_frame, q, timing, producer)) in submits.range(..at).enumerate().rev()
+            .filter(|(_, (seen, _, _, producer))| *seen >= frame.saturating_sub(4) && producer.resource == input)
+        {
+            let kind = usize::from(producer.kind == "compute binding candidate");
+            if !std::mem::replace(&mut logged[kind], true) {
+                crate::xlog_info!("present input producer: p{plane} depth {depth} input {input:#x}, submitted at frame {input_frame}, q{q} timing q{timing:?}: {} PSO {:#x} shader hashes {:x?}", producer.kind, producer.pso, producer.shaders);
+                if producer.inputs.first().is_some_and(|input| input.starts_with("selected ")) {
+                    crate::xlog_info!("present upstream inputs: p{plane} output {input:#x} [{}]", producer.inputs.join("; "));
+                }
+                if kind == 0 && producer.pso != 0 {
+                    next.push((producer_at, producer));
+                }
+            }
+            if logged == [true; 2] {
+                break;
+            }
+        }
+        if logged == [false; 2] {
+            crate::xlog_info!("present input producer: p{plane} depth {depth} input {input:#x}, no prior matching CPU submission in the trace");
+        }
+    }
+    for (producer_at, producer) in next {
+        log_input_producers(submits, plane, frame, producer_at, producer, depth + 1, budget, visited);
     }
 }
 
@@ -446,7 +555,7 @@ pub fn known_queues() -> Vec<usize> {
 
 static EXECUTES: AtomicU64 = AtomicU64::new(0);
 
-/// (PresentX calls, ExecuteCommandLists calls) so far
+/// Submitted composites and ExecuteCommandLists calls so far.
 pub fn activity() -> (u64, u64) {
     (PRESENTS.load(Ordering::Relaxed), EXECUTES.load(Ordering::Relaxed))
 }
@@ -507,6 +616,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     if let Some(r) = crate::hosting::on_message(hwnd.0, msg, wp.0, lp.0) {
         return LRESULT(r);
     }
+    if wp.0 == 0x79 && matches!(msg, WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP)
+        && super::live_status::key(msg, lp) {
+        return LRESULT(0);
+    }
     // keyboard and mouse as the gamepad: raw mouse input, the cursor held in the window
     if crate::hle::kbm::on_message(hwnd.0, msg, wp.0, lp.0) {
         return LRESULT(0);
@@ -521,6 +634,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             windows::Win32::System::Threading::ExitProcess(0);
         }
         WM_DESTROY => {
+            super::live_status::stop();
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -583,29 +697,45 @@ unsafe fn show_compiling(hwnd: HWND) {
     static SHOWN: Mutex<Option<String>> = Mutex::new(None);
     static FRAME_RATE: Mutex<Option<FrameRate>> = Mutex::new(None);
     let now = Instant::now();
-    let presented = PRESENTS.load(Ordering::Relaxed);
+    let presented = HOST_PRESENTS.load(Ordering::Relaxed);
     let fps = FRAME_RATE
         .lock()
         .unwrap()
         .get_or_insert_with(|| FrameRate::new(now, presented))
         .sample(now, presented);
-    let title = format!("XCL – {} | {fps:.1} FPS", window_name());
+    let mut title = format!("XCL – {} | {fps:.1} FPS", window_name());
+    let advanced = super::live_status::advanced();
+    if advanced {
+        title.push_str(" | ");
+        title.push_str(&super::live_status::title());
+    }
     let text = if crate::progress::enabled() {
-        crate::progress::current().map_or(title.clone(), |s| format!("{} | {title}", s.title()))
+        match crate::progress::current() {
+            Some(s) if advanced => format!("{title} | {}", s.title()),
+            Some(s) => format!("{} | {title}", s.title()),
+            None => title,
+        }
     } else {
-        compiling_title(title)
+        compiling_title(title, advanced)
     };
     let mut shown = SHOWN.lock().unwrap();
     if shown.as_deref() != Some(text.as_str()) {
         let _ = SetWindowTextW(hwnd, &HSTRING::from(text.as_str()));
         *shown = Some(text);
     }
+    drop(shown);
+    super::live_status::refresh(hwnd, fps);
 }
 
 /// `title` with the DXC compiles running and done (`XCL_PROGRESS=0`).
-fn compiling_title(title: String) -> String {
+fn compiling_title(title: String, advanced: bool) -> String {
     static LAST_ACTIVE: Mutex<Option<Instant>> = Mutex::new(None);
-    let (_, failed, queued) = super::pso_async::counts();
+    let (failed, queued) = if advanced {
+        (super::pso_async::failed_count(), crate::progress::PIPELINES.counts().pending)
+    } else {
+        let (_, failed, queued) = super::pso_async::counts();
+        (failed, queued)
+    };
     let (running, done) = crate::gpu::recomp::dxc::compile_counts();
     let active = running > 0 || queued > 0;
     let recent = {
@@ -680,9 +810,16 @@ fn window_thread() {
             crate::xlog_info!("XCL window created ({}x{})", cfg.window_width, cfg.window_height);
         }
         crate::hle::kbm::attach(hwnd.0);
+        if super::live_status::advanced() || crate::live_stall::enabled() {
+            super::live_status::start();
+        }
+        super::live_status::install(hwnd, inst.into());
         SetTimer(Some(hwnd), COMPILE_TIMER, 500, None);
         let raw = hwnd.0 as isize;
         let _ = std::thread::Builder::new().name("xcl-window-watch".into()).spawn(move || watch_window(raw));
+        if let Err(e) = std::thread::Builder::new().name("xcl-display".into()).spawn(move || display_thread(raw)) {
+            crate::xlog_error!("present: cannot start the host display thread: {e}");
+        }
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let t0 = Instant::now();
@@ -796,7 +933,7 @@ fn ensure_window() -> Option<HWND> {
 struct Presenter {
     queue: usize,
     dev: ID3D12Device,
-    sc: Option<IDXGISwapChain3>,
+    surfaces: Vec<Arc<ID3D12Resource>>,
     w: u32,
     h: u32,
     fmt: DXGI_FORMAT,
@@ -806,6 +943,7 @@ struct Presenter {
     copy_sources: Vec<ID3D12Resource>,
     dumps: Vec<FrameDump>,
     dump_frame: Option<u64>,
+    scalar_dump: Vec<(u64, usize, u64, ScalarProbe, u64)>,
     disabled: bool,
     value: u64,
     event: HANDLE,
@@ -928,7 +1066,7 @@ unsafe fn compose(p: &mut Presenter, bb: &ID3D12Resource, planes: &[ID3D12Resour
     p.dev.CreateRenderTargetView(bb, None, rtv);
     // (the RTV hook keeps a reference to what a handle names: none on the swap chain's buffer)
     note_rtv(rtv.ptr, std::ptr::null_mut());
-    p.list.ResourceBarrier(&[transition(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+    p.list.ResourceBarrier(&[transition(bb, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
     p.list.OMSetRenderTargets(1, Some(&rtv), false, None);
     p.list.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: p.w as f32, Height: p.h as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
     p.list.RSSetScissorRects(&[RECT { left: 0, top: 0, right: p.w as i32, bottom: p.h as i32 }]);
@@ -977,7 +1115,59 @@ enum DumpJob {
 static DUMP_WRITER: OnceLock<Option<SyncSender<DumpJob>>> = OnceLock::new();
 static DUMP_SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+const SCALAR_READBACK_BYTES: u64 = 16 * 8 * 8 * 4;
+
+fn scalar_readback() -> Option<(usize, u64, usize)> {
+    static BUFFER: OnceLock<Option<(usize, u64, usize)>> = OnceLock::new();
+    *BUFFER.get_or_init(|| unsafe { super::markers::readback_buffer(SCALAR_READBACK_BYTES) })
+}
+
+unsafe fn copy_scalar_probes(p: &Presenter, frame: u64) -> Vec<(u64, usize, u64, ScalarProbe, u64)> {
+    let bindings: Vec<_> = SCALAR_SUBMITS.lock().unwrap().iter()
+        .filter(|(f, q, _)| *q == p.queue && (frame.saturating_sub(2)..=frame).contains(f)).cloned().collect();
+    if bindings.is_empty() {
+        return Vec::new();
+    }
+    let Some((rb, _, _)) = scalar_readback() else { return Vec::new() };
+    let rb = rb as *mut c_void;
+    let Some(dst) = ID3D12Resource::from_raw_borrowed(&rb) else { return Vec::new() };
+    let mut at = 0;
+    let mut samples = Vec::new();
+    for (recorded, queue, (shader, values)) in bindings {
+        let q = super::list_x::queue_id(queue);
+        for value in values {
+            let (reg, desc, offset) = value.selector;
+            let bytes = (value.words * 4) as u64;
+            let source = value.va.and_then(|va| super::real::uma_window_buffer(va as usize, bytes as usize));
+            let Some((src, off)) = source else {
+                crate::xlog_info!("present scalar: frame {frame} q{q} submission frame {recorded} shader {shader:016x} s{reg}+{desc:#x}:{offset:#x}: no UMA source");
+                continue;
+            };
+            let src = src as *mut c_void;
+            let Some(src) = ID3D12Resource::from_raw_borrowed(&src) else { continue };
+            p.list.ResourceBarrier(&[transition(src, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            p.list.CopyBufferRegion(dst, at, src, off, bytes);
+            p.list.ResourceBarrier(&[transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
+            samples.push((frame, q, shader, value, at));
+            at += bytes;
+        }
+    }
+    samples
+}
+
 fn take_frame_dumps(p: &mut Presenter, completed: bool) -> Option<DumpBatch> {
+    if completed && !p.scalar_dump.is_empty() {
+        if let Some((_, _, cpu)) = scalar_readback() {
+            for (frame, q, shader, value, at) in p.scalar_dump.drain(..) {
+                let (reg, desc, offset) = value.selector;
+                let words: Vec<_> = (0..value.words as usize).map(|i| unsafe {
+                    ((cpu + at as usize + i * 4) as *const u32).read_volatile()
+                }).collect();
+                let floats: Vec<_> = words.iter().copied().map(f32::from_bits).collect();
+                crate::xlog_info!("present scalar: frame {frame} q{q} shader {shader:016x} s{reg}+{desc:#x}:{offset:#x} UMA {:x?} GPU bits {words:08x?} floats {floats:?}", value.va);
+            }
+        }
+    }
     let DumpAction::Collect(frame) = dump_action(p.dump_frame, completed) else { return None };
     let mut dumps = std::mem::take(&mut p.dumps);
     p.dump_frame = None;
@@ -1041,7 +1231,9 @@ unsafe fn frame_dump_ready(p: &Presenter, wait_ms: u32) -> Result<bool, FenceErr
 }
 
 pub(crate) fn flush_frame_dumps() {
-    DUMP_SHUTDOWN.store(true, Ordering::Release);
+    if !DUMP_SHUTDOWN.swap(true, Ordering::AcqRel) {
+        log_host_display();
+    }
     let deadline = Instant::now() + Duration::from_secs(5);
     let remaining = || deadline.saturating_duration_since(Instant::now());
     let mut guard = loop {
@@ -1056,7 +1248,7 @@ pub(crate) fn flush_frame_dumps() {
             }
         }
     };
-    let batch = guard.as_mut().filter(|p| p.dump_frame.is_some()).and_then(|p| {
+    let batch = guard.as_mut().filter(|p| p.dump_frame.is_some() || !p.scalar_dump.is_empty()).and_then(|p| {
         match unsafe { frame_dump_ready(p, remaining().as_millis() as u32) } {
             Ok(ready) => take_frame_dumps(p, ready),
             Err(e) => {
@@ -1117,56 +1309,261 @@ unsafe fn new_presenter(queue: usize) -> Option<Presenter> {
     let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
     let event = CreateEventW(None, false, false, None).ok()?;
     Some(Presenter {
-        queue, dev: dev.clone(), sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN, alloc, list, fence,
-        copy_sources: Vec::new(), dumps: Vec::new(), dump_frame: None, disabled: false, value: 0, event,
+        queue, dev: dev.clone(), surfaces: Vec::new(), w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN, alloc, list, fence,
+        copy_sources: Vec::new(), dumps: Vec::new(), dump_frame: None, scalar_dump: Vec::new(), disabled: false, value: 0, event,
         last: Instant::now() - Duration::from_secs(1), composer: None, bar_rtv: None,
     })
 }
 
-unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: DXGI_FORMAT) -> bool {
-    if let Some(sc) = &p.sc {
-        if p.w == w && p.h == h && p.fmt == fmt {
-            return true;
+#[derive(Clone)]
+struct DisplayFrame {
+    index: u64,
+    surface: Arc<ID3D12Resource>,
+}
+
+struct DisplayFrames {
+    pending: Option<(DisplayFrame, ID3D12Fence, u64)>,
+    retired: Option<DisplayFrame>,
+}
+
+static DISPLAY_FRAMES: Mutex<DisplayFrames> = Mutex::new(DisplayFrames { pending: None, retired: None });
+
+impl DisplayFrames {
+    unsafe fn retire(&mut self, dev: &ID3D12Device) -> Result<(), FenceError> {
+        if let Some((_, fence, value)) = &self.pending {
+            if fence::completed_value(fence, dev)? >= *value {
+                self.retired = self.pending.take().map(|(frame, _, _)| frame);
+            }
         }
-        if sc.ResizeBuffers(2, w, h, fmt, DXGI_SWAP_CHAIN_FLAG(0)).is_ok() {
-            p.w = w;
-            p.h = h;
-            p.fmt = fmt;
-            crate::xlog_info!("present: swap chain {w}x{h} {:?}", fmt);
-            return true;
-        }
-        p.fmt = DXGI_FORMAT_UNKNOWN;
-        return false;
+        Ok(())
     }
-    let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory2>(DXGI_CREATE_FACTORY_FLAGS(0)) else { return false };
-    let qraw = p.queue as *mut c_void;
-    let Some(queue) = ID3D12CommandQueue::from_raw_borrowed(&qraw) else { return false };
-    let desc = DXGI_SWAP_CHAIN_DESC1 {
-        Width: w,
-        Height: h,
-        Format: fmt,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-        BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-        BufferCount: 2,
-        Scaling: DXGI_SCALING_STRETCH,
-        SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-        AlphaMode: DXGI_ALPHA_MODE_IGNORE,
-        ..Default::default()
-    };
-    match factory.CreateSwapChainForHwnd(queue, hwnd, &desc, None, None) {
-        Ok(sc1) => {
-            let _ = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
-            p.sc = sc1.cast::<IDXGISwapChain3>().ok();
-            p.w = w;
-            p.h = h;
-            p.fmt = fmt;
-            crate::xlog_info!("present: swap chain {w}x{h} {:?} – the game image will appear in the XCL window", fmt);
-            p.sc.is_some()
+}
+
+fn log_host_display() {
+    crate::xlog_info!(
+        "host display: {} valid PresentX calls, {} composites submitted, {} DXGI S_OK, {} occluded, {} still drawing",
+        TITLE_PRESENT_CALLS.load(Ordering::Relaxed),
+        PRESENTS.load(Ordering::Relaxed),
+        HOST_PRESENTS.load(Ordering::Relaxed),
+        HOST_OCCLUDED.load(Ordering::Relaxed),
+        HOST_STILL_DRAWING.load(Ordering::Relaxed),
+    );
+}
+
+unsafe fn composite_surface(p: &mut Presenter, w: u32, h: u32, fmt: DXGI_FORMAT) -> Option<Arc<ID3D12Resource>> {
+    if (p.w, p.h, p.fmt) != (w, h, fmt) {
+        p.surfaces.clear();
+        (p.w, p.h, p.fmt) = (w, h, fmt);
+    }
+    if let Some(surface) = p.surfaces.iter().find(|surface| Arc::strong_count(surface) == 1) {
+        return Some(surface.clone());
+    }
+    if p.surfaces.len() == 4 {
+        return None;
+    }
+    let mut surface: Option<ID3D12Resource> = None;
+    p.dev.CreateCommittedResource(
+        &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+        D3D12_HEAP_FLAG_NONE,
+        &D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: u64::from(w),
+            Height: h,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: fmt,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        },
+        D3D12_RESOURCE_STATE_COMMON,
+        None,
+        &mut surface,
+    ).ok()?;
+    let surface = Arc::new(surface?);
+    p.surfaces.push(surface.clone());
+    Some(surface)
+}
+
+struct HostDisplay {
+    queue: ID3D12CommandQueue,
+    alloc: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    fence: ID3D12Fence,
+    value: u64,
+    in_flight: Option<DisplayFrame>,
+    shown: Option<u64>,
+    sc: Option<IDXGISwapChain3>,
+    w: u32,
+    h: u32,
+    fmt: DXGI_FORMAT,
+}
+
+impl HostDisplay {
+    unsafe fn new(dev: &ID3D12Device) -> windows::core::Result<Self> {
+        let desc = D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() };
+        type CreateQueue = unsafe extern "system" fn(*mut c_void, *const D3D12_COMMAND_QUEUE_DESC, *const windows::core::GUID, *mut *mut c_void) -> windows::core::HRESULT;
+        let slot = std::mem::offset_of!(ID3D12Device_Vtbl, CreateCommandQueue) / std::mem::size_of::<usize>();
+        let create: CreateQueue = std::mem::transmute(super::real::original_or_native(dev.as_raw(), slot).0);
+        let mut queue = std::ptr::null_mut();
+        create(dev.as_raw(), &desc, &ID3D12CommandQueue::IID, &mut queue).ok()?;
+        let queue = ID3D12CommandQueue::from_raw(queue);
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)?;
+        list.Close()?;
+        Ok(Self {
+            queue, alloc, list, fence: dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?, value: 0,
+            in_flight: None, shown: None, sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN,
+        })
+    }
+
+    unsafe fn flip(&mut self, dev: &ID3D12Device, hwnd: HWND, frame: DisplayFrame) -> Result<(), FenceError> {
+        let desc = frame.surface.GetDesc();
+        let err = |op, e| fence::api_error(dev, op, e);
+        let sc = self.swapchain(hwnd, desc.Width as u32, desc.Height, desc.Format)
+            .map_err(|e| err("host swap chain", e))?;
+        let bb: ID3D12Resource = sc.GetBuffer(sc.GetCurrentBackBufferIndex()).map_err(|e| err("GetBuffer", e))?;
+        self.alloc.Reset().map_err(|e| err("host allocator reset", e))?;
+        self.list.Reset(&self.alloc, None).map_err(|e| err("host list reset", e))?;
+        self.list.ResourceBarrier(&[
+            transition(&frame.surface, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST),
+        ]);
+        self.list.CopyResource(&bb, frame.surface.as_ref());
+        self.list.ResourceBarrier(&[
+            transition(&frame.surface, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+            transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT),
+        ]);
+        self.list.Close().map_err(|e| err("host list close", e))?;
+        let list = self.list.cast().map_err(|e| err("host list cast", e))?;
+        self.queue.ExecuteCommandLists(&[Some(list)]);
+        let index = frame.index;
+        self.in_flight = Some(frame);
+        crate::gpu::pix_capture::before_present(hwnd);
+        let status = sc.Present(1, DXGI_PRESENT_DO_NOT_WAIT);
+        self.value += 1;
+        self.queue.Signal(&self.fence, self.value).map_err(|e| err("host copy signal", e))?;
+        if status == S_OK {
+            self.shown = Some(index);
+            if HOST_PRESENTS.fetch_add(1, Ordering::Relaxed) == 0 {
+                crate::xlog_info!("present: first host flip ({}x{}, composite {index})", desc.Width, desc.Height);
+            }
+        } else if status == DXGI_STATUS_OCCLUDED {
+            HOST_OCCLUDED.fetch_add(1, Ordering::Relaxed);
+        } else if status == DXGI_ERROR_WAS_STILL_DRAWING {
+            HOST_STILL_DRAWING.fetch_add(1, Ordering::Relaxed);
+        } else {
+            status.ok().map_err(|e| err("host Present", e))?;
         }
-        Err(e) => {
-            crate::xlog_error!("present: CreateSwapChainForHwnd: {e}");
-            false
+        Ok(())
+    }
+
+    unsafe fn swapchain(&mut self, hwnd: HWND, w: u32, h: u32, fmt: DXGI_FORMAT) -> windows::core::Result<IDXGISwapChain3> {
+        if let Some(sc) = &self.sc {
+            if (self.w, self.h, self.fmt) != (w, h, fmt) {
+                sc.ResizeBuffers(2, w, h, fmt, DXGI_SWAP_CHAIN_FLAG(0))?;
+                (self.w, self.h, self.fmt) = (w, h, fmt);
+                crate::xlog_info!("present: swap chain {w}x{h} {:?}", fmt);
+            }
+            return Ok(sc.clone());
         }
+        let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+        let desc = DXGI_SWAP_CHAIN_DESC1 {
+            Width: w,
+            Height: h,
+            Format: fmt,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+            BufferCount: 2,
+            Scaling: DXGI_SCALING_STRETCH,
+            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+            ..Default::default()
+        };
+        let sc: IDXGISwapChain3 = factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?.cast()?;
+        let _ = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+        self.sc = Some(sc.clone());
+        (self.w, self.h, self.fmt) = (w, h, fmt);
+        crate::xlog_info!("present: swap chain {w}x{h} {:?}", fmt);
+        Ok(sc)
+    }
+}
+
+fn display_thread(raw: isize) {
+    let hwnd = HWND(raw as *mut c_void);
+    let mut display = None::<HostDisplay>;
+    let mut last_error = None;
+    let mut visibility_lost = false;
+    let mut last_stats = Instant::now();
+    let activity = std::env::var_os("XCL_ACTIVITY").is_some();
+    loop {
+        std::thread::sleep(Duration::from_millis(16));
+        if activity && last_stats.elapsed() >= Duration::from_secs(10) {
+            log_host_display();
+            last_stats = Instant::now();
+        }
+        unsafe {
+            if !IsWindow(Some(hwnd)).as_bool() {
+                break;
+            }
+            if IsIconic(hwnd).as_bool() || !IsWindowVisible(hwnd).as_bool() {
+                visibility_lost = true;
+                continue;
+            }
+            let raw = super::real::device_raw();
+            let Some(dev) = ID3D12Device::from_raw_borrowed(&raw) else { continue };
+            if let Some(host) = display.as_mut().filter(|host| host.in_flight.is_some()) {
+                match fence::completed_value(&host.fence, dev) {
+                    Ok(value) if value >= host.value => host.in_flight = None,
+                    Ok(_) => continue,
+                    Err(e) => {
+                        crate::xlog_error!("present: retire host copy: {e}");
+                        break;
+                    }
+                }
+            }
+            let frame = {
+                let mut frames = DISPLAY_FRAMES.lock().unwrap();
+                if let Err(e) = frames.retire(dev) {
+                    crate::xlog_error!("present: retire composite: {e}");
+                    break;
+                }
+                frames.retired.clone()
+            };
+            let Some(frame) = frame else { continue };
+            if display.is_none() {
+                match HostDisplay::new(dev) {
+                    Ok(host) => display = Some(host),
+                    Err(e) => {
+                        crate::xlog_error!("present: cannot create host display: {e}");
+                        break;
+                    }
+                }
+            }
+            let host = display.as_mut().unwrap();
+            if std::mem::take(&mut visibility_lost) {
+                host.shown = None;
+            }
+            if host.shown.is_some_and(|shown| shown >= frame.index) {
+                continue;
+            }
+            match host.flip(dev, hwnd, frame) {
+                Ok(()) => last_error = None,
+                Err(e) => {
+                    let message = e.to_string();
+                    if last_error.as_ref() != Some(&message) {
+                        crate::xlog_error!("present: {e}");
+                        last_error = Some(message);
+                    }
+                    if matches!(e, FenceError::Removed(_) | FenceError::Api("host copy signal", _)) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if display.as_ref().is_some_and(|host| host.in_flight.is_some()) {
+        std::mem::forget(display);
     }
 }
 
@@ -1198,8 +1595,8 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, &[usize])>) 
         (queue, src.clone(), guard)
     };
     // PresentX on another queue than the presenter was made for (the fallback presented once from
-    // a queue before the title's first PresentX, issue #103): the swap chain belongs to a queue –
-    // a new presenter for the title's present queue, after the old presentation completes
+    // a queue before the title's first PresentX): retire the old queue's composition before
+    // switching to the title's present queue.
     if frame.is_some() && guard.as_ref().is_some_and(|p| p.queue != queue) {
         if let Some(old) = guard.as_mut() {
             match fence::wait(&old.fence, old.value, &old.dev, Some(old.event), 1000) {
@@ -1212,7 +1609,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, &[usize])>) 
                 Err(_) => return,
             }
         }
-        crate::xlog_info!("D3D12.X: PresentX from another queue ({queue:#x}) – the XCL window's swap chain moves to it");
+        crate::xlog_info!("D3D12.X: PresentX from another queue ({queue:#x}) – composition moves to it");
         *guard = None;
     }
     if guard.is_none() {
@@ -1224,11 +1621,13 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, &[usize])>) 
     }
     let Some(desc) = backbuffer_like(src.as_raw() as usize) else { return };
     let Some(fmt) = swap_format(desc.Format) else { return };
-    let Some(hwnd) = ensure_window() else { return };
-    if p.queue != queue {
-        return; // swap chain is bound to the first queue we presented from
+    if ensure_window().is_none() {
+        return;
     }
-    // wait for the previous copy and present before reusing the allocator or resizing the swap chain
+    if p.queue != queue {
+        return;
+    }
+    // wait for the previous composition before reusing its allocator and descriptors
     if let Err(e) = fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 100) {
         p.disabled = matches!(&e, FenceError::Removed(_));
         if !matches!(&e, FenceError::Timeout(_)) {
@@ -1238,11 +1637,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, &[usize])>) 
     }
     p.copy_sources.clear();
     queue_frame_dumps(p, true);
-    if !ensure_swapchain(p, hwnd, desc.Width as u32, desc.Height, fmt) {
-        return;
-    }
-    let Some(sc) = p.sc.clone() else { return };
-    let Ok(bb) = sc.GetBuffer::<ID3D12Resource>(sc.GetCurrentBackBufferIndex()) else { return };
+    let Some(bb) = composite_surface(p, desc.Width as u32, desc.Height, fmt) else { return };
     if p.alloc.Reset().is_err() || p.list.Reset(&p.alloc, None).is_err() {
         return;
     }
@@ -1251,8 +1646,8 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, &[usize])>) 
     planes.extend(frame.map_or(&[][..], |f| &f.1[1..]).iter().filter_map(|&r| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).cloned()));
     let composed = planes.len() > 1 && compose(p, &bb, &planes);
     if !composed {
-        p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)]);
-        p.list.CopyResource(&bb, &src);
+        p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+        p.list.CopyResource(bb.as_ref(), &src);
         p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
     }
     let index = PRESENTS.load(Ordering::Relaxed);
@@ -1268,8 +1663,8 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, &[usize])>) 
     let due = frame_dump_due();
     let mut dumps = Vec::new();
     if due || trace_planes {
-        // the back buffer the window shows, after the copy or the composition
-        let (shown, d) = (bb.clone(), bb.GetDesc());
+        // the composite before the host progress bar
+        let (shown, d) = (bb.as_ref().clone(), bb.GetDesc());
         if let Some((buffer, footprint)) = readback_copy(&p.list, &shown, &d) {
             dumps.push(FrameDump { source: Some(shown), buffer, footprint, format: d.Format, tag: "frame".into() });
         }
@@ -1315,11 +1710,12 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, &[usize])>) 
             dumps.push(FrameDump { source: Some(res), buffer, footprint, format, tag });
         }
     }
+    let scalar_dump = if timed_capture.is_some() { copy_scalar_probes(p, index) } else { Vec::new() };
     // the bar and the overlay come after the frame dumps: they hold the title's frame as it is
     let mut rects = crate::progress::current().map_or(Vec::new(), |s| crate::progress::bar(p.w, p.h, s.fraction()).to_vec());
     rects.extend(crate::control::overlay_rects(p.w, p.h));
     if rects.is_empty() {
-        p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT)]);
+        p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
     } else {
         fill_rects(p, &bb, &rects);
     }
@@ -1334,9 +1730,9 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, &[usize])>) 
     if let Some(frame) = p.dump_frame {
         crate::xlog_warn!("present: frame dump writer busy; skipped frame {frame}");
     }
-    p.dump_frame = (!dumps.is_empty()).then(|| PRESENTS.load(Ordering::Relaxed));
+    p.dump_frame = (!dumps.is_empty()).then_some(index);
     p.dumps = dumps;
-    let present_result = sc.Present(0, DXGI_PRESENT(0)).ok();
+    p.scalar_dump = scalar_dump;
     p.value += 1;
     super::markers::queue_fence(queue as usize, "the latest present copy (signal)", &p.fence, p.value);
     if let Err(e) = q.Signal(&p.fence, p.value) {
@@ -1346,18 +1742,14 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, &[usize])>) 
         crate::xlog_error!("present: submit copy: {e}");
         return;
     }
-    if let Err(e) = present_result {
-        if !p.dumps.is_empty() {
-            static FAILED_PRESENT_DUMPS: AtomicU64 = AtomicU64::new(0);
-            let failed = FAILED_PRESENT_DUMPS.fetch_add(1, Ordering::Relaxed);
-            for dump in &mut p.dumps {
-                dump.tag = format!("failed_present_{failed}_{}", dump.tag);
-            }
+    {
+        let mut frames = DISPLAY_FRAMES.lock().unwrap();
+        if let Err(e) = frames.retire(&p.dev) {
+            p.disabled = true;
+            crate::xlog_error!("present: retire previous composite: {e}");
+            return;
         }
-        let e = fence::api_error(&p.dev, "Present", e);
-        p.disabled = matches!(&e, FenceError::Removed(_));
-        crate::xlog_error!("present: {e}");
-        return;
+        frames.pending = Some((DisplayFrame { index, surface: bb }, p.fence.clone(), p.value));
     }
     if !PRESENTX.load(Ordering::Relaxed) {
         super::gpu_timing::boundary();
@@ -1366,15 +1758,12 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, &[usize])>) 
         }
     }
     p.last = Instant::now();
-    let n = PRESENTS.fetch_add(1, Ordering::Relaxed);
+    PRESENTS.fetch_add(1, Ordering::Relaxed);
     crate::control::note_present();
     if let Some(slot) = timed_capture {
         NEXT_PLANE_CAPTURE.store(slot + 1, Ordering::Relaxed);
     }
-    if n == 0 {
-        crate::xlog_info!("present: first game frame shown ({}x{})", desc.Width, desc.Height);
-    }
-    if p.dump_frame.is_some() {
+    if p.dump_frame.is_some() || !p.scalar_dump.is_empty() {
         match frame_dump_ready(p, frame_dump_wait_ms()) {
             Ok(ready) => { queue_frame_dumps(p, ready); }
             Err(FenceError::Timeout(ms)) => {
@@ -1390,14 +1779,14 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, &[usize])>) 
 
 /// The progress bar (`progress::bar`) along the bottom edge of the back buffer and the
 /// performance overlay (`control::overlay_rects`): `rects` filled with their colours on the
-/// back buffer, which comes in COPY_SOURCE and leaves in PRESENT; the rest of the frame stays as
+/// back buffer, which comes in COPY_SOURCE and leaves in COMMON; the rest of the frame stays as
 /// it is.
 unsafe fn fill_rects(p: &mut Presenter, bb: &ID3D12Resource, rects: &[(crate::progress::Rect, [f32; 4])]) {
     if p.bar_rtv.is_none() {
         p.bar_rtv = p.dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() }).ok();
     }
     let Some(heap) = &p.bar_rtv else {
-        p.list.ResourceBarrier(&[transition(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT)]);
+        p.list.ResourceBarrier(&[transition(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
         return;
     };
     let rtv = heap.GetCPUDescriptorHandleForHeapStart();
@@ -1410,7 +1799,7 @@ unsafe fn fill_rects(p: &mut Presenter, bb: &ID3D12Resource, rects: &[(crate::pr
             p.list.ClearRenderTargetView(rtv, &colour, Some(&[RECT { left, top, right, bottom }]));
         }
     }
-    p.list.ResourceBarrier(&[transition(bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT)]);
+    p.list.ResourceBarrier(&[transition(bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON)]);
 }
 
 /// `XCL_FRAME_DUMP=1`: every 120th shown frame is written to the logs folder (`XCL_FRAME_DUMP=n`,
@@ -1480,7 +1869,7 @@ fn parse_frame_dump_wait_ms(setting: Option<&str>) -> u32 {
 /// The next shown frame is dumped whatever `XCL_FRAME_DUMP` says (a live look, `XCL_INPUT_FILE`).
 pub static LOOK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Frames shown so far.
+/// Compositions submitted so far, including host frames replaced before display.
 pub fn presents() -> u64 {
     PRESENTS.load(Ordering::Relaxed)
 }

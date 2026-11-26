@@ -128,6 +128,10 @@ impl Drop for PreloadJobGuard<'_> {
 }
 
 struct Pending {
+    /// when the title made it (`status`)
+    created: std::time::Instant,
+    /// the frame (`present::presents` + 1) a skipped bind last sent it to the bind queue
+    last_bound: AtomicU64,
     /// the build, until a full-quality build of it finished
     job: Mutex<Option<Arc<JobFn>>>,
     /// the build went to the workers (a lazy one goes on its first `resolve`)
@@ -140,8 +144,10 @@ struct Pending {
     cv: Condvar,
     compute: bool,
     image_only: std::sync::atomic::AtomicBool,
+    depth_only: std::sync::atomic::AtomicBool,
     /// of its shaders (`used`); 0 = none
     key: u64,
+    record: u64,
     /// it was used (`used::note` is told once)
     used: std::sync::atomic::AtomicBool,
     /// the stand-in was released before the real pipeline was built
@@ -209,8 +215,9 @@ impl Pending {
             REBUILT.fetch_add(1, Ordering::Relaxed);
             self.rebuild.store(true, Ordering::Release);
         }
-        if self.key != 0 && !self.used.swap(true, Ordering::Relaxed) {
+        if !self.used.swap(true, Ordering::Relaxed) {
             used::note(self.key);
+            super::pso_manifest::note_bound(self.record);
         }
     }
 }
@@ -427,21 +434,34 @@ fn build_full(p: &Pending) {
         return;
     }
     if let Some(job) = job_of(p) {
-        complete(p, run(&*job), false);
+        complete(p, run(p, &*job), false);
     }
 }
 
 /// The build something waits for: a big program the cache has no optimized DXIL for compiled
 /// at the fast tier first (`dxc::fast_tier`), its full-quality build queued behind everything
 /// else and swapped in when done.
-fn build_tiered(p: &Arc<Pending>) {
+/// `hand_off`: a live build's cold giant that cannot start now goes to the giant lane
+/// (`GIANT_LANE`) instead of holding this worker (`real::live_lanes`).
+fn build_tiered(p: &Arc<Pending>, hand_off: bool) {
     if p.orphan.load(Ordering::Acquire) || *p.done.lock().unwrap() || p.tiered_started.swap(true, Ordering::AcqRel) {
         return;
     }
     let Some(job) = job_of(p) else { return };
+    if hand_off && p.last_bound.load(Ordering::Acquire) != 0 {
+        PUT_OFF.with(|d| d.set(PutOff::Allowed));
+    }
     // (no fast tier: -O0 DXIL took an NVIDIA driver longer than -O1 – 182 s against 123 s on a
     // retail game's biggest compute program – and DXC only ~half the time)
-    let (real, fast) = (run(&*job), false);
+    let (real, fast) = (run(p, &*job), false);
+    if let (0, PutOff::Left(_)) = (real, PUT_OFF.with(|d| d.replace(PutOff::No))) {
+        p.tiered_started.store(false, Ordering::Release);
+        crate::progress::PIPELINES.queue();
+        GIANT_LANE.0.lock().unwrap().push_back(p.clone());
+        GIANT_LANE.1.notify_one();
+        start_giant_lane();
+        return;
+    }
     if !fast {
         p.full_started.store(true, Ordering::Release);
     }
@@ -449,6 +469,33 @@ fn build_tiered(p: &Arc<Pending>) {
     if fast && !p.full_started.load(Ordering::Acquire) {
         enqueue_upgrade(p.clone());
     }
+}
+
+/// Live builds whose cold giant did not fit when a bind-queue worker came to it, built one at a
+/// time, in order, on one thread that waits for the memory (`real::live_lanes`): the workers go
+/// on with the small ones.
+static GIANT_LANE: (Mutex<VecDeque<Arc<Pending>>>, Condvar) = (Mutex::new(VecDeque::new()), Condvar::new());
+static GIANT_LANE_BUILDS: AtomicUsize = AtomicUsize::new(0);
+
+fn start_giant_lane() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new().name("xcl-pso-giant".into()).stack_size(64 << 20).spawn(|| loop {
+            let p = {
+                let (queue, ready) = &GIANT_LANE;
+                let mut queue = ready.wait_while(queue.lock().unwrap(), |q| q.is_empty()).unwrap();
+                queue.pop_front().unwrap()
+            };
+            let _task = crate::progress::PIPELINES.take();
+            let n = GIANT_LANE_BUILDS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                crate::xlog_info!("D3D12.X: {n} live giants built in the giant lane ({} waiting)", GIANT_LANE.0.lock().unwrap().len());
+            }
+            BUILDING.with(|b| *b.borrow_mut() = Some(p.clone()));
+            build_tiered(&p, false);
+            BUILDING.with(|b| *b.borrow_mut() = None);
+        });
+    });
 }
 
 /// `p`'s driver compile of `dxil_len` bytes of DXIL waits for memory (`pso_sched::Backlog::park`).
@@ -461,6 +508,10 @@ fn park(q: &Preload, dxil_len: usize, p: &Arc<Pending>) {
 
 static BUILT: AtomicUsize = AtomicUsize::new(0);
 static FAILED: AtomicUsize = AtomicUsize::new(0);
+
+pub(super) fn failed_count() -> usize {
+    FAILED.load(Ordering::Relaxed)
+}
 /// binds waiting right now for a pipeline still being built (`title_held`)
 static HELD: AtomicUsize = AtomicUsize::new(0);
 
@@ -499,8 +550,16 @@ type JobFn = dyn Fn() -> usize + Send + Sync;
 
 /// Run a job; a panic in it is a failed build (a worker must not die with it, and whoever
 /// waits for the pipeline must be woken).
-fn run(job: &JobFn) -> usize {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).unwrap_or(0)
+fn run(p: &Pending, job: &JobFn) -> usize {
+    let (started, waited) = (std::time::Instant::now(), super::real::memory_waited());
+    let real = crate::live_stall::with_job(p.record, p.key, || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).unwrap_or(0)
+    });
+    if real != 0 && !preparing() {
+        let took = started.elapsed().saturating_sub(super::real::memory_waited().saturating_sub(waited));
+        super::pso_manifest::note_build_time(p.record, took.as_millis() as u64);
+    }
+    real
 }
 
 thread_local! {
@@ -544,7 +603,7 @@ fn prepare(p: &Pending) {
     }
     let Some(job) = job_of(p) else { return };
     PREPARING.with(|f| f.set(true));
-    let made = run(&*job);
+    let made = run(p, &*job);
     PREPARING.with(|f| f.set(false));
     release(made);
     let n = PREPARED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -570,7 +629,7 @@ fn prepare_queue() -> Option<&'static Mutex<mpsc::Sender<Weak<Pending>>>> {
             let _ = std::thread::Builder::new().name(format!("xcl-prep-{k}")).stack_size(64 << 20).spawn(move || loop {
                 let next = rx.lock().unwrap().recv();
                 let Ok(p) = next else { return };
-                while super::real::background_memory_paused() && p.strong_count() != 0 {
+                while (super::real::background_memory_paused() || super::real::live_compile_waiting()) && p.strong_count() != 0 {
                     std::thread::sleep(PARKED_POLL);
                 }
                 let _task = crate::progress::PIPELINES.take();
@@ -594,6 +653,9 @@ struct BuildQueue {
     upgrades: VecDeque<Arc<Pending>>,
     /// builds a bind waits for, with when the bind asked: before everything else
     urgent: VecDeque<(Arc<Pending>, std::time::Instant)>,
+    /// builds of pipelines whose draws were skipped (`skip_until_built`), the last bound last:
+    /// taken newest first, after `urgent` and before the rest, as background builds
+    bound: VecDeque<Arc<Pending>>,
 }
 
 impl BuildQueue {
@@ -615,11 +677,42 @@ static QUEUE: Mutex<BuildQueue> = Mutex::new(BuildQueue {
     compute: VecDeque::new(),
     upgrades: VecDeque::new(),
     urgent: VecDeque::new(),
+    bound: VecDeque::new(),
 });
+
+/// pipelines the bind queue holds at most: the ones bound longest ago fall out (a later bind
+/// sends a pipeline again)
+const BOUND_QUEUE: usize = 4096;
+
+fn enqueue_bound(p: Arc<Pending>) {
+    start_workers();
+    crate::progress::PIPELINES.queue();
+    let mut queue = QUEUE.lock().unwrap();
+    queue.bound.push_back(p);
+    if queue.bound.len() > BOUND_QUEUE {
+        queue.bound.pop_front();
+        drop(crate::progress::PIPELINES.take());
+    }
+    drop(queue);
+    READY.notify_one();
+}
 
 /// threads that build only what binds wait for, besides the workers (which take it first too)
 const URGENT_THREADS: usize = 4;
 static READY: Condvar = Condvar::new();
+
+pub(super) fn diagnostic_queued() -> impl Iterator<Item = crate::live_stall::Sample> {
+    use crate::live_stall::{Sample, Stage};
+    let mut samples = [None; 4];
+    if let Ok(q) = QUEUE.try_lock() {
+        for (slot, (p, since)) in samples.iter_mut().zip(q.urgent.iter()) {
+            *slot = Some(Sample {
+                stage: Stage::Queued, since: *since, tid: 0, pipeline: p.record, shader: p.key, target: None, queue: None,
+            });
+        }
+    }
+    samples.into_iter().flatten()
+}
 
 fn start_workers() {
     static WORKERS: std::sync::Once = std::sync::Once::new();
@@ -636,8 +729,17 @@ fn start_workers() {
                         if let Some(next) = next {
                             break next;
                         }
-                        if !urgent_only && (!queue.compute.is_empty() || !queue.graphics.is_empty() || !queue.upgrades.is_empty()) {
+                        if !urgent_only && !queue.bound.is_empty() {
                             if super::real::background_memory_paused() {
+                                queue = READY.wait_timeout(queue, PARKED_POLL).unwrap().0;
+                                continue;
+                            }
+                            if let Some(p) = queue.bound.pop_back() {
+                                break (p, false, None);
+                            }
+                        }
+                        if !urgent_only && (!queue.compute.is_empty() || !queue.graphics.is_empty() || !queue.upgrades.is_empty()) {
+                            if super::real::background_memory_paused() || super::real::live_compile_waiting() {
                                 queue = READY.wait_timeout(queue, PARKED_POLL).unwrap().0;
                                 continue;
                             }
@@ -654,7 +756,7 @@ fn start_workers() {
                 if upgrade {
                     build_full(&p);
                 } else {
-                    build_tiered(&p);
+                    build_tiered(&p, asked.is_none() && super::real::live_lanes());
                 }
                 BUILDING.with(|b| *b.borrow_mut() = None);
                 if let Some(at) = asked {
@@ -719,6 +821,73 @@ thread_local! {
     pub(super) static COMPUTE_SKIP_LIMIT: Cell<Option<std::time::Duration>> = const { Cell::new(None) };
     /// (tests) this thread's `lazy_mesh` instead of `XCL_LAZY_MESH_PSO`
     pub(super) static LAZY_MESH: Cell<Option<bool>> = const { Cell::new(None) };
+    /// (tests) this thread's `skip_until_built` (off unless a test sets it)
+    pub(super) static SKIP_UNTIL_BUILT: Cell<bool> = const { Cell::new(false) };
+}
+
+thread_local! {
+    /// this thread's binds wait for their pipelines (`waiting_if`)
+    static WAIT_FOR_BUILD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// `f` with this thread's binds waiting for pipelines still being built when `on` (a bundle:
+/// recorded once, a draw skipped in it would never come back).
+pub(super) fn waiting_if<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let was = WAIT_FOR_BUILD.with(|w| w.replace(on));
+    let r = f();
+    WAIT_FOR_BUILD.with(|w| w.set(was));
+    r
+}
+
+/// `enabled`, read once.
+pub(super) fn async_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(enabled)
+}
+
+/// `XCL_ASYNC_PSO` (default 1, `enabled`): a draw or dispatch whose pipeline is still being
+/// built does not wait for it. Its build goes ahead of the others, ordered by the binds that
+/// asked for it, and the draw is skipped (`bind::skip_failed_draws`; a dispatch only with
+/// `bind::skip_failed_dispatches`, else it waits as before) until the pipeline is built.
+fn skip_until_built() -> bool {
+    if WAIT_FOR_BUILD.with(Cell::get) {
+        return false;
+    }
+    #[cfg(test)]
+    return SKIP_UNTIL_BUILT.with(Cell::get);
+    #[cfg(not(test))]
+    async_on()
+}
+
+/// Every 2 s while pipelines are pending or binds skip: pending (wanted, not built), built,
+/// failed, the draws and dispatches skipped in those 2 s and the oldest pending pipeline's age.
+fn start_status() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new().name("xcl-pso-status".into()).spawn(|| {
+            let mut skipped = pending_skips();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                let now = pending_skips();
+                let (built, failed) = (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed));
+                let (mut pending, mut oldest) = (0usize, None);
+                if let Some(m) = PENDING.lock().unwrap().as_ref() {
+                    for p in m.values().filter(|p| p.sent.load(Ordering::Acquire) && p.real.load(Ordering::Acquire) == 0 && !*p.done.lock().unwrap()) {
+                        pending += 1;
+                        oldest = oldest.max(Some(p.created.elapsed()));
+                    }
+                }
+                if pending != 0 || now != skipped {
+                    crate::xlog_info!(
+                        "D3D12.X: async pipelines: {pending} pending (oldest {:.1} s), {built} built, {failed} failed; {} draws/dispatches skipped in the last 2 s ({now} so far)",
+                        oldest.map_or(0.0, |d| d.as_secs_f32()),
+                        now - skipped
+                    );
+                }
+                skipped = now;
+            }
+        });
+    });
 }
 
 thread_local! {
@@ -792,6 +961,12 @@ pub fn waited_on() -> bool {
     BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.urgent.load(Ordering::Acquire)))
 }
 
+/// The pipeline this worker builds now was bound and its draws skipped (`skip_until_built`): a
+/// live build, ahead of the background ones (`real::live_priority`).
+pub(super) fn live_build() -> bool {
+    BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.last_bound.load(Ordering::Acquire) != 0))
+}
+
 pub(super) fn blocking_waiter() -> bool {
     BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.active_waiters.load(Ordering::Acquire) != 0))
 }
@@ -827,12 +1002,7 @@ pub fn release(p: usize) {
 
 /// `standin` went to the title; `job` builds the real pipeline on a worker.
 pub fn submit(standin: usize, compute: bool, job: Job) {
-    submit_as(standin, compute, job, true, 0, String::new(), 0, 0);
-}
-
-/// `submit` with what the pipeline is made of (`what`: its shaders, for the log).
-pub fn submit_described(standin: usize, compute: bool, job: Job, what: String) {
-    submit_as(standin, compute, job, true, 0, what, 0, 0);
+    submit_as(standin, compute, job, true, (0, 0), String::new(), 0, 0);
 }
 
 /// Lazy pipeline creation (`XCL_LAZY_PSO=0`: off): a title's pipelines with console shaders get
@@ -872,18 +1042,26 @@ pub(super) fn is_standin(pso: usize) -> bool {
 /// ahead of all of them. (`XCL_PSO_PRELOAD=0`: built at its first `resolve`, its shaders prepared
 /// before.)
 pub fn submit_lazy(standin: usize, compute: bool, job: Job, key: u64) {
-    submit_as(standin, compute, job, false, key, String::new(), 0, 0);
+    submit_as(standin, compute, job, false, (key, 0), String::new(), 0, 0);
 }
 
 /// `submit_lazy` with what the pipeline is made of (`what`: its shaders, for the log;
 /// `shader_bytes`: its console shaders' size).
+#[cfg(test)]
 pub fn submit_lazy_described(standin: usize, compute: bool, job: Job, key: u64, what: String, shader_bytes: usize, group: u64) {
-    submit_as(standin, compute, job, false, key, what, shader_bytes, group);
+    submit_as(standin, compute, job, false, (key, 0), what, shader_bytes, group);
+}
+
+pub(super) fn submit_recorded(standin: usize, compute: bool, job: Job, (key, record): (u64, u64), what: String, shader_bytes: usize, group: u64) {
+    let send = !lazy();
+    submit_as(standin, compute, job, send, (if send { 0 } else { key }, record), what, shader_bytes, group);
 }
 
 #[allow(clippy::too_many_arguments)]
-fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, what: String, shader_bytes: usize, group: u64) {
+fn submit_as(standin: usize, compute: bool, job: Job, send: bool, (key, record): (u64, u64), what: String, shader_bytes: usize, group: u64) {
     let p = Arc::new(Pending {
+        created: std::time::Instant::now(),
+        last_bound: AtomicU64::new(0),
         job: Mutex::new(Some(Arc::from(job))),
         sent: std::sync::atomic::AtomicBool::new(send),
         preload: Default::default(),
@@ -892,7 +1070,9 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, what
         cv: Condvar::new(),
         compute,
         image_only: Default::default(),
+        depth_only: Default::default(),
         key,
+        record,
         used: Default::default(),
         orphan: Default::default(),
         full_started: Default::default(),
@@ -924,7 +1104,8 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, what
         if let Some(q) = preload() {
             crate::progress::PIPELINES.queue();
             let mut list = q.list.lock().unwrap();
-            let seq = list.push(shader_bytes, used::known(key), compute, group, Arc::downgrade(&p));
+            let known = used::known(key) || super::pso_manifest::bound_earlier(record);
+            let seq = list.push(shader_bytes, known, compute, group, super::pso_manifest::slow_ms(record), Arc::downgrade(&p));
             p.preload_seq.store(seq, Ordering::Relaxed);
             drop(list);
             q.cv.notify_one();
@@ -1074,6 +1255,13 @@ struct Preload {
     cv: Condvar,
 }
 
+/// Every pipeline made goes in the preload order of before (`XCL_PSO_BUILD_ALL=1`), instead of
+/// what an earlier run drew with first (`pso_sched::Backlog::drawn_first`). Tests keep the order
+/// of before: `pso_sched`'s tests cover the other.
+fn build_all() -> bool {
+    cfg!(test) || std::env::var("XCL_PSO_BUILD_ALL").is_ok_and(|v| v.trim() == "1")
+}
+
 /// How many preload workers there are (`XCL_PSO_PRELOAD_THREADS`; `pso_sched::background_workers`
 /// of the cores); how many of them build at once is `pace`'s. Under Wine they cannot run below
 /// normal priority and stay few.
@@ -1132,7 +1320,7 @@ fn build_ahead(p: &Pending) -> Option<usize> {
     }
     let job = job_of(p)?;
     PUT_OFF.with(|d| d.set(PutOff::Allowed));
-    let mut real = run(&*job);
+    let mut real = run(p, &*job);
     if let (0, PutOff::Left(dxil_len)) = (real, PUT_OFF.with(|d| d.replace(PutOff::No))) {
         {
             let mut owner = p.preload.lock().unwrap_or_else(|e| e.into_inner());
@@ -1143,7 +1331,7 @@ fn build_ahead(p: &Pending) -> Option<usize> {
                 return Some(dxil_len);
             }
         }
-        real = run(&*job);
+        real = run(p, &*job);
     }
     complete(p, real, false);
     None
@@ -1312,14 +1500,14 @@ fn pace(pool: usize, workers: mpsc::Receiver<Arc<BoostToken>>) {
 /// For the 30 s line: what the preload workers have built, what waits for them, what waits for
 /// memory, and their pace now.
 pub fn ahead_summary() -> String {
-    let (waiting, parked, peers) = Q.get().and_then(|q| q.as_ref()).map_or((0, 0, 0), |q| {
+    let (waiting, parked, peers, (drawn, later)) = Q.get().and_then(|q| q.as_ref()).map_or((0, 0, 0, (0, 0)), |q| {
         let list = q.list.lock().unwrap();
         let (waiting, parked) = list.waiting();
-        (waiting, parked, list.parked_peers(&recent_groups()))
+        (waiting, parked, list.parked_peers(&recent_groups()), list.drawn_split())
     });
     let pool = if Q.get().is_some_and(|q| q.is_some()) { preload_threads() } else { 0 };
     format!(
-        "built ahead {} on {} workers ({} preload jobs waiting, {parked} of them for memory; put off {} times; now {} of up to {} preload jobs active{}, beside {:.1} threads of other work, {}{}; {peers} parked in recent root groups, {} driver compiles started on the bind floor)",
+        "built ahead {} on {} workers ({} preload jobs waiting, {parked} of them for memory, {drawn} an earlier run drew with, {later} no run drew with (a quarter of the workers); put off {} times; now {} of up to {} preload jobs active{}, beside {:.1} threads of other work, {}{}; {peers} parked in recent root groups, {} driver compiles started on the bind floor)",
         AHEAD.load(Ordering::Relaxed),
         pool,
         waiting,
@@ -1343,7 +1531,8 @@ fn preload() -> Option<&'static Preload> {
             if std::env::var("XCL_PSO_PRELOAD").is_ok_and(|v| v.trim() == "0") {
                 return None;
             }
-            Some(Preload { list: Mutex::new(Default::default()), cv: Condvar::new() })
+            let list = if build_all() { Default::default() } else { super::pso_sched::Backlog::drawn_first() };
+            Some(Preload { list: Mutex::new(list), cv: Condvar::new() })
         })
         .as_ref()?;
     STARTED.call_once(|| {
@@ -1387,7 +1576,8 @@ fn preload() -> Option<&'static Preload> {
                         if BUILDING_AHEAD.load(Ordering::Acquire) >= PACE_WORKERS.load(Ordering::Acquire) {
                             continue;
                         }
-                        if super::real::background_memory_paused() {
+                        // (a job is yielded at its end: none is taken while a live compile waits for a slot)
+                        if super::real::background_memory_paused() || super::real::live_compile_waiting() {
                             drop(q.cv.wait_timeout(g, PARKED_POLL).unwrap());
                             continue;
                         }
@@ -2120,6 +2310,20 @@ pub(super) fn allow_image_skip(pso: usize) {
     }
 }
 
+/// A graphics pipeline without colour targets (shadow maps, depth prepasses): what its draws
+/// leave unwritten is read by every later draw of the frame, so its binds may wait this many
+/// frame wait budgets (`frame_budget`) before they are skipped at once.
+const DEPTH_ONLY_BUDGETS: u32 = 4;
+
+pub(super) fn allow_depth_wait(pso: usize) {
+    if let Some(p) = entry(pso).filter(|p| !p.compute) {
+        p.depth_only.store(true, Ordering::Release);
+        if let Some(Some(q)) = Q.get() {
+            q.list.lock().unwrap().depth_only(p.preload_seq.load(Ordering::Relaxed));
+        }
+    }
+}
+
 pub(super) enum PendingComputeSkip {
     Deadline { shader: u64, waited_ms: usize },
     ImageOnly,
@@ -2162,8 +2366,30 @@ fn resolve_with_deadline(pso: usize, site_waits: &AtomicUsize, compute_limit: Op
             waits.fetch_add(1, Ordering::Relaxed);
             return Err(PendingComputeSkip::ImageOnly);
         }
+        if skip_until_built() && if p.compute { super::bind::skip_failed_dispatches() } else { super::bind::skip_failed_draws() } {
+            start_status();
+            p.sent.store(true, Ordering::Release);
+            let frame = super::present::presents().wrapping_add(1);
+            if p.last_bound.swap(frame, Ordering::AcqRel) != frame {
+                let seq = p.preload_seq.load(Ordering::Relaxed);
+                if seq != 0 && !p.rebuild.load(Ordering::Acquire) {
+                    if let Some(Some(q)) = Q.get() {
+                        q.list.lock().unwrap().promote(seq);
+                        q.cv.notify_one();
+                    }
+                }
+                if !p.promote_preload() {
+                    enqueue_bound(p.clone());
+                }
+            }
+            if p.key != 0 && !p.skipped.swap(true, Ordering::AcqRel) {
+                used::note_skipped(p.key);
+            }
+            return Ok(pso);
+        }
         // (the title's thread is held from here until the pipeline is built or the bind gives up)
         let _held = Held::new(&p);
+        let _live = crate::live_stall::begin(crate::live_stall::Stage::PipelineWait, p.record, p.key, None, None);
         if !p.urgent.swap(true, Ordering::AcqRel) {
             if p.compute && !*p.done.lock().unwrap() && !p.counted.swap(true, Ordering::AcqRel) {
                 COMPUTE_BOUND_PENDING.fetch_add(1, Ordering::AcqRel);
@@ -2174,7 +2400,8 @@ fn resolve_with_deadline(pso: usize, site_waits: &AtomicUsize, compute_limit: Op
         }
         let t0 = std::time::Instant::now();
         let frame_waited = frame_waited();
-        let over_budget = !p.compute && frame_budget().is_some_and(|b| frame_waited >= b);
+        let budgets = if p.depth_only.load(Ordering::Acquire) { DEPTH_ONLY_BUDGETS } else { 1 };
+        let over_budget = !p.compute && frame_budget().is_some_and(|b| frame_waited >= b * budgets);
         let limit = if p.compute {
             compute_limit.or_else(backstop)
         } else if p.skipped.load(Ordering::Acquire) || over_budget {
@@ -2194,6 +2421,7 @@ fn resolve_with_deadline(pso: usize, site_waits: &AtomicUsize, compute_limit: Op
                 drop(done);
                 add_frame_wait(t0.elapsed());
                 let ms = t0.elapsed().as_millis() as usize;
+                super::pso_manifest::note_blocked(p.record, ms);
                 site_waits.fetch_add(1, Ordering::Relaxed);
                 WAIT_MS.fetch_add(ms, Ordering::Relaxed);
                 SKIPS.fetch_add(1, Ordering::Relaxed);
@@ -2228,6 +2456,7 @@ fn resolve_with_deadline(pso: usize, site_waits: &AtomicUsize, compute_limit: Op
                 let waited = t0.elapsed();
                 add_frame_wait(waited);
                 let waited_ms = waited.as_millis() as usize;
+                super::pso_manifest::note_blocked(p.record, waited_ms);
                 site_waits.fetch_add(1, Ordering::Relaxed);
                 WAIT_MS.fetch_add(waited_ms, Ordering::Relaxed);
                 WORST_WAIT.fetch_max(waited_ms, Ordering::Relaxed);
@@ -2255,11 +2484,15 @@ fn resolve_with_deadline(pso: usize, site_waits: &AtomicUsize, compute_limit: Op
         }
         let ms = waited.as_millis() as usize;
         WAIT_MS.fetch_add(ms, Ordering::Relaxed);
+        if p.real.load(Ordering::Acquire) != 0 {
+            super::pso_manifest::note_blocked(p.record, ms);
+        }
         if ms >= 250 {
             crate::xlog_info!(
-                "D3D12.X: a bind waited {ms} ms for {kind} pipeline {pso:#x}{}; {}",
+                "D3D12.X: a bind waited {ms} ms for {kind} pipeline {pso:#x}{}; {}; manifest {:016x}",
                 if p.rebuild.load(Ordering::Acquire) { " (a rebuild of one released unbound)" } else { "" },
-                p.note.lock().unwrap().as_deref().unwrap_or("no build details")
+                p.note.lock().unwrap().as_deref().unwrap_or("no build details"),
+                p.record
             );
         }
         if WORST_WAIT.fetch_max(ms, Ordering::Relaxed) < ms && ms >= 250 {
@@ -2358,9 +2591,31 @@ pub fn compute_bound_pending() -> bool {
     COMPUTE_BOUND_PENDING.load(Ordering::Acquire) > 0
 }
 
+/// (its pipeline key, its shaders) of stand-in `pso` (0 and nothing: not built in the background).
+pub fn key_of(pso: usize) -> (u64, String) {
+    entry(pso).map_or((0, String::new()), |p| (p.key, p.what.clone()))
+}
+
+/// draws and dispatches skipped as their pipeline was still being built
+static PENDING_SKIPS: AtomicUsize = AtomicUsize::new(0);
+
+pub(super) fn note_pending_skip() {
+    PENDING_SKIPS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// draws and dispatches skipped so far as their pipeline was still being built
+pub fn pending_skips() -> usize {
+    PENDING_SKIPS.load(Ordering::Relaxed)
+}
+
 /// The shaders a console pipeline is made of, when known.
 pub fn what(pso: usize) -> Option<String> {
     entry(pso).map(|p| p.what.clone()).filter(|w| !w.is_empty())
+}
+
+/// `pso` is a stand-in whose real pipeline is still being built, or was built just now.
+pub(super) fn pending_or_built(pso: usize) -> bool {
+    entry(pso).is_some_and(|p| p.real.load(Ordering::Acquire) != 0 || !*p.done.lock().unwrap())
 }
 
 /// `pso` is a stand-in whose real pipeline is still being built.
@@ -2439,9 +2694,114 @@ mod tests {
         }
     }
 
+    /// With `XCL_ASYNC_PSO` neither a draw nor a dispatch waits for a pipeline still being built:
+    /// it gets the stand-in at once (its draw is then skipped), its build is sent ahead, and once
+    /// built the real pipeline is used.
+    #[test]
+    fn with_async_pipelines_a_bind_never_waits_and_its_build_goes_first() {
+        let (draw, compute) = (0x7E57_7231usize, 0x7E57_7232usize);
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let held = |g: Arc<(Mutex<bool>, Condvar)>, real: usize| -> Job {
+            Box::new(move || {
+                if preparing() {
+                    return 0;
+                }
+                let mut open = g.0.lock().unwrap();
+                while !*open {
+                    open = g.1.wait(open).unwrap();
+                }
+                real
+            })
+        };
+        submit_lazy(draw, false, held(gate.clone(), 0x1261), 0);
+        submit_lazy(compute, true, held(gate.clone(), 0x1262), 0);
+        SKIP_UNTIL_BUILT.with(|s| s.set(true));
+        let t0 = Instant::now();
+        assert_eq!(resolve_wait(draw), draw);
+        assert_eq!(resolve_for_bind(draw), draw);
+        assert_eq!(resolve_wait(compute), compute, "a dispatch does not wait either");
+        assert!(t0.elapsed() < Duration::from_millis(150), "no bind waited: {:?}", t0.elapsed());
+        assert_ne!(entry(draw).unwrap().last_bound.load(Ordering::Acquire), 0, "its build was sent to the bind queue");
+        assert!(!entry(draw).unwrap().urgent.load(Ordering::Acquire), "a skipped bind waits for nothing: its build is a background one");
+        BACKSTOP.with(|b| b.set(Some(Some(Duration::from_millis(300)))));
+        let t0 = Instant::now();
+        assert_eq!(waiting_if(true, || resolve_wait(draw)), draw, "a bundle's bind waits (to the backstop here)");
+        assert!(t0.elapsed() >= Duration::from_millis(250), "it waited: {:?}", t0.elapsed());
+        BACKSTOP.with(|b| b.set(None));
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        let t0 = Instant::now();
+        while resolve(draw) == draw && t0.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(resolve_wait(draw), 0x1261, "once built it is used");
+        SKIP_UNTIL_BUILT.with(|s| s.set(false));
+        for p in [draw, compute] {
+            released(p);
+        }
+    }
+
+    /// A draw without colour targets still waits for its pipeline once the frame budget is
+    /// used up (a skipped shadow map is read by the rest of the frame), up to
+    /// `DEPTH_ONLY_BUDGETS` of it; a draw with colour targets is skipped at once as before.
+    #[test]
+    fn depth_only_draws_wait_past_the_frame_wait_budget() {
+        let (colour, depth, late) = (0x7E57_7221usize, 0x7E57_7222usize, 0x7E57_7223usize);
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let held = |g: Arc<(Mutex<bool>, Condvar)>, real: usize| -> Job {
+            Box::new(move || {
+                if preparing() {
+                    return 0;
+                }
+                let mut open = g.0.lock().unwrap();
+                while !*open {
+                    open = g.1.wait(open).unwrap();
+                }
+                real
+            })
+        };
+        submit_lazy(colour, false, held(gate.clone(), 0x1261), 0);
+        submit_lazy(depth, false, held(gate.clone(), 0x1262), 0);
+        submit_lazy(late, false, held(gate.clone(), 0x1263), 0);
+        allow_depth_wait(depth);
+        allow_depth_wait(late);
+        BACKSTOP.with(|b| b.set(Some(Some(Duration::from_millis(2000)))));
+        FRAME_BUDGET.with(|b| b.set(Some(Some(Duration::from_millis(200)))));
+        FRAME_WAIT.with(|w| w.set((super::super::present::presents(), Duration::from_millis(250))));
+
+        let (skips, t0) = (budget_skips(), Instant::now());
+        assert_eq!(resolve_wait(colour), colour);
+        assert!(t0.elapsed() < Duration::from_millis(150), "skipped at once: {:?}", t0.elapsed());
+        assert!(budget_skips() > skips);
+
+        FRAME_WAIT.with(|w| w.set((super::super::present::presents(), Duration::from_millis(200 * DEPTH_ONLY_BUDGETS as u64))));
+        let t0 = Instant::now();
+        assert_eq!(resolve_wait(late), late, "past its own budget a depth-only draw is skipped too");
+        assert!(t0.elapsed() < Duration::from_millis(150), "skipped at once: {:?}", t0.elapsed());
+
+        FRAME_WAIT.with(|w| w.set((super::super::present::presents(), Duration::from_millis(250))));
+        let opener = {
+            let g = gate.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                *g.0.lock().unwrap() = true;
+                g.1.notify_all();
+            })
+        };
+        let t0 = Instant::now();
+        assert_eq!(resolve_wait(depth), 0x1262, "a depth-only draw waits for its pipeline past the frame budget");
+        assert!(t0.elapsed() >= Duration::from_millis(200));
+        opener.join().unwrap();
+        for p in [colour, depth, late] {
+            released(p);
+        }
+    }
+
     #[test]
     fn build_queue_prefers_graphics_and_keeps_order_within_each_class() {
         let pending = |compute| Arc::new(Pending {
+            created: Instant::now(),
+            last_bound: AtomicU64::new(0),
             job: Mutex::new(None),
             sent: Default::default(),
             preload: Default::default(),
@@ -2450,7 +2810,9 @@ mod tests {
             cv: Default::default(),
             compute,
             image_only: Default::default(),
+            depth_only: Default::default(),
             key: 0,
+            record: 0,
             used: Default::default(),
             orphan: Default::default(),
             full_started: Default::default(),

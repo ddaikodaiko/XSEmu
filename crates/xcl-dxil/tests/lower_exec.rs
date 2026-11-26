@@ -3873,6 +3873,23 @@ void main() {
 }
 "#,
     ),
+    (
+        "vector-template",
+        r#"
+RWByteAddressBuffer io : register(u0);
+RWByteAddressBuffer res : register(u1);
+[numthreads(1, 1, 1)]
+void main() {
+    uint off = io.Load(0u);
+    uint lim = io.Load(4u);
+    bool4 in0 = off + vector<uint, 4>(0u, 4u, 8u, 12u) < lim;
+    res.Store4(0u, select(in0, uint4(1u, 2u, 3u, 4u), 0u));
+    vector<float, 2> f = (vector<float, 2>)io.Load2(8u);
+    res.Store2(16u, asuint(f * vector<float, 2>(0.5f, 2.0f)));
+    res.Store4(24u, (vector<int, 4>(io.Load4(16u)) >> 1).wzyx);
+}
+"#,
+    ),
 ];
 
 /// With neither XCL_EXEC_DIR nor XCL_EXEC_SRC: the snippets through both compilers. A

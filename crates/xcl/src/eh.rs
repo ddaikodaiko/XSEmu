@@ -18,6 +18,8 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
 use crate::hooks;
 use crate::modules;
 
+mod crash;
+
 pub fn register_function_table(base: usize, rva: u32, size: u32) -> bool {
     let count = size / std::mem::size_of::<IMAGE_RUNTIME_FUNCTION_ENTRY>() as u32;
     let ok = unsafe {
@@ -63,33 +65,19 @@ pub fn set_title_filter(f: usize) -> usize {
 }
 
 unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i32 {
+    if let Some(result) = crash::unhandled(info, forward_title_filter) {
+        return result;
+    }
     crate::hle::d3d12x::real::log_device_removed();
     if !info.is_null() && !(*info).ExceptionRecord.is_null() {
         let rec = &*(*info).ExceptionRecord;
         let addr = rec.ExceptionAddress as usize;
-        let mut extra = String::new();
         let ctx = (*info).ContextRecord;
-        if rec.ExceptionCode as u32 == 0xC000_0005 && rec.NumberParameters >= 2 {
-            let op = match rec.ExceptionInformation[0] {
-                0 => "read",
-                1 => "write",
-                8 => "execute",
-                _ => "?",
-            };
-            // what was executed (which register the address was made from), and for an address
-            // given as all ones – one no pointer can hold; Windows does not report the real one –
-            // the registers that hold such a value
-            let wild = if rec.ExceptionInformation[1] == usize::MAX && !ctx.is_null() { not_addresses(&*ctx) } else { String::new() };
-            extra = format!(
-                " ({op} at address {:#x}; {}; code bytes: {}{wild})",
-                rec.ExceptionInformation[1],
-                crate::hle::kernelx::lazy::describe(rec.ExceptionInformation[1] as usize),
-                code_at(addr)
-            );
-        }
-        if rec.ExceptionCode as u32 == ILLEGAL_INSTRUCTION {
-            extra = format!(" (code bytes: {})", code_at(addr));
-        }
+        let extra = if rec.ExceptionCode as u32 == ILLEGAL_INSTRUCTION {
+            format!(" (code bytes: {})", code_at(addr))
+        } else {
+            String::new()
+        };
         let regs = if ctx.is_null() {
             String::new()
         } else {
@@ -120,12 +108,6 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
         );
         crate::xlog_error!("{msg}");
         crate::control::exit_now(rec.ExceptionCode as u32, "crash", &format!("exception {:#010x} in {}", rec.ExceptionCode as u32, modules::describe_address(addr)));
-        if rec.ExceptionCode as u32 == 0xC000_0005 && rec.NumberParameters >= 2 {
-            let b = behind(rec.ExceptionInformation[1]);
-            if !b.is_empty() {
-                crate::xlog_error!("the address of the access violation, {:#x}:{b}", rec.ExceptionInformation[1]);
-            }
-        }
         if !ctx.is_null() {
             log_register_memory(&*ctx);
         }
@@ -135,6 +117,10 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
         crate::log::flush();
         full_dump(info);
     }
+    forward_title_filter(info)
+}
+
+unsafe fn forward_title_filter(info: *const EXCEPTION_POINTERS) -> i32 {
     match TITLE_FILTER.load(Ordering::Acquire) {
         0 => 0, // EXCEPTION_CONTINUE_SEARCH
         f => std::mem::transmute::<usize, unsafe extern "system" fn(*const EXCEPTION_POINTERS) -> i32>(f)(info),
@@ -149,6 +135,10 @@ static ENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::ne
 /// status is not 0, every other thread – and the log written out. abort() leaves no other
 /// trace: the buffered log lines went with the process.
 unsafe extern "system" fn hk_nt_terminate_process(h: isize, status: i32) -> i32 {
+    let orig: unsafe extern "system" fn(isize, i32) -> i32 = std::mem::transmute(ORIG_NT_TERMINATE.load(Ordering::Acquire));
+    if crash::started() && (h == 0 || h == -1) {
+        return orig(h, status);
+    }
     if h == 0 || h == -1 {
         crate::control::note_exit_status(status as u32);
         // (a full dump being written at a crash is finished first)
@@ -166,15 +156,16 @@ unsafe extern "system" fn hk_nt_terminate_process(h: isize, status: i32) -> i32 
             // (an end that is no unhandled exception – a removed device – leaves the same record)
             crash_dump();
         } else {
+            crate::hle::d3d12x::real::save_pipeline_libraries();
             crate::xlog_info!("process ends (thread {tid}); on the stack: {stack}");
         }
         crate::log::flush();
     }
-    let orig: unsafe extern "system" fn(isize, i32) -> i32 = std::mem::transmute(ORIG_NT_TERMINATE.load(Ordering::Acquire));
     orig(h, status)
 }
 
 pub fn install_crash_handler() {
+    crash::init();
     unsafe {
         if let Err(e) = hooks::hook("ntdll.dll", "NtTerminateProcess", hk_nt_terminate_process as usize, &ORIG_NT_TERMINATE) {
             crate::xlog_warn!("{e}");
@@ -339,10 +330,9 @@ mod not_addresses_tests {
     }
 }
 
-/// The first 16 code bytes at `rip`, as hex (as far as they are readable).
 unsafe fn code_at(rip: usize) -> String {
-    let n = (1..=16).rev().find(|&n| crate::gpu::shader::readable(rip, n)).unwrap_or(0);
-    crate::insn::hex(std::slice::from_raw_parts(rip as *const u8, n))
+    crash::instruction_bytes(rip)
+        .map_or_else(|| "unavailable".into(), |bytes| crate::insn::hex(&bytes))
 }
 
 /// Update the x86-64 arithmetic flags (CF, PF, AF, ZF, SF, OF) for `cmp lhs, rhs`, keeping all
@@ -1253,7 +1243,7 @@ unsafe fn full_dump(info: *const EXCEPTION_POINTERS) {
     let path = std::path::Path::new(&dir).join(format!("xcl-{}-{}.dmp", if full { "full" } else { "small" }, windows_sys::Win32::System::Threading::GetCurrentProcessId()));
     let t = std::time::Instant::now();
     let r = match crate::vfs_hooks::with_host_io(|| std::fs::File::create(&path)) {
-        Ok(f) => dump_by_helper(f.as_raw_handle() as HANDLE, ty, windows_sys::Win32::System::Threading::GetCurrentThreadId(), info as usize, 1_800_000),
+        Ok(f) => dump_by_helper(f.as_raw_handle() as HANDLE, ty, windows_sys::Win32::System::Threading::GetCurrentThreadId(), info as usize, 1_800_000, None),
         Err(e) => Err(format!("cannot create the file ({e})")),
     };
     crate::xlog_error!(
@@ -1465,7 +1455,10 @@ unsafe extern "system" fn minidump_write_dump(process: HANDLE, pid: u32, file: H
         return real_minidump_write_dump().map_or(0, |f| f(process, pid, file, ty, exc, user, callback));
     }
     let (tid, pointers) = exc.as_ref().map_or((0, 0), |e| (e.ThreadId, e.ExceptionPointers as usize));
-    let r = dump_by_helper(file, ty, tid, pointers, 120_000);
+    if let Some(result) = crash::title_dump(file, ty, tid, pointers) {
+        return result;
+    }
+    let r = dump_by_helper(file, ty, tid, pointers, 120_000, None);
     crate::xlog_info!(
         "the title's minidump (type {ty:#x}, thread {tid}) written by a helper process: {}{}",
         r.as_ref().err().cloned().unwrap_or_else(|| "done".into()),
@@ -1478,27 +1471,43 @@ unsafe extern "system" fn minidump_write_dump(process: HANDLE, pid: u32, file: H
 /// A dump of this process of type `ty` written into `file` by a helper xcl process
 /// (`xcl minidump`), waited for up to `wait_ms`; `pointers`: the crashing thread's exception
 /// pointers, or 0. The error says what did not work.
-unsafe fn dump_by_helper(file: HANDLE, ty: u32, tid: u32, pointers: usize, wait_ms: u32) -> Result<(), String> {
+unsafe fn dump_by_helper(file: HANDLE, ty: u32, tid: u32, pointers: usize, wait_ms: u32, summary: Option<HANDLE>) -> Result<(), String> {
     use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, WAIT_OBJECT_0};
-    use windows_sys::Win32::System::Threading::{CreateProcessW, GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess, WaitForSingleObject, CREATE_NO_WINDOW, PROCESS_INFORMATION, STARTUPINFOW};
+    use windows_sys::Win32::System::Threading::{CreateProcessW, GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess, TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, PROCESS_INFORMATION, STARTUPINFOW};
     let pid = GetCurrentProcessId();
     let me = GetCurrentProcess();
     let mut inherited: HANDLE = std::ptr::null_mut();
-    if DuplicateHandle(me, file, me, &mut inherited, 0, 1, DUPLICATE_SAME_ACCESS) == 0 {
+    if !file.is_null() && DuplicateHandle(me, file, me, &mut inherited, 0, 1, DUPLICATE_SAME_ACCESS) == 0 {
         return Err("cannot pass its file to a helper process".into());
     }
-    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
-    let mut cmd = crate::util::wide(&format!("\"{exe}\" minidump {pid} {} {ty} {tid} {pointers}", inherited as usize));
+    let mut inherited_summary: HANDLE = std::ptr::null_mut();
+    if let Some(summary) = summary {
+        DuplicateHandle(me, summary, me, &mut inherited_summary, 0, 1, DUPLICATE_SAME_ACCESS);
+    }
+    if inherited.is_null() && inherited_summary.is_null() {
+        return Err("no local report handle".into());
+    }
+    let Some(exe) = crash::exe() else {
+        if !inherited.is_null() { CloseHandle(inherited); }
+        if !inherited_summary.is_null() { CloseHandle(inherited_summary); }
+        return Err("no executable path cached for the helper".into());
+    };
+    let exe = exe.display();
+    let mut cmd = crate::util::wide(&format!("\"{exe}\" minidump {pid} {} {ty} {tid} {pointers} {}", inherited as usize, inherited_summary as usize));
     let si = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, ..std::mem::zeroed() };
     let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
     let started = CreateProcessW(std::ptr::null(), cmd.as_mut_ptr(), std::ptr::null(), std::ptr::null(), 1, CREATE_NO_WINDOW, std::ptr::null(), std::ptr::null(), &si, &mut pi) != 0;
     let error = std::io::Error::last_os_error();
-    CloseHandle(inherited);
+    if !inherited.is_null() { CloseHandle(inherited); }
+    if !inherited_summary.is_null() { CloseHandle(inherited_summary); }
     if !started {
         return Err(format!("cannot start the helper process ({error})"));
     }
     CloseHandle(pi.hThread);
     let waited = WaitForSingleObject(pi.hProcess, wait_ms);
+    if waited != WAIT_OBJECT_0 && wait_ms <= crash::DUMP_MS {
+        TerminateProcess(pi.hProcess, 1);
+    }
     let mut code = 1u32;
     GetExitCodeProcess(pi.hProcess, &mut code);
     CloseHandle(pi.hProcess);
@@ -1515,19 +1524,28 @@ unsafe fn dump_by_helper(file: HANDLE, ty: u32, tid: u32, pointers: usize, wait_
 pub fn write_minidump_of(args: &[String]) -> i32 {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_ALL_ACCESS};
-    let n: Vec<usize> = args.iter().filter_map(|a| a.parse().ok()).collect();
-    let &[pid, file, ty, tid, pointers] = n.as_slice() else { return 2 };
-    let Some(write) = real_minidump_write_dump() else { return 3 };
+    let Ok(n) = args.iter().map(|a| a.parse::<usize>()).collect::<Result<Vec<_>, _>>() else { return 2 };
+    let ([pid, file, ty, tid, pointers], summary) = match n.as_slice() {
+        &[pid, file, ty, tid, pointers] => ([pid, file, ty, tid, pointers], 0),
+        &[pid, file, ty, tid, pointers, summary] => ([pid, file, ty, tid, pointers], summary),
+        _ => return 2,
+    };
     unsafe {
         let process = OpenProcess(PROCESS_ALL_ACCESS, 0, pid as u32);
         if process.is_null() {
             return 4;
         }
         let exc = MINIDUMP_EXCEPTION_INFORMATION { ThreadId: tid as u32, ExceptionPointers: pointers as *mut EXCEPTION_POINTERS, ClientPointers: 1 };
-        let ok = write(process, pid as u32, file as HANDLE, ty as u32, if pointers == 0 { std::ptr::null() } else { &exc }, std::ptr::null(), std::ptr::null());
+        let dump = || {
+            file == 0
+                || real_minidump_write_dump().is_some_and(|write| {
+                    write(process, pid as u32, file as HANDLE, ty as u32, if pointers == 0 { std::ptr::null() } else { &exc }, std::ptr::null(), std::ptr::null()) != 0
+                })
+        };
+        let ok = if summary != 0 { crash::enrich(process, tid as u32, pointers, summary as HANDLE, dump) } else { dump() };
         CloseHandle(process);
-        CloseHandle(file as HANDLE);
-        if ok != 0 { 0 } else { 1 }
+        if file != 0 { CloseHandle(file as HANDLE); }
+        if ok { 0 } else { 1 }
     }
 }
 

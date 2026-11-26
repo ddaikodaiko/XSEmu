@@ -223,6 +223,60 @@ fn icon_res(ico: &[u8]) -> Vec<u8> {
     res
 }
 
+/// The exact hooks below only affect the uncached material-gate variant. Changes to other
+/// translator code, including edits to the hook lines themselves, still rekey the cache.
+fn translator_source(relative: &str, src: &[u8]) -> Vec<u8> {
+    let hooks: &[&[u8]] = match relative {
+        "src/gpu/recomp/pso.rs" => &[b"pub mod material_gate;"],
+        "src/gpu/recomp/emit.rs" => &[
+            b"    material_gate: Option<std::rc::Rc<super::pso::material_gate::Trace>>,",
+            b"            material_gate: super::pso::material_gate::current(),",
+            b"        if let Some(line) = self.material_gate.as_ref().and_then(|gate| gate.before(d, self.packed_compute())) { self.line(&line); }",
+            b"                if let Some(line) = self.material_gate.as_ref().and_then(|gate| gate.store(self.cur_pc, dim, &tw0, &icoord, act)) { self.line(&line); }",
+            b"                if self.material_gate.is_some() { h.push_str(super::pso::material_gate::ENTRY); }",
+        ],
+        _ => return normalized(src),
+    };
+    let mut ordinary = Vec::with_capacity(src.len());
+    for line in src.split_inclusive(|&byte| byte == b'\n') {
+        let code = line.strip_suffix(b"\n").unwrap_or(line);
+        let code = code.strip_suffix(b"\r").unwrap_or(code);
+        if !hooks.contains(&code) {
+            ordinary.extend_from_slice(line);
+        }
+    }
+    normalized(&ordinary)
+}
+
+/// xcl-dxil's `BUILD_ID` as its build.rs computes it: FNV-1a 64 over every file under src, by
+/// name with '/' in byte order, each name and text (without carriage returns) followed by a 0.
+fn dxil_build_id(crate_root: &Path) -> String {
+    fn collect(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(dir).expect("read xcl-dxil sources").flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                collect(&p, out);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    let src = crate_root.join("src");
+    println!("cargo:rerun-if-changed={}", src.display());
+    let mut files = Vec::new();
+    collect(&src, &mut files);
+    let mut named: Vec<(String, std::path::PathBuf)> = files.into_iter().map(|p| (p.strip_prefix(crate_root).unwrap_or(&p).to_string_lossy().replace('\\', "/"), p)).collect();
+    named.sort();
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for (name, path) in &named {
+        add(&mut h, name.as_bytes());
+        add(&mut h, &[0]);
+        let text: Vec<u8> = std::fs::read(path).expect("read xcl-dxil source").into_iter().filter(|&b| b != b'\r').collect();
+        add(&mut h, &text);
+        add(&mut h, &[0]);
+    }
+    format!("{h:016x}")
+}
 fn main() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut sources: Vec<String> = TRANSLATOR_FILES.iter().map(|s| s.to_string()).collect();
@@ -244,9 +298,17 @@ fn main() {
         println!("cargo:rerun-if-changed={relative}");
         add(&mut h, relative.as_bytes());
         add(&mut h, &[0]);
-        add(&mut h, &normalized(&std::fs::read(root.join(relative)).expect("read shader translator source")));
+        add(&mut h, &translator_source(relative, &std::fs::read(root.join(relative)).expect("read shader translator source")));
         add(&mut h, &[0]);
     }
+    // the direct DXIL backend writes the containers the translated shaders become: its build id
+    // (xcl-dxil's build.rs, computed the same way here) is part of the fingerprint, so a backend
+    // change rekeys it like a translator change and the warm-up runs
+    let dxil = dxil_build_id(&root.join("../xcl-dxil"));
+    println!("cargo:rustc-env=XCL_DXIL_SOURCE_ID={dxil}");
+    add(&mut h, b"xcl-dxil\0");
+    add(&mut h, dxil.as_bytes());
+    add(&mut h, &[0]);
     println!("cargo:rustc-env=XCL_TRANSLATOR_SOURCE_ID={h:016x}");
 
     // the segment heap: the NT heap's one backend lock held a dozen threads compiling in the

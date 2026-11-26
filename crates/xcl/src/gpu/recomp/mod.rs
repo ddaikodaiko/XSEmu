@@ -64,8 +64,20 @@ pub mod runner;
 mod tests;
 #[cfg(test)]
 mod coherence_tests;
+#[cfg(test)]
+mod structure_tests;
+#[cfg(test)]
+mod branch_free_tests;
+#[cfg(test)]
+mod quad_read_tests;
+#[cfg(test)]
+mod page_split_tests;
+#[cfg(test)]
+mod page_group_tests;
 pub mod upper_lanes;
 mod loop_profile;
+mod structure;
+mod lane_guards;
 pub use loop_profile::{loop_profile_enabled, LOOP_PROFILE_SITES, LOOP_PROFILE_WORDS};
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -185,7 +197,7 @@ pub const IO_GS_VERTICES: usize = 111;
 pub const IO_UMA_BASE_HI: usize = 112;
 pub const IO_MEM_VIEWS: usize = 113;
 /// `XCL_DS_VALIDATE`: the window 0 offset of the word a translated shader sets when a lane's
-/// address leaves the window its scalar base selected (`emit::Em::check_carry`); 0: none.
+/// address leaves the window its scalar base selected (`emit::Em::effective_address`); 0: none.
 pub const IO_CARRY_AT: usize = 114;
 /// The offset, in memory window io[`IO_TRIP_WINDOW`], of four counters a translated shader adds
 /// to when a guard gives up
@@ -195,6 +207,41 @@ pub const IO_TRIP_AT: usize = 115;
 /// The memory window the counters at io[`IO_TRIP_AT`] are in: one the CPU reads (the coherent
 /// window, which is not window 0 in the runtime layout).
 pub const IO_TRIP_WINDOW: usize = 116;
+pub const IO_NGG_USER_DISPLACEMENT: usize = 117;
+/// Raw SRV of this recording's locator. Its first dword selects the execution's topology SRV.
+pub const IO_PHYSICAL_TABLE: usize = 118;
+
+/// Shader and native gather/scatter ABI. `va` is the normalized guest byte address (low, high).
+/// The result is the absolute raw UAV index and its byte offset, including on direct UMA.
+pub const GPU_PAGE_DIRECTORY_HLSL: &str = r#"
+static const uint XCL_PTE_ABSENT = 0u, XCL_PTE_UNMAPPED = 1u, XCL_PTE_MAPPED = 2u, XCL_PTE_INVALID = 3u;
+uint xcl_leaf_pte(uint srv, uint lo) {
+    if (srv == 0u) return 0u;
+    ByteAddressBuffer leaf = ResourceDescriptorHeap[NonUniformResourceIndex(srv)];
+    return leaf.Load((lo >> 16) * 4u);
+}
+uint2 xcl_lookup_gpu_pte(uint2 va, uint directory) {
+    if (va.y > 65535u) return uint2(XCL_PTE_INVALID, 0u);
+    if (directory == 0u) return uint2(XCL_PTE_ABSENT, 0u);
+    ByteAddressBuffer root = ResourceDescriptorHeap[directory];
+    uint2 leaves = root.Load2(va.y * 8u);
+    uint pte = xcl_leaf_pte(leaves.x, va.x);
+    if (pte == 0u) pte = xcl_leaf_pte(leaves.y, va.x);
+    if (pte == 0u) return uint2(XCL_PTE_ABSENT, 0u);
+    if (pte == 0x80000000u) return uint2(XCL_PTE_UNMAPPED, pte);
+    if (or((pte & 0xf8000000u) != 0x80000000u, (pte & 0xfffffu) == 0u)) return uint2(XCL_PTE_INVALID, pte);
+    return uint2(XCL_PTE_MAPPED, pte);
+}
+uint2 xcl_raw_gpuva(uint2 va, uint directory, uint mem_views, uint uma_hi, uint windows) {
+    uint2 miss = uint2(mem_views + 4u, 0u);
+    uint2 p = xcl_lookup_gpu_pte(va, directory);
+    if (p.x == XCL_PTE_MAPPED) return uint2(p.y & 0xfffffu, ((p.y >> 20) & 127u) * 65536u + (va.x & 65535u));
+    if (p.x != XCL_PTE_ABSENT) return miss;
+    uint w = va.y - uma_hi;
+    return uint2(select(w < windows, mem_views + w, miss.x), select(w < windows, va.x, miss.y));
+}
+"#;
+pub const NGG_USER_DISPLACEMENT: usize = (KERNEL_SGPRS - 8) * 4;
 /// What the counters at io[`IO_TRIP_AT`] count, in their order: lanes whose loop budget
 /// (`XCL_LOOP_GUARD`) ran out, whose split-wave64 meet gave up (`xcl_x_meet`), whose
 /// compare-exchange ran out of retries. The third counter counts waves whose barrier
@@ -514,6 +561,7 @@ pub struct Options {
     pub split_wave64: bool,
     pub legacy_compute_wave64: bool,
     pub compute_per_access_coherence: bool,
+    pub bvh_node_fix: bool,
     pub loop_profile: bool,
     pub guard_trip_counters: bool,
     /// first register (space 1) of the program's static samplers (another stage of the same
@@ -526,17 +574,50 @@ pub struct Options {
     /// structured control flow when the program allows it (false, or `XCL_RECOMP_NO_STRUCTURED`:
     /// always the guarded block chain)
     pub structured: bool,
+    /// no lane guard where EXEC provably holds every lane the wave started with (false, or
+    /// `XCL_RECOMP_NO_EXEC_PROOF`: every vector write guarded)
+    pub exec_proof: bool,
     /// float compares test their operands for NaN explicitly (`emit::float_compare`): AMD
     /// drivers need it (`pso::nan_guards`), the DXIL's ordered compares are exact without
     pub nan_guards: bool,
     /// `Mode::Mesh` only: the program as a host mesh shader (ms_6_6) instead of the compute
     /// first pass (`MeshNative`)
     pub mesh_native: Option<MeshNative>,
+    /// the constant data the console compiler put after the program in its code region
+    /// (`code_data`): what a load through an `s_getpc_b64` address reads. None: such a load
+    /// reads guest memory at the program-relative address, as a kernel test's `mem` holds it
+    pub code_data: Option<CodeData>,
+}
+
+/// Constant data in a program's code region: the dwords from `at` (bytes from the program's
+/// first instruction, the address `s_getpc_b64` counts in).
+#[derive(Debug, Clone)]
+pub struct CodeData {
+    pub at: u32,
+    pub words: Vec<u32>,
+}
+
+/// The code region of `f` from the first data block after program `p` to the end of the last
+/// one, the bytes between them included. None: no data block follows the program.
+pub fn code_data(f: &super::xbox::Fssm, p: &super::xbox::Program) -> Option<CodeData> {
+    let program_end = p.offset.checked_add(p.len)?;
+    let after = || f.data_blocks.iter().filter(|b| b.len > 0 && b.offset >= program_end);
+    let at = (after().map(|b| b.offset).min()? - p.offset) & !3;
+    let last = after().max_by_key(|b| b.offset)?;
+    let words = f.data.get(p.offset + at..last.offset.checked_add(last.len)?)?
+        .chunks(4)
+        .map(|c| {
+            let mut w = [0u8; 4];
+            w[..c.len()].copy_from_slice(c);
+            u32::from_le_bytes(w)
+        })
+        .collect::<Vec<u32>>();
+    Some(CodeData { at: at.try_into().ok()?, words })
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, legacy_compute_wave64: legacy_compute_wave64(), compute_per_access_coherence: compute_per_access_coherence(), loop_profile: false, guard_trip_counters: true, static_sampler_base: 0, mem_windows: 1, structured: true, nan_guards: true, mesh_native: None }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, legacy_compute_wave64: legacy_compute_wave64(), compute_per_access_coherence: compute_per_access_coherence(), bvh_node_fix: bvh_node_fix(), loop_profile: false, guard_trip_counters: true, static_sampler_base: 0, mem_windows: 1, structured: true, exec_proof: true, nan_guards: true, mesh_native: None, code_data: None }
     }
 }
 
@@ -548,6 +629,11 @@ pub(super) fn legacy_compute_wave64() -> bool {
 pub(super) fn compute_per_access_coherence() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("XCL_COMPUTE_PER_ACCESS_COHERENCE").is_ok_and(|v| v.trim() == "1"))
+}
+
+pub(super) fn bvh_node_fix() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("XCL_BVH_NODE_FIX").is_ok_and(|v| v.trim() == "1"))
 }
 
 pub(super) fn compute_wave64_pack_max_insts() -> usize {
@@ -1174,6 +1260,84 @@ fn emit_structured(
     pending
 }
 
+fn flag_name(cfg: &structure::Cfg, f: structure::Flag) -> String {
+    match f {
+        structure::Flag::Skip(y) if y == cfg.n => skip_flag(END),
+        structure::Flag::Skip(y) => skip_flag(cfg.start[y]),
+        structure::Flag::Cont(h) => format!("xcl_cont_{:x}", cfg.start[h]),
+    }
+}
+
+/// Every flag `nodes` set.
+fn node_flags(nodes: &[structure::Node], out: &mut BTreeSet<structure::Flag>) {
+    use structure::Node;
+    for n in nodes {
+        match n {
+            Node::Set(f) => {
+                out.insert(*f);
+            }
+            Node::If { then, els, .. } => {
+                node_flags(then, out);
+                node_flags(els, out);
+            }
+            Node::Loop { body, .. } | Node::Guard(_, body) | Node::IfFlag(_, body) => node_flags(body, out),
+            _ => {}
+        }
+    }
+}
+
+/// Emit the structured form (`structure`).
+fn emit_nodes(c: &Ctx, cfg: &structure::Cfg, em: &mut emit::Em, body: &mut String, nodes: &[structure::Node], depth: usize, blocks: &mut usize) {
+    use structure::Node;
+    let pad = emit::pad(depth);
+    let flags = |fs: &[structure::Flag]| fs.iter().map(|&f| flag_name(cfg, f)).collect::<Vec<_>>().join(" || ");
+    for n in nodes {
+        match n {
+            Node::Code(b) => {
+                emit_block(c, em, body, cfg.start[*b], cfg.end[*b], depth, blocks);
+            }
+            Node::If { block, invert, then, els } => {
+                let cond = match emit_block(c, em, body, cfg.start[*block], cfg.end[*block], depth, blocks) {
+                    emit::Flow::Cond(cond, _) => cond,
+                    emit::Flow::Jump(_) | emit::Flow::JumpExpr(_) => "true".into(),
+                    _ => "false".into(),
+                };
+                let test = if *invert { format!("!({cond})") } else { cond };
+                body.push_str(&format!("{pad}if ({test}) {{\n"));
+                emit_nodes(c, cfg, em, body, then, depth + 1, blocks);
+                if !els.is_empty() {
+                    body.push_str(&format!("{pad}}} else {{\n"));
+                    emit_nodes(c, cfg, em, body, els, depth + 1, blocks);
+                }
+                body.push_str(&format!("{pad}}}\n"));
+            }
+            Node::Loop { header, body: inner } => {
+                let probe = c.loop_profile.probe(cfg.start[*header], cfg.loop_end(*header));
+                probe.before(body, pad);
+                body.push_str(&format!("{pad}[loop] for (;;) {{\n"));
+                probe.guard(body, pad, em);
+                emit_nodes(c, cfg, em, body, inner, depth + 1, blocks);
+                body.push_str(&format!("{pad}}}\n"));
+                probe.after(body, pad);
+            }
+            Node::Set(f) => body.push_str(&format!("{pad}{} = true;\n", flag_name(cfg, *f))),
+            Node::Clear(f) => body.push_str(&format!("{pad}{} = false;\n", flag_name(cfg, *f))),
+            Node::Break => body.push_str(&format!("{pad}break;\n")),
+            Node::Continue => body.push_str(&format!("{pad}continue;\n")),
+            Node::Guard(fs, inner) => {
+                body.push_str(&format!("{pad}if (!({})) {{\n", flags(fs)));
+                emit_nodes(c, cfg, em, body, inner, depth + 1, blocks);
+                body.push_str(&format!("{pad}}}\n"));
+            }
+            Node::IfFlag(f, inner) => {
+                body.push_str(&format!("{pad}if ({}) {{\n", flag_name(cfg, *f)));
+                emit_nodes(c, cfg, em, body, inner, depth + 1, blocks);
+                body.push_str(&format!("{pad}}}\n"));
+            }
+        }
+    }
+}
+
 /// The longest range [start, x) (x ≤ hi) entered only at `start`, left only by falling into
 /// x, that `structurable` accepts – emitted as plain structured code under one `pc` guard.
 fn structured_span(c: &Ctx, i: usize, hi: u64) -> Option<u64> {
@@ -1427,16 +1591,12 @@ fn scalar_constant(d: &Decoded, code: u64) -> Option<u32> {
 
 /// S# built from constants in the code – how the console compiler places the static
 /// samplers of a root signature: for each MIMG instruction whose four sampler SGPRs were all
-/// set by s_mov / s_movk with constants earlier in its block, those words.
+/// set by s_mov / s_movk / s_brev with the same constants on every path to it, those words.
 fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64, [u32; 4]> {
-    let mut known: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
-    let mut out = BTreeMap::new();
-    for d in insts {
-        if leaders.contains(&d.pc) {
-            known.clear();
-        }
+    type Known = std::collections::HashMap<u64, u32>;
+    let step = |known: &mut Known, d: &Decoded, out: Option<&mut BTreeMap<u64, [u32; 4]>>| {
         let f = |n: &str| rdna2::field_value(d.enc, &d.words, n);
-        if d.enc.name == "ENC_MIMG" {
+        if let (Some(out), "ENC_MIMG") = (out, d.enc.name) {
             if let Some(s) = f("SSAMP").map(|v| v * rdna2::register_scale("SSAMP")) {
                 if let (Some(a), Some(b), Some(c), Some(e)) = (known.get(&s), known.get(&(s + 1)), known.get(&(s + 2)), known.get(&(s + 3))) {
                     out.insert(d.pc, [*a, *b, *c, *e]);
@@ -1445,6 +1605,7 @@ fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64
         }
         let set: Vec<(u64, u32)> = match d.inst.name {
             "S_MOV_B32" => f("SDST").zip(f("SSRC0").and_then(|c| scalar_constant(d, c))).map(|(r, v)| vec![(r, v)]).unwrap_or_default(),
+            "S_BREV_B32" => f("SDST").zip(f("SSRC0").and_then(|c| scalar_constant(d, c))).map(|(r, v)| vec![(r, v.reverse_bits())]).unwrap_or_default(),
             "S_MOVK_I32" => f("SDST").zip(f("SIMM16")).map(|(r, v)| vec![(r, v as u16 as i16 as i32 as u32)]).unwrap_or_default(),
             // 64-bit moves of inline integers (sign-extended): S# words that are 0 / -1
             "S_MOV_B64" => match (f("SDST"), f("SSRC0")) {
@@ -1463,6 +1624,67 @@ fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64
             if r < 106 {
                 known.insert(r, v);
             }
+        }
+    };
+    let starts: Vec<u64> = leaders.iter().copied().collect();
+    let block = |i: usize| {
+        let a = insts.partition_point(|d| d.pc < starts[i]);
+        let b = starts.get(i + 1).map_or(insts.len(), |&end| insts.partition_point(|d| d.pc < end));
+        &insts[a..b.max(a)]
+    };
+    let mut followed = insts.iter().all(|d| d.inst.flags & rdna2::F_BRANCH == 0 || rdna2::branch_target(d).is_some());
+    let succs: Vec<Vec<usize>> = (0..starts.len())
+        .map(|i| {
+            let next = (i + 1 < starts.len()).then_some(i + 1);
+            let mut to = |t: u64| {
+                let at = starts.binary_search(&t).ok();
+                followed &= at.is_some();
+                at
+            };
+            match term_of(block(i).last()) {
+                Term::Next => next.into_iter().collect(),
+                Term::Cond(t) => to(t).into_iter().chain(next).collect(),
+                Term::Jump(t) => to(t).into_iter().collect(),
+                Term::End => Vec::new(),
+                _ => {
+                    followed = false;
+                    Vec::new()
+                }
+            }
+        })
+        .collect();
+    let mut entry: Vec<Option<Known>> = vec![None; starts.len()];
+    if followed {
+        let mut dirty = vec![false; starts.len()];
+        entry[0] = Some(Known::new());
+        dirty[0] = true;
+        while dirty.contains(&true) {
+            for i in 0..starts.len() {
+                if !std::mem::take(&mut dirty[i]) {
+                    continue;
+                }
+                let mut known = entry[i].clone().unwrap_or_default();
+                for d in block(i) {
+                    step(&mut known, d, None);
+                }
+                for &s in &succs[i] {
+                    if let Some(cur) = &mut entry[s] {
+                        let before = cur.len();
+                        cur.retain(|r, v| known.get(r) == Some(v));
+                        dirty[s] |= cur.len() != before;
+                    } else {
+                        entry[s] = Some(known.clone());
+                        dirty[s] = true;
+                    }
+                }
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    for (i, known) in entry.into_iter().enumerate() {
+        let mut known = known.unwrap_or_default();
+        for d in block(i) {
+            step(&mut known, d, Some(&mut out));
         }
     }
     out
@@ -1561,10 +1783,45 @@ fn emit_program(program: &DecodedProgram<'_>, opt: &Options) -> Result<Translati
     let mut em = emit::Em::new(em_options);
     em.configure_round_modes(insts, branches == 0);
     em.static_ss = program.static_samplers.clone();
+    em.code_loads = opt.code_data.as_ref().is_some_and(|data| !data.words.is_empty())
+        && insts.iter().any(|d| d.inst.name == "S_GETPC_B64");
+    // the program's blocks and, when the graph is reducible, its structured form
+    let leaders: Vec<u64> = leaders.iter().copied().filter(|l| starts.contains(l)).collect();
+    let terms: Vec<Term> = leaders
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| {
+            let e = leaders.get(i + 1).copied().unwrap_or(u64::MAX);
+            term_of(insts[..insts.partition_point(|d| d.pc < e)].last().filter(|d| d.pc >= s))
+        })
+        .collect();
+    let structured = if branches > 0 && gs_jump.is_none() && opt.structured && std::env::var_os("XCL_RECOMP_NO_STRUCTURED").is_none() && std::env::var_os("XCL_RECOMP_NO_CFG").is_none() {
+        match structure::Cfg::new(&leaders, &terms) {
+            Ok(cfg) => {
+                let nodes = cfg.layout();
+                Some((cfg, nodes))
+            }
+            Err(e) => {
+                why(0, &e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // where each emitted loop's guard may leave it to
+    let guard: x64_masks::GuardExits = match &structured {
+        Some((cfg, nodes)) => cfg
+            .loop_exits(nodes)
+            .into_iter()
+            .map(|(h, to)| (cfg.loops[&h].iter().map(|&b| (cfg.start[b], cfg.end[b])).collect(), to.map(|b| cfg.start[b])))
+            .collect(),
+        None => x64_masks::range_exits(insts),
+    };
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
     // continues from the ES into the GS through s_setpc: left as it is)
     if opt.wave64 && opt.split_wave64 && !em.packed_compute() && matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_)) && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
-        em.x64_whole_live = x64_masks::by_pc(insts, matches!(opt.mode, Mode::Kernel));
+        em.x64_whole_live = x64_masks::by_pc(insts, matches!(opt.mode, Mode::Kernel), &guard);
     }
     em.fmt_regs = program.fmt_regs.clone();
     // a wave64 VS / PS on a GPU that can run 32-lane waves: what lanes 32..63 hold where the
@@ -1574,6 +1831,15 @@ fn emit_program(program: &DecodedProgram<'_>, opt: &Options) -> Result<Translati
         let a = upper_lanes::analyze(insts);
         if a.reads.values().any(|r| matches!(r, upper_lanes::Read::Const(_) | upper_lanes::Read::Shadow)) {
             em.upper = Some(a);
+        }
+    }
+    // instructions every lane the wave started with runs: no lane guard (a packed wave starts
+    // from its valid lanes, the emitter skips it; a wave64 mesh wave starts from 32 lanes; a
+    // kernel's EXEC is its input, so only what the program sets is known there)
+    if opt.exec_proof && gs_jump.is_none() && !(opt.wave64 && matches!(opt.mode, Mode::Mesh(_))) && std::env::var_os("XCL_RECOMP_NO_EXEC_PROOF").is_none() {
+        em.exec_full = lane_guards::full_exec(insts, opt.wave64, !matches!(opt.mode, Mode::Kernel), &guard);
+        if em.upper.is_none() && matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Vertex(_) | Mode::Pixel(_)) {
+            em.loose = lane_guards::loose_writes(insts, &em.exec_full, matches!(opt.mode, Mode::Kernel), &guard);
         }
     }
     em.max_vgpr = program.max_vgpr;
@@ -1594,40 +1860,39 @@ fn emit_program(program: &DecodedProgram<'_>, opt: &Options) -> Result<Translati
         body.push_str(&em.take());
         blocks = 1;
     } else {
-        // Blocks in address order as a chain of `if (pc == start)`: a forward branch is found
-        // further down the chain, so only ranges spanned by backward branches need a loop
-        // (`while (pc in range)`); ranges are merged until they nest. Same semantics as a
-        // dispatcher loop over all blocks, but DXC sees an acyclic graph almost everywhere
-        // (optimising one big dispatcher loop took minutes on large retail programs).
-        let leaders: Vec<u64> = leaders.iter().copied().filter(|l| starts.contains(l)).collect();
-        let loops = loop_ranges(insts);
-        let edges: Vec<(u64, u64)> = insts.iter().filter_map(|d| rdna2::branch_target(d).map(|t| (d.pc, t))).collect();
-        let terms: Vec<Term> = leaders
-            .iter()
-            .enumerate()
-            .map(|(i, &s)| {
-                let e = leaders.get(i + 1).copied().unwrap_or(u64::MAX);
-                term_of(insts[..insts.partition_point(|d| d.pc < e)].last().filter(|d| d.pc >= s))
-            })
-            .collect();
         let loop_profile = loop_profile::Sites::new(insts, opt.loop_profile && matches!(opt.mode, Mode::Compute(_)));
+        let edges: Vec<(u64, u64)> = insts.iter().filter_map(|d| rdna2::branch_target(d).map(|t| (d.pc, t))).collect();
+        let loops = if structured.is_some() { Vec::new() } else { loop_ranges(insts) };
         let ctx = Ctx { insts, starts, leaders: &leaders, terms: &terms, loops: &loops, loop_profile, edges: &edges, memo: Default::default() };
-        let mut flags = BTreeSet::new();
         let mut code = String::new();
-        if gs_jump.is_none() && opt.structured && std::env::var_os("XCL_RECOMP_NO_STRUCTURED").is_none() && structurable(&ctx, 0, u64::MAX).is_some() {
-            // structured control flow: plain if / loops, no block dispatch on `pc` (much
-            // smaller for DXC and the driver on big programs)
-            emit_structured(&ctx, &mut em, &mut code, 0, u64::MAX, None, 0, None, &BTreeSet::new(), 1, &mut blocks, &mut flags);
-        } else {
-            if gs_jump.is_some() && opt.split_wave64 && opt.wave64 {
-                code.push_str("    uint pc = xcl_entry_pc;\n");
-            } else {
-                code.push_str("    uint pc = 0;\n");
+        if let Some((cfg, nodes)) = &structured {
+            emit_nodes(&ctx, cfg, &mut em, &mut code, nodes, 1, &mut blocks);
+            let mut flags = BTreeSet::new();
+            node_flags(nodes, &mut flags);
+            for f in flags {
+                body.push_str(&format!("    bool {} = false;\n", flag_name(cfg, f)));
             }
-            emit_range(&ctx, &mut em, &mut code, 0, u64::MAX, 1, &mut blocks, &mut flags);
-        }
-        for &t in &flags {
-            body.push_str(&format!("    bool {} = false;\n", skip_flag(t)));
+        } else {
+            // The `pc` chain: blocks in address order as a chain of `if (pc == start)`: a
+            // forward branch is found further down the chain, so only ranges spanned by
+            // backward branches need a loop (`while (pc in range)`); ranges are merged until
+            // they nest. Same semantics as a dispatcher loop over all blocks, but DXC sees an
+            // acyclic graph almost everywhere (optimising one big dispatcher loop took minutes
+            // on large retail programs).
+            let mut flags = BTreeSet::new();
+            if gs_jump.is_none() && opt.structured && std::env::var_os("XCL_RECOMP_NO_STRUCTURED").is_none() && structurable(&ctx, 0, u64::MAX).is_some() {
+                emit_structured(&ctx, &mut em, &mut code, 0, u64::MAX, None, 0, None, &BTreeSet::new(), 1, &mut blocks, &mut flags);
+            } else {
+                if gs_jump.is_some() && opt.split_wave64 && opt.wave64 {
+                    code.push_str("    uint pc = xcl_entry_pc;\n");
+                } else {
+                    code.push_str("    uint pc = 0;\n");
+                }
+                emit_range(&ctx, &mut em, &mut code, 0, u64::MAX, 1, &mut blocks, &mut flags);
+            }
+            for &t in &flags {
+                body.push_str(&format!("    bool {} = false;\n", skip_flag(t)));
+            }
         }
         body.push_str(&code);
     }

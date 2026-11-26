@@ -97,6 +97,15 @@ pub fn flush() {
     }
 }
 
+pub(crate) fn access_violation_notice(tid: u32, unhandled: bool) {
+    if let Ok(mut g) = FILE.try_lock() {
+        if let Some(f) = g.as_mut() {
+            let kind = if unhandled { "unhandled exception" } else { "title dump requested for exception" };
+            let _ = writeln!(f, "[{:9.3}][{tid:5}][ERROR] {kind} 0xc0000005; raw diagnostics are local only", uptime());
+        }
+    }
+}
+
 #[macro_export]
 macro_rules! xlog_error { ($($a:tt)*) => { $crate::log::write($crate::log::Level::Error, format_args!($($a)*)) } }
 #[macro_export]

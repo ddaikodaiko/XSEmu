@@ -139,6 +139,8 @@ struct State {
     hi: BTreeMap<u64, [Hi; 32]>,
     /// VGPR → its lanes < 32 (bit n: lane n) whose last write was a `v_writelane`
     lo: BTreeMap<u64, u32>,
+    /// (VGPR, lane) → the word the slot's last `v_writelane` put there (absent: anything)
+    slots: BTreeMap<(u64, u32), Word>,
 }
 
 impl State {
@@ -146,7 +148,7 @@ impl State {
         let mut s = [Word::Any; 128];
         s[125] = Word::Zero; // NULL
         s[127] = Word::Zero; // EXEC's upper word: lanes 32..63 are not populated
-        State { s, hi: BTreeMap::new(), lo: BTreeMap::new() }
+        State { s, hi: BTreeMap::new(), lo: BTreeMap::new(), slots: BTreeMap::new() }
     }
 
     fn join(&self, o: &State) -> State {
@@ -169,7 +171,8 @@ impl State {
                 (m != 0).then_some((*v, m))
             })
             .collect();
-        State { s, hi, lo }
+        let slots = self.slots.iter().filter_map(|(k, w)| o.slots.get(k).map(|x| (*k, w.join(*x)))).collect();
+        State { s, hi, lo, slots }
     }
 
     fn upper(&self, v: u64) -> [Hi; 32] {
@@ -556,6 +559,10 @@ fn step(d: &Decoded, st: &mut State) {
     // VGPR lanes
     if name == "V_WRITELANE_B32" {
         let v = fv("VDST");
+        if let Lane::Const(l) = lane_operand(d) {
+            let w = st.src32(d, fv("SRC0"));
+            st.slots.insert((v, l), w);
+        }
         match lane_operand(d) {
             Lane::Const(l) if l >= 32 => {
                 let mut u = st.upper(v);
@@ -663,6 +670,13 @@ fn step(d: &Decoded, st: &mut State) {
             }
             return;
         }
+    }
+    if let Some((Read::Shadow, Some(slot))) = classify(d, st) {
+        let w = st.slots.get(&slot).copied().unwrap_or(Word::Any);
+        for (r, _) in sgpr_outputs(d) {
+            st.set(r, w);
+        }
+        return;
     }
     let valu = is_valu(d);
     for (r, n) in sgpr_outputs(d) {
@@ -934,6 +948,26 @@ mod tests {
             ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 21), ("SRC0", V + 10), ("SRC1", 128 + 5)], None),
         ]);
         assert!(!r.contains(&Read::Shadow), "{r:?}");
+    }
+
+    #[test]
+    fn a_mask_restored_from_spill_slots_keeps_its_words() {
+        const ONE: I = ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 128 + 1)], None);
+        const TWO: I = ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 128 + 2)], None);
+        const PARK_LO: I = ("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", 30), ("SRC1", 128 + 4)], None);
+        const PARK_HI: I = ("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", 31), ("SRC1", 128 + 5)], None);
+        const CLOBBER: I = ("S_MOV_B64", "ENC_SOP1", &[("SDST", 30), ("SSRC0", 18)], None);
+        const LO_BACK: I = ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 30), ("SRC0", V + 10), ("SRC1", 128 + 4)], None);
+        const HI_BACK: I = ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 31), ("SRC0", V + 10), ("SRC1", 128 + 5)], None);
+        const LO_FROM_HI: I = ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 30), ("SRC0", V + 10), ("SRC1", 128 + 5)], None);
+        const HI_FROM_LO: I = ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 31), ("SRC0", V + 10), ("SRC1", 128 + 4)], None);
+        const REPARK: I = ("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", 30), ("SRC1", 128 + 5)], None);
+        let in_order = reads(&[WWM, PARK_LO, PARK_HI, ONE, CLOBBER, LO_BACK, HI_BACK, RESTORE, TWO, READ32]);
+        assert_eq!(in_order, vec![Read::Shadow, Read::Shadow, Read::Const(1)]);
+        let swapped = reads(&[WWM, PARK_LO, PARK_HI, ONE, CLOBBER, LO_FROM_HI, HI_FROM_LO, RESTORE, TWO, READ32]);
+        assert_eq!(swapped, vec![Read::Shadow, Read::Shadow, Read::Unknown]);
+        let reparked = reads(&[WWM, PARK_LO, PARK_HI, ONE, CLOBBER, REPARK, LO_BACK, HI_BACK, RESTORE, TWO, READ32]);
+        assert_eq!(reparked, vec![Read::Shadow, Read::Shadow, Read::Unknown]);
     }
 
     #[test]

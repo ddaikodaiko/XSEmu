@@ -3,6 +3,8 @@ use std::hash::Hash;
 use std::sync::{LazyLock, Mutex};
 use std::thread::{self, ThreadId};
 
+use super::depth_lineage_queue::{self as lineage, FenceKind};
+
 const LATE_EPOCHS: u64 = 8;
 const MAX_QUEUES: usize = 128;
 const MAX_FENCES: usize = 4096;
@@ -340,14 +342,31 @@ pub(super) fn completed(queue: usize, seq: u64, hz: u64, interval: Option<(u64, 
 }
 
 pub(super) fn signal(queue: Option<usize>, _epoch: u64, fence: usize, value: u64) {
-    LEDGER.lock().unwrap().signal(queue, fence, value);
+    let track = lineage::enabled();
+    let edge = {
+        let mut ledger = LEDGER.lock().unwrap();
+        ledger.signal(queue, fence, value);
+        track.then(|| {
+            let f = ledger.fences.get(&fence)?;
+            let signal = ledger.signals.values.get(&(f.generation, value))?;
+            Some((f.generation, f.rewound, signal.ambiguous))
+        }).flatten()
+    };
+    if let Some((generation, rewound, ambiguous)) = edge {
+        lineage::observe_fence(FenceKind::Signal { rewound, ambiguous }, queue, fence, generation, value);
+    }
 }
 
 pub(super) fn wait(queue: usize, epoch: u64, fence: usize, value: u64) {
-    LEDGER
-        .lock()
-        .unwrap()
-        .wait(queue, epoch, fence, value, thread::current().id());
+    let track = lineage::enabled() && queue != 0;
+    let generation = {
+        let mut ledger = LEDGER.lock().unwrap();
+        ledger.wait(queue, epoch, fence, value, thread::current().id());
+        track.then(|| ledger.fences.get(&fence).map(|f| f.generation)).flatten()
+    };
+    if let Some(generation) = generation {
+        lineage::observe_fence(FenceKind::Wait, Some(queue), fence, generation, value);
+    }
 }
 
 pub(super) fn forget_fence(fence: usize) {

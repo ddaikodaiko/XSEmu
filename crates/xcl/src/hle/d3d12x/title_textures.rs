@@ -372,6 +372,22 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
     Ok(())
 }
 
+pub(super) unsafe fn tag_created(ppv: *mut *mut c_void, va: u64, desc: [u8; 0x38], initial: [u32; 2]) {
+    static FAILED: AtomicU64 = AtomicU64::new(0);
+    if ppv.is_null() || (*ppv).is_null() {
+        return;
+    }
+    let host = super::vram::native_image_backing(*ppv as usize);
+    let image = texture::image_bridge::GuestImage { va, desc, host, initial };
+    if let Err(e) = image.tag(*ppv) {
+        if FAILED.fetch_add(1, Ordering::Relaxed) < 4 {
+            crate::xlog_warn!("title texture at {va:#x}: no guest image tag ({e}); it stays off the native image bridge");
+        }
+        return;
+    }
+    super::image_writeback::register(*ppv, &image);
+}
+
 pub(super) fn note_cpu_color_view(device: *mut c_void, res: *mut c_void, va: usize, desc: [u8; 0x38], state: D3D12_RESOURCE_STATES) {
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32_FLOAT};
 
@@ -529,6 +545,7 @@ fn recheck_source(e: &mut Entry) -> bool {
 pub fn note_gpu_write(res: usize) {
     let mut t = TEXTURES.lock().unwrap();
     if let Some(e) = t.get_mut(res) {
+        super::physical_directory::note_native_texture_access(e.va as u64, e.tex.size(), true);
         if !e.gpu_written {
             e.gpu_written = true;
             GPU_WRITTEN.fetch_add(1, Ordering::Relaxed);
@@ -629,12 +646,12 @@ pub fn any() -> bool {
 /// The title recorded `transitions` on PC list `list`: those of textures kept in step are noted
 /// for when the list is submitted.
 pub fn note_transitions(list: usize, transitions: &[Transition]) {
-    if !any() || transitions.is_empty() {
+    if (!any() && !super::image_writeback::active()) || transitions.is_empty() {
         return;
     }
     let kept: Vec<Transition> = {
         let t = TEXTURES.lock().unwrap();
-        transitions.iter().filter(|(r, _, _)| t.by_res.contains_key(r) || t.shadowed.contains_key(r)).copied().collect()
+        transitions.iter().filter(|(r, _, _)| t.by_res.contains_key(r) || t.shadowed.contains_key(r) || super::image_writeback::tracks(*r)).copied().collect()
     };
     if !kept.is_empty() {
         LIST_NOTES.lock().unwrap().entry(list).or_default().extend(kept);
@@ -643,10 +660,20 @@ pub fn note_transitions(list: usize, transitions: &[Transition]) {
 
 /// PC list `list` starts a new recording (made, reset, released): its noted transitions go.
 pub fn list_reset(list: usize) {
+    super::image_writeback::list_reset(list);
     let mut g = LIST_NOTES.lock().unwrap();
     if !g.is_empty() {
         g.remove(&list);
     }
+}
+
+/// The transitions noted for the PC lists `lists`, in submission order.
+pub(super) fn list_transitions(lists: &[*mut c_void]) -> Vec<Transition> {
+    let g = LIST_NOTES.lock().unwrap();
+    if g.is_empty() {
+        return Vec::new();
+    }
+    lists.iter().filter_map(|&l| g.get(&(l as usize))).flatten().copied().collect()
 }
 
 /// The PC lists `lists` were submitted, in this order: the textures kept in step are in the
@@ -902,6 +929,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
                     e.pending = false;
                     PENDING.fetch_sub(1, Ordering::Relaxed);
                 }
+                super::physical_directory::note_native_texture_access(e.va as u64, e.tex.size(), false);
                 Some((r, (e.device, e.src, Arc::clone(&e.tex), e.states.clone())))
             })
             .collect()
@@ -1323,6 +1351,58 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_images_keep_original_slot44_and_slot133_layouts_after_shadowing() {
+        use crate::gpu::texture::image_bridge::{GuestImage, ImageUse};
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        let _vram = super::super::vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _textures = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(adapter) = factory.EnumAdapters1(0) else {
+                crate::gpu::recomp::runner::skip_test("no adapter");
+                return;
+            };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                crate::gpu::recomp::runner::skip_test("software adapter: placed video memory is a real-GPU path");
+                return;
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no D3D12 device");
+                return;
+            }
+            let dev = dev.unwrap();
+            let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut opts as *mut _ as *mut c_void, std::mem::size_of_val(&opts) as u32).is_err()
+                || opts.ResourceHeapTier.0 < 2
+                || opts.TiledResourcesTier.0 < D3D12_TILED_RESOURCES_TIER_2.0
+            {
+                crate::gpu::recomp::runner::skip_test("tiled tier < 2");
+                return;
+            }
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let memory = vec![0u8; 2<<20];
+            let va = (memory.as_ptr() as u64).next_multiple_of(65536);
+            let a = console_desc(3, 64, 64, 1, 1, 28, 0x105);
+            let b = console_desc(3, 128, 64, 1, 1, 28, 0x105);
+            let iid = (&ID3D12Resource::IID as *const windows::core::GUID).cast();
+            let mut r = std::ptr::null_mut();
+            assert!(super::super::device_x::create_placed_resource_x(dev.as_raw(), va, a.as_ptr(), 0, std::ptr::null(), iid, &mut r) >= 0);
+            let first = ID3D12Resource::from_raw(r);
+            r = std::ptr::null_mut();
+            assert!(super::super::device_x::create_placed_resource_layout_x(dev.as_raw(), va, b.as_ptr(), D3D12_BARRIER_LAYOUT_COMMON, std::ptr::null(), iid, &mut r) >= 0);
+            let second = ID3D12Resource::from_raw(r);
+            for (resource, desc, initial) in [(&first, a, [0,0]),(&second, b, [1,D3D12_BARRIER_LAYOUT_COMMON.0 as u32])] {
+                let p = GuestImage::get(resource).unwrap();
+                assert_eq!((p.va, p.desc, p.initial), (va, desc, initial));
+                assert!(p.permits(ImageUse::Copy) && p.permits(ImageUse::Sample));
+                assert!(!p.permits(ImageUse::UnorderedAccess) && !p.permits(ImageUse::RenderTarget));
+            }
+        }
+    }
 
     /// A texture is left out only when its memory hashes as at its own last upload, and a
     /// texture that was forgotten (released, or its address registered again) is uploaded again.
@@ -2266,7 +2346,10 @@ mod tests {
                 ("2D 1024x1024 BC7 11 mips", console_desc(3, 1024, 1024, 1, 11, 98, 0x109)),
                 ("2D 64x64 RGBA8 all-packed 7 mips", console_desc(3, 64, 64, 1, 7, 28, 0x105)),
                 ("2D 256x256x6 cubemap 9 mips", console_desc(3, 256, 256, 6, 9, 28, 0x105)),
-                ("3D 64x64x64 4 mips", console_desc(4, 64, 64, 64, 4, 28, 0x105)),
+                ("3D 64x64x64 RGBA8 1 mip", console_desc(4, 64, 64, 64, 1, 28, 0x105)),
+                ("3D 64x64x64 RGBA8 4 packed mips", console_desc(4, 64, 64, 64, 4, 28, 0x105)),
+                ("3D 64x64x64 R11G11B10_FLOAT 4 packed mips", console_desc(4, 64, 64, 64, 4, 26, 0x105)),
+                ("3D 64x64x64 R16_FLOAT 4 packed mips", console_desc(4, 64, 64, 64, 4, 54, 0x105)),
             ];
             for (label, d) in shapes {
                 let mut p = std::ptr::null_mut();
@@ -2283,6 +2366,8 @@ mod tests {
                     if !placed {
                         println!("{label}: not reserved on this adapter (committed instead)");
                     }
+                } else if is_3d && u16::from_le_bytes(d[0x1E..0x20].try_into().unwrap()) > 1 {
+                    assert!(!placed, "{label}: packed volume mips must use committed detile/upload");
                 } else if !is_3d || opts.TiledResourcesTier.0 >= D3D12_TILED_RESOURCES_TIER_3.0 {
                     assert!(placed, "{label} should use shared vram::Pages");
                 }

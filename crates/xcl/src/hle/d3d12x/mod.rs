@@ -22,6 +22,14 @@ pub mod console_list;
 pub mod device_x;
 pub mod dxgi_device;
 mod cpu_writes;
+mod depth_capture;
+mod depth_capture_views;
+mod depth_lineage;
+mod depth_lineage_queue;
+mod depth_state;
+mod depth_twin_probe;
+mod material_gate_views;
+mod material_gate_capture;
 pub mod depth_uav;
 mod fence_x;
 pub mod frame;
@@ -32,10 +40,14 @@ pub mod null;
 pub mod page_mappings;
 pub mod present;
 pub mod pso_async;
+mod pso_canon;
+mod pso_library;
 pub mod pso_manifest;
 pub mod pso_sched;
 pub mod real;
 pub mod residency;
+pub mod warm_children;
+mod warm_peers;
 mod single;
 mod residency_list;
 pub mod sparse;
@@ -47,8 +59,10 @@ pub(crate) fn placed_buffers_over(va: usize, len: usize) -> Vec<String> {
 }
 pub mod title_list;
 pub mod title_textures;
+pub(crate) mod image_writeback;
 pub mod vram;
 mod wait_trace;
+mod live_status;
 
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -286,3 +300,6 @@ pub unsafe extern "system" fn D3D10CreateBlob(size: usize, out: *mut *mut c_void
 pub unsafe extern "system" fn D3D12XboxSetProcessDebugFlags(_flags: u32) -> HRESULT {
     S_OK
 }
+
+mod physical_import;
+mod physical_directory;

@@ -243,7 +243,7 @@ fn operands(body: &Body, inst: &Inst, reachable: &[bool], mut f: impl FnMut(Valu
     }
 }
 
-fn reachable_blocks(body: &Body, work: &mut Vec<u32>) -> Vec<bool> {
+pub(crate) fn reachable_blocks(body: &Body, work: &mut Vec<u32>) -> Vec<bool> {
     let mut blocks = vec![false; body.blocks.len()];
     if blocks.is_empty() {
         return blocks;

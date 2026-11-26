@@ -45,8 +45,13 @@ fn compute_per_access_coherence_caches_only_before_first_flagged_read() {
                 let (_, tail) = line.split_once(" = xcl_m")?;
                 Some(tail.split_once('(')?.0)
             }).collect::<Vec<_>>();
-            assert_eq!(call, ["_cachedLoad", "_cachedLoad4", "Load", "Load", "Load4"]);
+            let grouped = windows > 1 && !(split && !legacy);
+            let after = if grouped { ["LoadG", "Load4G"] } else { ["Load", "Load4"] };
+            assert_eq!(call, ["_cachedLoad", "_cachedLoad4", "Load", after[0], after[1]]);
             let view = if windows == 1 { "xcl_mem_views" } else { "xcl_mem_views + xcl_w" };
+            if grouped {
+                assert!(prelude.contains(&format!("xcl_mLoadG(uint a, uint64_t g, uint4 r) {{ globallycoherent RWByteAddressBuffer xcl_mb = ResourceDescriptorHeap[{view}]")));
+            }
             assert!(prelude.contains(&format!("xcl_m_cachedLoad(uint a) {{ RWByteAddressBuffer xcl_mb = ResourceDescriptorHeap[{view}]")));
             assert!(prelude.contains(&format!("xcl_mLoad(uint a) {{ globallycoherent RWByteAddressBuffer xcl_mb = ResourceDescriptorHeap[{view}]")));
             assert_eq!(hlsl(&[FLAGGED, PLAIN], &opt), legacy_hlsl(&[FLAGGED, PLAIN], &opt));

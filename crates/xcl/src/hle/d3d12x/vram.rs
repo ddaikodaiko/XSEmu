@@ -254,8 +254,62 @@ impl Drop for PendingPlacement {
         PLACEMENT_FINISHED.notify_all();
     }
 }
-/// resource → its arena's id and placement
-static ARENA_OF: Mutex<Option<std::collections::HashMap<usize, (u64, Placement)>>> = Mutex::new(None);
+const ARENA_PEERS: usize = 6;
+
+#[derive(Clone, Copy)]
+struct ArenaPeer {
+    resource: usize,
+    offset: usize,
+    end: usize,
+}
+
+impl std::fmt::Debug for ArenaPeer {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(out, "{:#x}:[{:#x},{:#x})", self.resource, self.offset, self.end)
+    }
+}
+
+#[derive(Clone)]
+struct ArenaTrace {
+    heap: usize,
+    offset: usize,
+    initial: TextureInitial,
+    shape: Option<(u32, u32, u32)>,
+    at_creation: Vec<ArenaPeer>,
+    appeared_later: Vec<ArenaPeer>,
+    first_peer_released: Option<ArenaPeer>,
+    omitted_at_creation: usize,
+    omitted_later: usize,
+}
+
+struct ArenaResource {
+    id: u64,
+    placement: Placement,
+    trace: Option<Box<ArenaTrace>>,
+}
+
+impl ArenaResource {
+    fn peer(&self, resource: usize, base: usize) -> ArenaPeer {
+        ArenaPeer { resource, offset: self.placement.va - base, end: self.placement.host_end - base }
+    }
+}
+
+static ARENA_OF: Mutex<Option<std::collections::HashMap<usize, ArenaResource>>> = Mutex::new(None);
+
+pub(super) fn arena_depth_shape(resource: usize) -> Option<(u32, u32, u32)> {
+    ARENA_OF.lock().unwrap().as_ref()?.get(&resource)?.trace.as_deref()?.shape
+}
+
+pub(super) fn arena_lineage(resource: usize) -> Option<String> {
+    let (id, p, trace) = {
+        let table = ARENA_OF.lock().unwrap();
+        let entry = table.as_ref()?.get(&resource)?;
+        (entry.id, entry.placement, entry.trace.as_deref()?.clone())
+    };
+    Some(format!("arena={id} heap={:#x} host_heap_range=[{:#x},{:#x}) tracked_title_range=[{:#x},{:#x}) host_initial={:?} same_heap_host_overlaps_at_creation={:?} omitted_at_creation={} same_heap_host_overlaps_appeared_later={:?} omitted_later={} first_overlapping_peer_released={:?}; overlaps are observed arena placements, not GPU alias activation or evidence about other backings",
+        trace.heap, trace.offset, trace.offset + (p.host_end - p.va), p.va, p.title_end, trace.initial,
+        trace.at_creation, trace.omitted_at_creation, trace.appeared_later, trace.omitted_later, trace.first_peer_released))
+}
 /// bytes of every arena made
 static MADE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -263,27 +317,50 @@ static MADE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsi
 pub fn arena_bytes() -> (usize, usize) {
     (ARENAS.lock().unwrap().bytes(), MADE_BYTES.load(std::sync::atomic::Ordering::Relaxed))
 }
-static PLACED_TEXTURES: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+use crate::gpu::texture::image_bridge::ownership::HostBacking;
+static PLACED_TEXTURES: Mutex<Option<std::collections::HashMap<usize, HostBacking>>> = Mutex::new(None);
 
 #[cfg(test)]
 pub(super) fn arena_of(resource: usize) -> Option<u64> {
-    ARENA_OF.lock().unwrap().as_ref()?.get(&resource).map(|&(id, _)| id)
+    ARENA_OF.lock().unwrap().as_ref()?.get(&resource).map(|entry| entry.id)
 }
 
 /// A texture backed by one of the aliasable D3D12 heaps.
 pub(super) fn is_placed_texture(resource: usize) -> bool {
-    PLACED_TEXTURES.lock().unwrap().as_ref().is_some_and(|textures| textures.contains(&resource))
+    PLACED_TEXTURES.lock().unwrap().as_ref().is_some_and(|textures| textures.contains_key(&resource))
+}
+
+pub(super) fn native_image_backing(resource: usize) -> HostBacking {
+    PLACED_TEXTURES.lock().unwrap().as_ref().and_then(|t| t.get(&resource)).copied().unwrap_or(HostBacking::PRIVATE)
 }
 
 pub(super) fn forget(resource: usize) {
-    let placed = PLACED_TEXTURES.lock().unwrap().as_mut().is_some_and(|textures| textures.remove(&resource));
+    let placed = PLACED_TEXTURES.lock().unwrap().as_mut().is_some_and(|textures| textures.remove(&resource).is_some());
     if placed {
         forget_pages(resource);
         if let Some(slabs) = SLABS.lock().unwrap().as_mut() {
             slabs.release(resource, std::time::Instant::now());
         }
-        if let Some((id, p)) = ARENA_OF.lock().unwrap().as_mut().and_then(|m| m.remove(&resource)) {
-            ARENAS.lock().unwrap().release(id, p, std::time::Instant::now());
+        let tracing = super::depth_lineage::twin_enabled();
+        let released = {
+            let mut table = ARENA_OF.lock().unwrap();
+            table.as_mut().and_then(|m| {
+                let released = m.remove(&resource)?;
+                if tracing {
+                    for entry in m.values_mut().filter(|entry| entry.id == released.id
+                        && entry.placement.host_overlaps(released.placement))
+                    {
+                        if let Some(trace) = &mut entry.trace {
+                            let base = entry.placement.va - trace.offset;
+                            trace.first_peer_released.get_or_insert_with(|| released.peer(resource, base));
+                        }
+                    }
+                }
+                Some(released)
+            })
+        };
+        if let Some(released) = released {
+            ARENAS.lock().unwrap().release(released.id, released.placement, std::time::Instant::now());
         }
     }
 }
@@ -539,6 +616,17 @@ fn is_lazy(resource: usize) -> bool {
 fn lazy_tiles() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("XCL_LAZY_TILES").map_or(true, |v| v.trim() != "0"))
+}
+
+pub(super) fn writer_tiles(resource: usize) -> Option<String> {
+    let (va, end, mapped, total, tiles) = {
+        let g = PAGES.lock().unwrap();
+        let (p, t) = g.values().flatten().find_map(|p| p.targets.get(&resource).map(|t| (p, t)))?;
+        let tiles: Vec<_> = (0..t.total.min(128) as usize).map(|i| t.held.get(i).copied().flatten().and_then(|(pool, tile)|
+            p.pools.get(pool as usize).map(|heap| (heap.as_raw() as usize, tile)))).collect();
+        (t.va, t.end(), t.mapped, t.total, tiles)
+    };
+    Some(format!("reserved title_range=[{va:#x},{end:#x}) mapped={mapped} total_tiles={total} first_128_heap_tile_order={tiles:x?}"))
 }
 
 pub(super) fn tile_backing(resource: usize) -> Option<(usize, usize, usize)> {
@@ -1057,7 +1145,7 @@ unsafe fn place_on_pages(
     if lazy {
         LAZY.lock().unwrap().get_or_insert_with(HashSet::new).insert(raw as usize);
     }
-    PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(raw as usize);
+    PLACED_TEXTURES.lock().unwrap().get_or_insert_with(std::collections::HashMap::new).insert(raw as usize, HostBacking::TILED);
     Some(hr)
 }
 
@@ -1289,7 +1377,7 @@ fn tier2(dev: &ID3D12Device) -> bool {
     unsafe { dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut o as *mut _ as *mut c_void, std::mem::size_of_val(&o) as u32).is_ok() && o.ResourceHeapTier.0 >= 2 }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(super) enum TextureInitial {
     Legacy(u32),
     Undefined,
@@ -1532,8 +1620,51 @@ unsafe fn place_in_arena(dev: &ID3D12Device, desc: &D3D12_RESOURCE_DESC, p: Plac
     if !compact {
         super::residency::manage_heap(&heap, prefer_local);
     }
-    PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
-    ARENA_OF.lock().unwrap().get_or_insert_with(std::collections::HashMap::new).insert(*ppv as usize, (id, p));
+    let resource = *ppv as usize;
+    PLACED_TEXTURES.lock().unwrap().get_or_insert_with(std::collections::HashMap::new).insert(resource, HostBacking::arena(id, p.va, p.host_end));
+    let tracing = super::depth_lineage::twin_enabled();
+    let depth = desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    let source = super::material_gate_views::writer::enabled() && desc.Format.0 == 41 && desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    let trace = (tracing && (depth || source)).then(|| Box::new(ArenaTrace {
+        heap: heap.as_raw() as usize,
+        offset,
+        initial,
+        shape: (depth && matches!(desc.Dimension, D3D12_RESOURCE_DIMENSION_TEXTURE1D | D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+            && desc.MipLevels != 0 && desc.DepthOrArraySize != 0).then(|| {
+                let planes = if matches!(desc.Format.0, 19..=22 | 44..=47) { 2 } else { 1 };
+                (u32::from(desc.MipLevels), u32::from(desc.DepthOrArraySize), planes)
+            }),
+        at_creation: Vec::new(),
+        appeared_later: Vec::new(),
+        first_peer_released: None,
+        omitted_at_creation: 0,
+        omitted_later: 0,
+    }));
+    let mut entry = ArenaResource { id, placement: p, trace };
+    let mut table = ARENA_OF.lock().unwrap();
+    let table = table.get_or_insert_with(std::collections::HashMap::new);
+    if tracing {
+        let base = p.va - offset;
+        let new_peer = entry.peer(resource, base);
+        for (&other, previous) in table.iter_mut().filter(|(_, v)| v.id == id && p.host_overlaps(v.placement)) {
+            let prior_peer = previous.peer(other, base);
+            if let Some(trace) = &mut entry.trace {
+                if trace.at_creation.len() < ARENA_PEERS {
+                    trace.at_creation.push(prior_peer);
+                } else {
+                    trace.omitted_at_creation += 1;
+                }
+            }
+            if let Some(trace) = &mut previous.trace {
+                if trace.appeared_later.len() < ARENA_PEERS {
+                    trace.appeared_later.push(new_peer);
+                } else {
+                    trace.omitted_later += 1;
+                }
+            }
+        }
+    }
+    table.insert(resource, entry);
     Some(hr)
 }
 
@@ -1719,7 +1850,7 @@ unsafe fn place_in_slab(dev: &ID3D12Device, va: usize, small: &D3D12_RESOURCE_DE
     }
     slabs.of.insert(*ppv as usize, key);
     drop(g);
-    PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+    PLACED_TEXTURES.lock().unwrap().get_or_insert_with(std::collections::HashMap::new).insert(*ppv as usize, HostBacking::slab(heap.as_raw() as usize, offset, offset + bytes));
     Some(hr)
 }
 

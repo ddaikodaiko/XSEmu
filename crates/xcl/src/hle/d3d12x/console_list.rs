@@ -25,6 +25,7 @@ use windows_sys::core::GUID;
 use crate::util::{HRESULT, S_OK};
 
 const DLL: &str = "d3d12_xs.dll";
+use super::list_x::texture_ops;
 /// stream markers of our own (bits 31:30 = 10: neither a parameter header nor a dispatch)
 const PIPE_MARKER: u32 = 0x8C0F_E002;
 const RS_MARKER: u32 = 0x8C0F_E003;
@@ -34,6 +35,8 @@ const TRANSITIONS_MARKER: u32 = 0x8C0F_E007;
 const COPY_BUFFER_MARKER: u32 = 0x8C0F_E008;
 const CLEAR_UAV_MARKER: u32 = 0x8C0F_E009;
 const COPY_TEXTURE_MARKER: u32 = 0x8C0F_E00A;
+const INDIRECT_MARKER: u32 = 0x8C0F_E00B;
+const OWNED_COPY_TEXTURE_MARKER: u32 = 0x8C0F_E00C;
 /// root parameter header: 0xC0000000 | i << 10 (bits 31:30 set: the inline code leaves its
 /// dirty flag alone); the inline code adds the constant offset · 4 (bits 9:2) and
 /// (count − 1) << 16
@@ -74,6 +77,7 @@ pub struct Layout {
     pub size: u32,
     pub inline: u32,
     pub inline_gfx: u32,
+    pub inline_ms: u32,
     pub(super) uavs: Vec<UavBinding>,
 }
 
@@ -111,7 +115,7 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
     // the parameters go into user SGPRs in order while each fits whole; from the first one
     // that does not, the rest go to the table (packed from its start) – as the console's
     // compiler expects them (HANDOFF: root argument binding)
-    let (mut spilled, mut spilled_gfx) = (false, false);
+    let (mut spilled, mut spilled_gfx, mut spilled_ms) = (false, false, false);
     for k in 0..n {
         let (ty, pay) = (r(poff + 12 * k)?, r(poff + 12 * k + 8)? as usize);
         let p = match ty {
@@ -145,6 +149,10 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
         spilled_gfx |= l.inline_gfx + bytes > 4 * INLINE_SGPRS_GFX;
         if !spilled_gfx {
             l.inline_gfx += bytes;
+        }
+        spilled_ms |= l.inline_ms + bytes > 16 * 4;
+        if !spilled_ms {
+            l.inline_ms += bytes;
         }
         l.size += bytes;
         l.params.push(p);
@@ -187,6 +195,10 @@ pub fn user_data_for(l: &Layout, user_sgprs: Option<u32>, args: &[u8], table_at:
 /// `user_data` of a draw: the vertex and pixel shader's user SGPRs (inline from s8).
 pub fn user_data_gfx(l: &Layout, args: &[u8], table_at: u64) -> Vec<u32> {
     sgprs(FIRST_SGPR_GFX, l.inline_gfx, args, table_at)
+}
+
+pub(super) fn ngg_user_data(inline: u32, args: &[u8], table_at: u64) -> Vec<u32> {
+    sgprs(FIRST_SGPR_GFX, inline, args, table_at)
 }
 
 fn sgprs(first: usize, inline: u32, args: &[u8], table_at: u64) -> Vec<u32> {
@@ -310,16 +322,27 @@ const MAX_PARAMS: usize = 64;
 const OBJECT_BYTES: usize = 0x1000;
 
 struct ListState {
+    indirect: Vec<Arc<PacketIndirect>>,
     pc: usize,
     /// allocator the current recording uses (its Reset frees `uma`)
     allocator: usize,
     refs: u32,
     /// record chunks: (start, bytes used – filled in when the next chunk starts / at close)
     chunks: Vec<(Box<[u8]>, usize)>,
+    texture_operations: Vec<Result<texture_ops::Operation,String>>,
     /// unified-memory blocks owned by the list (upload memory, argument tables, io)
     uma: Vec<usize>,
     /// where the next draw's argument table and io go (blocks in `uma`)
     arena: crate::gpu::uma::Arena,
+}
+
+struct PacketIndirect {
+    signature: ID3D12CommandSignature,
+    max: u32,
+    arguments: ID3D12Resource,
+    argument_offset: u64,
+    count: Option<ID3D12Resource>,
+    count_offset: u64,
 }
 
 static LISTS: Mutex<Option<HashMap<usize, ListState>>> = Mutex::new(None);
@@ -418,8 +441,9 @@ unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
             free_uma(&st.uma);
             super::markers::recording_ended(st.pc);
             let timing = super::gpu_timing::list_token(st.pc as *mut c_void);
+            if !super::real::is_adopted(st.pc as *mut c_void){super::bind::forget(st.pc as *mut c_void);}
             let release: unsafe extern "system" fn(usize) -> u32 = std::mem::transmute(pc_vtable_call(st.pc, 2));
-            if release(st.pc) == 0 {
+            if super::physical_directory::recordings::release(st.pc, || release(st.pc)) == 0 {
                 super::gpu_timing::list_released(timing);
                 super::residency::list_reset(st.pc);
             }
@@ -467,10 +491,13 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, ps
     let f: unsafe extern "system" fn(usize, *mut c_void, *mut c_void) -> HRESULT = std::mem::transmute(pc_vtable_call(pc, 10));
     let hr = f(pc, allocator, pc_pso(pso));
     if hr >= 0 {
+        super::physical_directory::recordings::ended(pc);
         if super::gpu_timing::enabled() && !super::real::is_adopted(pc as *mut c_void) {
             super::gpu_timing::opened(pc as *mut c_void, pc_pso(pso) as usize);
         }
         super::residency::list_reset(pc);
+        if !super::real::is_adopted(pc as *mut c_void){super::bind::reset(pc as *mut c_void,allocator as usize,pc_pso(pso) as usize);}
+        with_list(obj,|st|st.indirect.clear());
         super::markers::recording_ended(pc);
     }
     hr
@@ -478,6 +505,22 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, ps
 
 unsafe extern "system" fn cl_dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
     push(this as usize, &[DISPATCH, x, y, z]);
+}
+
+unsafe extern "system" fn cl_execute_indirect(this:*mut c_void,sig:*mut c_void,max:u32,args:*mut c_void,argument_offset:u64,count:*mut c_void,count_offset:u64) {
+    let index=(||{
+        let packet=PacketIndirect {
+            signature:ID3D12CommandSignature::from_raw_borrowed(&sig)?.clone(), max,
+            arguments:ID3D12Resource::from_raw_borrowed(&args)?.clone(), argument_offset,
+            count:ID3D12Resource::from_raw_borrowed(&count).cloned(), count_offset,
+        };
+        with_list(this as usize,|st|{
+            let index=u32::try_from(st.indirect.len()).ok()?;
+            st.indirect.push(Arc::new(packet));
+            Some(index)
+        })?
+    })().unwrap_or(u32::MAX);
+    push(this as usize,&[INDIRECT_MARKER,index]);
 }
 unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
     if pso.is_null() || *(pso as *const usize) != pso_vtable() {
@@ -559,6 +602,19 @@ unsafe extern "system" fn cl_clear_uav_float(this: *mut c_void, gpu: u64, cpu: u
 /// #85 CopyTextureRegion(dst location, x, y, z, src location, box) – 48-byte
 /// D3D12_TEXTURE_COPY_LOCATION, 24-byte D3D12_BOX
 unsafe extern "system" fn cl_copy_texture_region(this: *mut c_void, dst: *const [u32; 12], x: u32, y: u32, z: u32, src: *const [u32; 12], bx: *const [u32; 6]) {
+    if texture_ops::installed() {
+        let aligned = |p: *const [u32;12]| (!p.is_null()).then(|| std::ptr::read_unaligned(p.cast::<[u64;6]>()));
+        let (d,s) = (aligned(dst), aligned(src));
+        let op = texture_ops::Operation::copy(d.as_ref().map_or(std::ptr::null(), |l| l.as_ptr().cast()), [x,y,z],
+            s.as_ref().map_or(std::ptr::null(), |l| l.as_ptr().cast()), bx.cast(), 0);
+        let index = with_list(this as usize, |st| {
+            let i = u32::try_from(st.texture_operations.len()).expect("too many console texture operations");
+            st.texture_operations.push(op);
+            i
+        }).expect("missing console recording");
+        push(this as usize, &[OWNED_COPY_TEXTURE_MARKER, index]);
+        return;
+    }
     let mut w = vec![COPY_TEXTURE_MARKER];
     w.extend_from_slice(&*dst);
     w.extend([x, y, z]);
@@ -567,7 +623,12 @@ unsafe extern "system" fn cl_copy_texture_region(this: *mut c_void, dst: *const 
     w.extend_from_slice(&bx.as_ref().copied().unwrap_or([0; 6]));
     push(this as usize, &w);
 }
-unsafe extern "system" fn cl_barrier(this: *mut c_void, _n: u32, _barriers: *const c_void) {
+unsafe extern "system" fn cl_barrier(this: *mut c_void, n: u32, barriers: *const c_void) {
+    if super::depth_state::enabled() {
+        if let Some(pc) = with_list(this as usize, |s| s.pc) {
+            super::depth_uav::observe_slot146(pc, n, barriers, false);
+        }
+    }
     push(this as usize, &[BARRIER_MARKER]);
 }
 unsafe extern "system" fn cl_allocate_upload_memory(this: *mut c_void, size: usize, align: usize) -> *mut u8 {
@@ -618,6 +679,7 @@ fn list_vtable() -> usize {
             (32, cl_set_descriptor_heaps as usize),
             (53, cl_clear_uav_uint as usize),
             (54, cl_clear_uav_float as usize),
+            (59, cl_execute_indirect as usize),
             (85, cl_copy_texture_region as usize),
             (33, cl_set_compute_root_signature as usize),
             (37, cl_set_root_constant as usize),
@@ -642,9 +704,10 @@ pub unsafe fn create(pc: *mut c_void) -> *mut c_void {
 
 /// `create` for a list recording from `allocator` (its Reset frees the list's unified memory).
 pub unsafe fn create_with_allocator(pc: *mut c_void, allocator: *mut c_void) -> *mut c_void {
+    super::physical_directory::recordings::ended(pc as usize);
     let obj = Box::into_raw(vec![0u8; OBJECT_BYTES].into_boxed_slice()) as *mut u8 as usize;
     *field(obj, 0) = list_vtable();
-    let mut st = ListState { pc: pc as usize, allocator: allocator as usize, refs: 1, chunks: Vec::new(), uma: Vec::new(), arena: Default::default() };
+    let mut st = ListState { pc: pc as usize, allocator: allocator as usize, refs: 1, chunks: Vec::new(), uma: Vec::new(), arena: Default::default(), indirect: Vec::new(), texture_operations: Vec::new() };
     new_chunk(obj, &mut st, 0);
     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(obj, st);
     obj as *mut c_void
@@ -740,8 +803,10 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     // translated shaders reach memory through the shared heap (`real::mem_views`): bound before
     // the first dispatch when the title binds none
     let mut heaps_bound = false;
+    let mut bound_heaps = Vec::new();
+    let texture_operations = std::mem::take(&mut st.texture_operations);
     let chunks: Vec<Vec<u32>> = st.chunks.iter().map(|(c, used)| c[..*used].chunks(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect()).collect();
-    'chunks: for words in &chunks {
+    'chunks: for (chunk, words) in chunks.iter().enumerate() {
         let mut at = 0usize;
         while at < words.len() {
             let w0 = words[at];
@@ -768,6 +833,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                     }
                 }
                 list.SetDescriptorHeaps(&heaps);
+                bound_heaps=heaps.into_iter().flatten().collect();
                 heaps_bound = true;
                 at += 2 + 2 * n;
             } else if w0 == TRANSITIONS_MARKER {
@@ -827,7 +893,16 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                     _ => out.skipped += 1,
                 }
                 at += 12;
+            } else if w0 == OWNED_COPY_TEXTURE_MARKER {
+                let idx = *words.get(at+1).ok_or("missing owned texture copy index")? as usize;
+                let op = texture_operations.get(idx).ok_or("invalid owned texture copy index")?.as_ref().map_err(Clone::clone)?;
+                if !texture_ops::intercept(st.pc as *mut c_void, texture_ops::RecordingPoint::Console { chunk, dword: at }, || Ok(op.clone()))? {
+                    op.unaffected_console_copy(&list)?;
+                }
+                out.copies += 1;
+                at += 2;
             } else if w0 == COPY_TEXTURE_MARKER {
+                if texture_ops::installed() { return Err("console texture copy predates owned operation capture".into()); }
                 // aligned copies of the two 48-byte locations and the box (borrowed pointers)
                 let loc = |from: usize| -> [u64; 6] {
                     let mut b = [0u64; 6];
@@ -854,12 +929,25 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                     out.skipped += 1;
                 }
                 at += 35;
+            } else if w0 == INDIRECT_MARKER {
+                let packet=st.indirect.get(*words.get(at+1).ok_or("truncated ExecuteIndirect packet")? as usize).ok_or("invalid ExecuteIndirect packet")?.clone();
+                let pso=pso.ok_or("ExecuteIndirect has no pipeline")?;
+                if !(*pso).translated || !super::indirect::dispatches(packet.signature.as_raw() as usize) {
+                    return Err("the compute packet recorder cannot replay this ExecuteIndirect signature and pipeline".into());
+                }
+                super::physical_directory::recordings::retain_native(st.pc,packet.clone())?;
+                let entry=super::list_x::native_buffer::live::Scope::new(bound_heaps.clone(),None);
+                super::bind::execute_indirect_packet(st.pc as *mut c_void,st.allocator,(*pso).pc,title_rs,layout.clone(),&mut table,
+                    packet.signature.as_raw() as usize,packet.max,packet.arguments.as_raw() as usize,packet.argument_offset,
+                    packet.count.as_ref().map_or(0,|r|r.as_raw() as usize),packet.count_offset,&entry)?;
+                at+=2;
             } else if w0 == BARRIER_MARKER {
                 list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                     Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
                     Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
                     Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }) },
                 }]);
+                super::depth_uav::note_slot146_global(st.pc);
                 out.barriers += 1;
                 at += 1;
             } else if w0 == DISPATCH || w0 & !4 == 0x4002_E800 {
@@ -878,6 +966,13 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                                 continue;
                             }
                         };
+                        if super::bind::shader_skip(real) {
+                            if let Some(layout) = &layout {
+                                super::bind::record_skipped_writes(real, (*p).pc, super::bind::bound_writes(layout, &table));
+                            }
+                            out.skipped_dispatches += 1;
+                            continue;
+                        }
                         if !super::real::is_translated_compute(real) {
                             out.skipped_dispatches += 1;
                             continue;
@@ -892,11 +987,12 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
                         io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
                         io[crate::gpu::recomp::IO_MEM_VIEWS] = super::real::mem_views().ok_or("memory windows have no views")?;
+                        io[crate::gpu::recomp::IO_PHYSICAL_TABLE] = super::physical_directory::recordings::packet_index(st.pc);
                         io[crate::gpu::recomp::IO_CARRY_AT] = super::bind::carry_watch();
                         let raw_list = st.pc as *mut c_void;
                         let title_pso = (*p).pc;
                         super::markers::before_op(raw_list);
-                        let (window, offset) = super::bind::trip_watch(raw_list, title_pso, false);
+                        let (window, offset) = super::bind::trip_watch(raw_list, title_pso, real, false);
                         io[crate::gpu::recomp::IO_TRIP_WINDOW] = window;
                         io[crate::gpu::recomp::IO_TRIP_AT] = offset;
                         let io_at = uma_copy(st, bytemuck_u32(&io)).ok_or("UMA: io")?;
@@ -910,7 +1006,9 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         list.SetComputeRootUnorderedAccessView(0, va(io_at));
                         list.SetComputeRootUnorderedAccessView(1, va(res_at));
                         if !heaps_bound {
-                            list.SetDescriptorHeaps(&[super::console_heap::global_heap()]);
+                            let h=super::console_heap::global_heap();
+                            list.SetDescriptorHeaps(&[h.clone()]);
+                            bound_heaps=h.into_iter().collect();
                             heaps_bound = true;
                         }
                         let raw = real as *mut c_void;
@@ -919,7 +1017,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         super::residency::note_list_untracked(st.pc);
                         super::gpu_timing::op_grid(raw_list, super::gpu_timing::Kind::Dispatch, || title_pso, [x, y, z], || list.Dispatch(x, y, z));
                         super::markers::after_op(raw_list, "dispatch", title_pso);
-                        if super::markers::enabled() {
+                        if super::bind::dispatch_snapshot_enabled() {
                             if let Some(layout) = layout.clone() {
                                 super::bind::note_dispatch_snapshot(st.pc, title_pso, Some([x, y, z]), layout, table.clone(), (io[..16].to_vec(), user_sgprs, inline as u32));
                             }

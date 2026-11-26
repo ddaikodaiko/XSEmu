@@ -23,11 +23,13 @@
 //!   status array: QueryInterface, AddRef, Release, IsComplete(index), GetHResult(index),
 //!   then 5 more.
 //!
-//! Each queue has a worker thread: submitted requests run in order (file reads through the
-//! VFS like the title's own, memory copies, zlib), a status entry gets the first failure of
-//! the requests since the previous one, a signal sets the fence from the CPU. Methods not
-//! listed are logged and answer E_NOTIMPL. BCPack decodes after zlib when its tables are
-//! installed (see `hle::bcpack`); hardware swizzle modes are refused.
+//! Every queue's submitted entries run on one shared pool of workers (`pool`), shared by queue
+//! priority. A queue's entries take their turn in order (file reads through the VFS like the
+//! title's own, memory copies, zlib), a status entry gets the first failure of the requests since
+//! the previous one, a signal sets the fence from the CPU; file reads and their decompression may
+//! run ahead of their turn. Methods not listed are logged and answer E_NOTIMPL. BCPack decodes
+//! after zlib when its tables are installed (see `hle::bcpack`); hardware swizzle modes are
+//! refused.
 
 #![allow(non_snake_case)]
 
@@ -47,6 +49,8 @@ use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION,
 use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess, ResetEvent, SetEvent};
 
 use crate::util::{HRESULT, S_OK};
+
+pub mod pool;
 
 const DLL: &str = "xcrdapi.dll";
 
@@ -200,10 +204,13 @@ pub struct BcpackStats {
 pub struct DStorageStats {
     /// BCPack requests refused (no decoder), by `DSTORAGE_BCPACK_MODE`
     pub bcpack_refused: BTreeMap<String, BcpackStats>,
+    /// the shared worker pool, by priority
+    #[serde(default)]
+    pub pool: pool::PoolStats,
 }
 
 pub fn stats() -> DStorageStats {
-    DStorageStats { bcpack_refused: BCPACK.stats() }
+    DStorageStats { bcpack_refused: BCPACK.stats(), pool: pool::stats() }
 }
 
 /// Log a refused BCPack request: one warning per mode and zlib stage, then a running count on
@@ -421,7 +428,8 @@ unsafe extern "system" fn factory_set_cpu_affinity(_p: *mut c_void, _mask: u64) 
 
 unsafe extern "system" fn factory_set_debug_flags(_p: *mut c_void, _flags: u32) {}
 
-unsafe extern "system" fn factory_set_staging_buffer_size(_p: *mut c_void, _bytes: u32) -> HRESULT {
+unsafe extern "system" fn factory_set_staging_buffer_size(_p: *mut c_void, bytes: u32) -> HRESULT {
+    pool::set_staging(bytes);
     S_OK
 }
 
@@ -972,9 +980,18 @@ pub fn counters() -> (u64, u64, u64) {
     (REQUESTS.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed))
 }
 
-/// Run a request and report any short write as a failure.
-/// (`dest_pages`, `src_pages`: the request's page lists as at enqueue, and where they were.)
-unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<(&[usize], ListPlace)>, src_pages: Option<(&[usize], ListPlace)>) -> Result<(), HRESULT> {
+/// Run a request at its turn and report any short write as a failure.
+/// (`dest_pages`, `src_pages`: the request's page lists as at enqueue, and where they were;
+/// `read`: its payload when a worker read it ahead, `pool`; `decode`: how long loading it took
+/// here, when it was not.)
+unsafe fn execute(
+    r: &Request,
+    file: Option<&FileInner>,
+    dest_pages: Option<(&[usize], ListPlace)>,
+    src_pages: Option<(&[usize], ListPlace)>,
+    read: Option<Result<Vec<u8>, HRESULT>>,
+    decode: &mut Option<std::time::Duration>,
+) -> Result<(), HRESULT> {
     let n = r.destination_size as usize;
     {
         // the first requests: where a title's data goes and how it is packed
@@ -999,50 +1016,17 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<(&[u
     if !r.dest_physical_pages() && !writable(r.destination as usize, n) {
         return Err(E_ACCESS_VIOLATION);
     }
-    let src: Vec<u8> = if r.memory_source() {
-        let mut b = vec![0u8; r.source_size as usize];
-        if r.source_physical_pages() {
-            let (at_enqueue, place) = src_pages.ok_or(E_ACCESS_VIOLATION)?;
-            let pages = page_list_at_turn("source", r, r.source as usize, at_enqueue, place).0;
-            if !crate::hle::kernelx::read_physical_pages(&pages, r.source_page_offset as usize, &mut b) {
-                return Err(E_ACCESS_VIOLATION);
-            }
-        } else {
-            if !crate::gpu::shader::readable(r.source as usize, r.source_size as usize) {
-                return Err(E_ACCESS_VIOLATION);
-            }
-            let mut read = 0;
-            let ok = ReadProcessMemory(GetCurrentProcess(), r.source as *const c_void, b.as_mut_ptr().cast(), b.len(), &mut read);
-            if ok == 0 || read != b.len() {
-                return Err(E_ACCESS_VIOLATION);
-            }
+    let payload = match read {
+        Some(read) => {
+            file.and_then(|f| f.handle()).ok_or(E_FILE_HANDLE)?;
+            read?
         }
-        b
-    } else {
-        let f = file.and_then(|f| f.handle()).ok_or(E_FILE_HANDLE)?;
-        let mut b = vec![0u8; r.source_size as usize];
-        read_exact_at(&f, r.offset, &mut b)?;
-        b
-    };
-
-    if r.swizzle() != 0 {
-        return Err(E_DECOMPRESSION);
-    }
-
-    let payload: Vec<u8> = if r.bcpack() != 0 {
-        unpack_bcpack(r, &src)?
-    } else if r.zlib() {
-        let stage1_len = if r.intermediate_size != 0 { r.intermediate_size as usize } else { n };
-        let mut d = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&src, stage1_len).map_err(|_| E_ZLIB_DATA)?;
-        if d.len() != stage1_len {
-            return Err(E_ZLIB_DATA);
+        None => {
+            let t = std::time::Instant::now();
+            let loaded = load(r, file, src_pages);
+            *decode = Some(t.elapsed());
+            loaded?
         }
-        if d.len() < n {
-            d.resize(n, 0);
-        }
-        d
-    } else {
-        src
     };
 
     let request = || {
@@ -1073,6 +1057,58 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<(&[u
         }
         Ok(())
     }))
+}
+
+/// A request's payload: its source read (a file through the VFS, or memory at its turn) and
+/// decompressed, `destination_size` bytes or more. A worker may run this for a file request
+/// ahead of the request's turn (`pool`); its result waits for the turn.
+unsafe fn load(r: &Request, file: Option<&FileInner>, src_pages: Option<(&[usize], ListPlace)>) -> Result<Vec<u8>, HRESULT> {
+    let n = r.destination_size as usize;
+    let src: Vec<u8> = if r.memory_source() {
+        let mut b = vec![0u8; r.source_size as usize];
+        if r.source_physical_pages() {
+            let (at_enqueue, place) = src_pages.ok_or(E_ACCESS_VIOLATION)?;
+            let pages = page_list_at_turn("source", r, r.source as usize, at_enqueue, place).0;
+            if !crate::hle::kernelx::read_physical_pages(&pages, r.source_page_offset as usize, &mut b) {
+                return Err(E_ACCESS_VIOLATION);
+            }
+        } else {
+            if !crate::gpu::shader::readable(r.source as usize, r.source_size as usize) {
+                return Err(E_ACCESS_VIOLATION);
+            }
+            let mut read = 0;
+            let ok = ReadProcessMemory(GetCurrentProcess(), r.source as *const c_void, b.as_mut_ptr().cast(), b.len(), &mut read);
+            if ok == 0 || read != b.len() {
+                return Err(E_ACCESS_VIOLATION);
+            }
+        }
+        b
+    } else {
+        let f = file.and_then(|f| f.handle()).ok_or(E_FILE_HANDLE)?;
+        let mut b = vec![0u8; r.source_size as usize];
+        read_exact_at(&f, r.offset, &mut b)?;
+        b
+    };
+
+    if r.swizzle() != 0 {
+        return Err(E_DECOMPRESSION);
+    }
+
+    Ok(if r.bcpack() != 0 {
+        unpack_bcpack(r, &src)?
+    } else if r.zlib() {
+        let stage1_len = if r.intermediate_size != 0 { r.intermediate_size as usize } else { n };
+        let mut d = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&src, stage1_len).map_err(|_| E_ZLIB_DATA)?;
+        if d.len() != stage1_len {
+            return Err(E_ZLIB_DATA);
+        }
+        if d.len() < n {
+            d.resize(n, 0);
+        }
+        d
+    } else {
+        src
+    })
 }
 
 /// `XCL_DS_VALIDATE=1`: after each request, whether it could have broken memory it does not own –
@@ -1289,11 +1325,12 @@ struct QueueInner {
     auto_submit: bool,
     source_memory: bool,
     capacity: usize,
+    priority: pool::Priority,
+    /// this queue's lane in the shared worker pool
+    lane: u64,
     pending: Mutex<Pending>,
     space: Condvar,
     cancels: Mutex<Vec<CancelRule>>,
-    worker: Mutex<Option<mpsc::Sender<Vec<Entry>>>>,
-    worker_active: (Mutex<bool>, Condvar),
     closed: AtomicBool,
     error_event: usize,
     errors: Mutex<(u32, Option<FirstError>)>,
@@ -1315,136 +1352,115 @@ impl QueueInner {
 
     fn is_cancelled(&self, seq: u64, tag: u64) -> bool {
         let mut rules = self.cancels.lock().unwrap();
-        // Worker processes requests in strictly increasing `seq` order, so rules with
+        // Requests take their turn in strictly increasing `seq` order, so rules with
         // `up_to_seq < seq` can never match this or any later request.
         rules.retain(|r| r.up_to_seq >= seq);
         rules.iter().any(|r| tag & r.mask == r.value)
     }
 
+    /// Whether a cancel already covers the request, asked by its read-ahead (out of turn, so the
+    /// rules are left as they are for the turn).
+    fn cancels_ahead(&self, seq: u64, tag: u64) -> bool {
+        self.cancels.lock().unwrap().iter().any(|r| r.up_to_seq >= seq && tag & r.mask == r.value)
+    }
+
     fn submit(self: &Arc<Self>, explicit: bool) {
-        // Lock `worker` before `pending` so concurrent `Submit()` calls always enqueue
-        // batches to the channel in strict `seq` order.
-        let mut w = self.worker.lock().unwrap();
+        // The pending lock is held into the pool, so concurrent `Submit()` calls hand over their
+        // batches in strict `seq` order and none follows `close`.
+        let mut pending = self.pending.lock().unwrap();
         if self.closed.load(Ordering::Acquire) {
             return;
         }
-        let batch = {
-            let mut pending = self.pending.lock().unwrap();
-            if !explicit && (pending.late_destinations != 0 || pending.entries.len() < self.capacity / 2) {
-                return;
-            }
-            if pending.late_destinations != 0 {
-                for entry in &mut pending.entries {
-                    let Entry::Request { req, dest_pages: Some(pages), .. } = entry else { continue };
-                    if !pages.contains(&0) {
-                        continue;
-                    }
-                    let Ok(current) = (unsafe { snapshot_page_array(req.destination, req.destination_page_offset, req.destination_size) }) else { continue };
-                    for (saved, now) in pages.iter_mut().zip(current) {
-                        if *saved == 0 {
-                            *saved = now;
-                        }
+        if !explicit && (pending.late_destinations != 0 || pending.entries.len() < self.capacity / 2) {
+            return;
+        }
+        if pending.late_destinations != 0 {
+            for entry in &mut pending.entries {
+                let Entry::Request { req, dest_pages: Some(pages), .. } = entry else { continue };
+                if !pages.contains(&0) {
+                    continue;
+                }
+                let Ok(current) = (unsafe { snapshot_page_array(req.destination, req.destination_page_offset, req.destination_size) }) else { continue };
+                for (saved, now) in pages.iter_mut().zip(current) {
+                    if *saved == 0 {
+                        *saved = now;
                     }
                 }
-                pending.late_destinations = 0;
             }
-            std::mem::take(&mut pending.entries)
-        };
+            pending.late_destinations = 0;
+        }
+        let batch = std::mem::take(&mut pending.entries);
         if batch.is_empty() {
             return;
         }
         self.space.notify_all();
-        if w.is_none() {
-            let (tx, rx) = mpsc::channel::<Vec<Entry>>();
-            let q = Arc::clone(self);
-            *self.worker_active.0.lock().unwrap() = true;
-            let started = std::thread::Builder::new().name("xcl-dstorage".into()).spawn(move || q.run(rx));
-            if started.is_err() {
-                *self.worker_active.0.lock().unwrap() = false;
-                self.worker_active.1.notify_all();
-                // Release `worker` before dropping `batch` so fence `Release` cannot re-enter under lock.
-                drop(w);
-                drop(batch);
-                return;
-            }
-            *w = Some(tx);
-        }
-        let sent = w.as_ref().unwrap().send(batch);
-        // Release `worker` before dropping any unsent `batch` returned in `Err`.
-        drop(w);
-        drop(sent);
+        let refused = pool::submit(self.lane, batch);
+        // Release `pending` before dropping a batch the pool did not take, so fence `Release` cannot
+        // re-enter under the lock.
+        drop(pending);
+        drop(refused);
     }
 
-    fn run(&self, rx: mpsc::Receiver<Vec<Entry>>) {
-        struct ActiveGuard<'a>(&'a QueueInner);
-        impl Drop for ActiveGuard<'_> {
-            fn drop(&mut self) {
-                *self.0.worker_active.0.lock().unwrap() = false;
-                self.0.worker_active.1.notify_all();
-            }
-        }
-        let _active = ActiveGuard(self);
-        // the first failure of the requests since the last status entry
-        let mut since_status = S_OK;
-        for batch in rx {
-            for e in batch {
-                if self.closed.load(Ordering::Acquire) {
-                    if let Entry::Status(s, i) = e {
-                        if let Some(slot) = s.slots.get(i as usize) {
-                            slot.store(E_QUEUE_CLOSED, Ordering::Release);
-                        }
-                    }
-                    continue;
+    /// One entry's turn on a pool worker, in queue order; `since` is the first failure since the
+    /// last status entry, and what it is after this entry is returned. `read` is the payload read
+    /// ahead for a file request, `decode` gets the time loading it took at the turn otherwise.
+    fn turn(&self, e: Entry, read: Option<Result<Vec<u8>, HRESULT>>, mut since: HRESULT, decode: &mut Option<std::time::Duration>) -> HRESULT {
+        if self.closed.load(Ordering::Acquire) {
+            if let Entry::Status(s, i) = e {
+                if let Some(slot) = s.slots.get(i as usize) {
+                    slot.store(E_QUEUE_CLOSED, Ordering::Release);
                 }
-                match e {
-                    Entry::Request { seq, req, file, dest_pages, src_pages, places } => {
-                        if self.is_cancelled(seq, req.tag) {
-                            // Cancelled requests are skipped without affecting status or error record.
-                            continue;
-                        }
-                        let dest = dest_pages.as_deref().map(|p| (p, places.0));
-                        let result = unsafe { execute(&req, file.as_deref(), dest, src_pages.as_deref().map(|p| (p, places.1))) };
-                        unsafe { validate_after(&req, dest, result) };
-                        if let Err(hr) = result {
-                            self.fail(hr, req, file.as_deref());
-                            if since_status >= 0 {
-                                since_status = hr;
-                            }
-                        }
-                    }
-                    Entry::Refused { hr, req, file, fill } => {
-                        if let Some(t) = &fill {
-                            // the destination gets solid blocks; the request still fails, unless
-                            // XCL_DSTORAGE_BCPACK_FILL=succeed
-                            let filled = unsafe { bcpack_fill(&req, t) };
-                            if filled && bcpack_fill_succeeds() {
-                                continue;
-                            }
-                        }
-                        self.fail(hr, req, file.as_deref());
-                        if since_status >= 0 {
-                            since_status = hr;
-                        }
-                    }
-                    Entry::Status(s, i) => {
-                        if let Some(slot) = s.slots.get(i as usize) {
-                            slot.store(since_status, Ordering::Release);
-                        }
-                        since_status = S_OK;
-                    }
-                    Entry::Signal(fence, value) => unsafe {
-                        fence.signal(value);
-                    },
-                    Entry::SetEvent(event) => unsafe {
-                        SetEvent(event.as_raw_handle());
-                    },
-                    #[cfg(test)]
-                    Entry::Gate(b) => {
-                        b.wait();
+            }
+            return since;
+        }
+        match e {
+            Entry::Request { seq, req, file, dest_pages, src_pages, places } => {
+                if self.is_cancelled(seq, req.tag) {
+                    // Cancelled requests are skipped without affecting status or error record.
+                    return since;
+                }
+                let dest = dest_pages.as_deref().map(|p| (p, places.0));
+                let result = unsafe { execute(&req, file.as_deref(), dest, src_pages.as_deref().map(|p| (p, places.1)), read, decode) };
+                unsafe { validate_after(&req, dest, result) };
+                if let Err(hr) = result {
+                    self.fail(hr, req, file.as_deref());
+                    if since >= 0 {
+                        since = hr;
                     }
                 }
             }
+            Entry::Refused { hr, req, file, fill } => {
+                if let Some(t) = &fill {
+                    // the destination gets solid blocks; the request still fails, unless
+                    // XCL_DSTORAGE_BCPACK_FILL=succeed
+                    let filled = unsafe { bcpack_fill(&req, t) };
+                    if filled && bcpack_fill_succeeds() {
+                        return since;
+                    }
+                }
+                self.fail(hr, req, file.as_deref());
+                if since >= 0 {
+                    since = hr;
+                }
+            }
+            Entry::Status(s, i) => {
+                if let Some(slot) = s.slots.get(i as usize) {
+                    slot.store(since, Ordering::Release);
+                }
+                since = S_OK;
+            }
+            Entry::Signal(fence, value) => unsafe {
+                fence.signal(value);
+            },
+            Entry::SetEvent(event) => unsafe {
+                SetEvent(event.as_raw_handle());
+            },
+            #[cfg(test)]
+            Entry::Gate(b) => {
+                b.wait();
+            }
         }
+        since
     }
 
     fn enqueue(self: &Arc<Self>, mut e: Entry) {
@@ -1474,18 +1490,16 @@ impl QueueInner {
         }
     }
     /// Close(), and the last Release() (DirectStorage closes a queue when its last reference
-    /// goes): what is not submitted yet ends as E_QUEUE_CLOSED, and no request writes into the
-    /// caller's memory once this has returned.
+    /// goes): what is not through its turn yet ends as E_QUEUE_CLOSED, and no request writes into
+    /// the caller's memory once this has returned.
     fn close(&self) {
-        // Lock `worker` then `pending` (same order as `submit`) so no racing enqueue or submit
-        // can push new pending entries or spawn a new worker after `closed` is set.
+        // `closed` is set under the pending lock, which `submit` holds into the pool, so no racing
+        // enqueue or submit hands the pool new entries after this.
         let drained = {
-            let mut w = self.worker.lock().unwrap();
             let mut pend = self.pending.lock().unwrap();
             if self.closed.swap(true, Ordering::AcqRel) {
                 Vec::new()
             } else {
-                w.take();
                 self.space.notify_all();
                 pend.late_destinations = 0;
                 std::mem::take(&mut pend.entries)
@@ -1499,13 +1513,9 @@ impl QueueInner {
             }
             // `Entry::Signal` drops `FenceRef` (calling Release); `Entry::Request` drops `FileInner`.
         }
-        // Wait outside queue locks so no in-flight worker request can still touch caller buffers
-        // after `Close()` or the final `Release()` returns (including for concurrent callers).
-        let (lock, cvar) = &self.worker_active;
-        let mut active = lock.lock().unwrap();
-        while *active {
-            active = cvar.wait(active).unwrap();
-        }
+        // Outside the queue's locks: submitted entries are dropped, and a turn running on a worker
+        // ends before this returns (for concurrent callers too).
+        pool::close(self.lane);
     }
 }
 
@@ -1583,17 +1593,18 @@ unsafe fn create_queue(desc: *const u8, extended: bool, riid: *const GUID, out: 
         auto_submit: options == 0,
         source_memory: source == 1,
         capacity,
+        priority: pool::Priority::of(priority),
+        lane: pool::new_lane_id(),
         pending: Mutex::new(Pending { entries: Vec::new(), next_seq: 1, late_destinations: 0 }),
         space: Condvar::new(),
         cancels: Mutex::new(Vec::new()),
-        worker: Mutex::new(None),
-        worker_active: (Mutex::new(false), Condvar::new()),
         closed: AtomicBool::new(false),
         error_event: ev as usize,
         errors: Mutex::new((0, None)),
         bcpack_fill: AtomicBool::new(bcpack_fill_from_env()),
     });
     QUEUES.lock().unwrap().push(Arc::downgrade(&inner));
+    pool::register(&inner);
     let o = new_object(queue_vtbl(), inner);
     let hr = queue_qi(o, riid, out);
     queue_release(o);
@@ -1620,9 +1631,8 @@ unsafe extern "system" fn queue_release(p: *mut c_void) -> u32 {
     let n = (*obj).refs.fetch_sub(1, Ordering::AcqRel) - 1;
     if n == 0 {
         let obj = Box::from_raw(obj);
-        // DirectStorage closes the queue when its last reference is released; that also drops
-        // the channel sender, so the worker thread exits and drops its Arc<QueueInner>
-        // (breaking the worker <-> queue cycle).
+        // DirectStorage closes the queue when its last reference is released; that also takes
+        // its lane out of the worker pool, which drops the pool's Arc<QueueInner>.
         obj.inner.close();
         drop(obj);
     }
@@ -1925,11 +1935,11 @@ mod tests {
             let data = [1u8, 2, 3, 4, 5, 6, 7, 8];
             src.add(0xFFC).copy_from_nonoverlapping(data.as_ptr(), data.len());
             let req = Request::parse(&request(SOURCE_MEMORY_BIT, dest.as_mut_ptr() as u64, 8, src.add(0xFFC) as u64, 0, 8));
-            let whole = execute(&req, None, None, None);
+            let whole = execute(&req, None, None, None, None, &mut None);
             let copied = dest;
             dest.fill(0x7E);
             let decommitted = VirtualFree(src.add(0x1000).cast(), 0x1000, MEM_DECOMMIT);
-            let partial = execute(&req, None, None, None);
+            let partial = execute(&req, None, None, None, None, &mut None);
             VirtualFree(src.cast(), 0, MEM_RELEASE);
             assert_eq!(whole, Ok(()));
             assert_eq!(copied, data);
@@ -2120,7 +2130,7 @@ mod tests {
             };
             let fence_ptr = &fence as *const MockFence as *mut c_void;
 
-            // Block the worker deterministically so the submitted batch sits in the channel.
+            // Hold the queue's turn deterministically so the submitted batch waits in the pool.
             let gate = Arc::new(std::sync::Barrier::new(2));
             queue(q).enqueue(Entry::Gate(Arc::clone(&gate)));
             // Submitted + matching tag (0x1001 & 0xF000 == 0x1000) -> cancelled.
@@ -2345,7 +2355,7 @@ mod tests {
                 assert_eq!(create_status(f, 1, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
                 let weak = Arc::downgrade(queue(q));
 
-                // Start the worker thread with a buffer-free status entry.
+                // Hand the pool a buffer-free status entry.
                 queue_enqueue_status(q, s, 0);
                 queue_submit(q);
 
@@ -2367,7 +2377,7 @@ mod tests {
                 while weak.upgrade().is_some() && start.elapsed().as_secs() < 5 {
                     std::thread::yield_now();
                 }
-                assert!(weak.upgrade().is_none(), "concurrent Release leaked QueueInner / worker thread");
+                assert!(weak.upgrade().is_none(), "concurrent Release leaked QueueInner in the pool");
                 status_release(s);
             }
         }
@@ -2404,13 +2414,13 @@ mod tests {
             queue_close(q);
             assert_eq!(status_get_hresult(s, 0), E_QUEUE_CLOSED);
 
-            // Subsequent EnqueueStatus / Submit on closed queue do not mutate status or spawn a worker.
+            // Subsequent EnqueueStatus / Submit on closed queue do not mutate status or hand the pool work.
             inner::<StatusInner>(s).slots[1].store(S_OK, Ordering::Release);
             queue_enqueue_status(q, s, 1);
             queue_submit(q);
             assert_eq!(status_get_hresult(s, 1), S_OK);
             assert!(queue(q).pending.lock().unwrap().entries.is_empty());
-            assert!(queue(q).worker.lock().unwrap().is_none());
+            assert_eq!(pool::submitted(queue(q).lane), 0);
 
             queue_release(q);
             status_release(s);
@@ -2503,7 +2513,7 @@ mod tests {
             let dst = VirtualAlloc(std::ptr::null(), 0x1_0000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
             assert_ne!(dst, 0);
             let req = Request::parse(&request(SOURCE_MEMORY_BIT | ZLIB_BIT, dst as u64 + 0x1000, plain.len() as u32, packed.as_ptr() as u64, 0, packed.len() as u32));
-            assert_eq!(execute(&req, None, None, None), Ok(()));
+            assert_eq!(execute(&req, None, None, None, None, &mut None), Ok(()));
             assert_eq!(std::slice::from_raw_parts((dst + 0x1000) as *const u8, plain.len()), &plain[..]);
             let held = crate::alias::report(dst + 0x1010).expect("an address a request wrote to");
             assert!(held.contains(&format!("{:#x} bytes at {:#x}", plain.len(), dst + 0x1000)) && held.contains("STILL HOLDS it"), "{held}");
@@ -2546,8 +2556,7 @@ mod tests {
             desc[10] = 2;
             let mut q = std::ptr::null_mut();
             assert_eq!(create_queue(desc.as_ptr(), false, &IID_QUEUE, &mut q), S_OK);
-            let (tx, rx) = mpsc::channel();
-            *queue(q).worker.lock().unwrap() = Some(tx);
+            pool::hold(queue(q).lane, true);
 
             let mut table = [5usize, 0, 0];
             let source = [0u8; 3];
@@ -2567,12 +2576,12 @@ mod tests {
             );
             queue_enqueue_request(q, late.as_ptr());
             queue_enqueue_request(q, plain.as_ptr());
-            assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            assert_eq!(pool::submitted(queue(q).lane), 0);
 
             table.as_mut_ptr().write_volatile(9);
             table.as_mut_ptr().add(1).write_volatile(7);
             queue_submit(q);
-            let batch = rx.try_recv().unwrap();
+            let batch = pool::take_submitted(queue(q).lane);
             assert!(matches!(&batch[..], [
                 Entry::Request { seq: 1, dest_pages: Some(pages), .. },
                 Entry::Request { seq: 2, .. }
@@ -2580,7 +2589,7 @@ mod tests {
 
             queue_enqueue_request(q, plain.as_ptr());
             queue_enqueue_request(q, plain.as_ptr());
-            assert_eq!(rx.try_recv().unwrap().len(), 2);
+            assert_eq!(pool::take_submitted(queue(q).lane).len(), 2);
             queue_close(q);
             queue_release(q);
         }
@@ -3199,6 +3208,289 @@ mod tests {
             assert!(status_is_complete(s, 0) && status_get_hresult(s, 0) == E_QUEUE_CLOSED, "submitted status must get E_QUEUE_CLOSED");
             assert!(status_is_complete(s, 1) && status_get_hresult(s, 1) == E_QUEUE_CLOSED, "pending status must get E_QUEUE_CLOSED");
             status_release(s);
+        }
+    }
+
+    // -----------------------------------------------------------------------------------
+    // the shared worker pool: order, cancellation, errors and priorities across queues
+    // -----------------------------------------------------------------------------------
+
+    const BLOCK: usize = 4096;
+
+    /// A fence that checks, at each signal, that the requests before it in its queue have written
+    /// their blocks and none after it has: a queue's requests write at their turn, in order.
+    #[repr(C)]
+    struct OrderFence {
+        vtbl: *const usize,
+        refs: AtomicU32,
+        blocks: *const u8,
+        count: usize,
+        seed: u8,
+        last: AtomicU64,
+        bad: Mutex<Option<String>>,
+    }
+
+    fn order_fence_vtbl() -> &'static [usize] {
+        unsafe extern "system" fn qi(_p: *mut c_void, _riid: *const GUID, _out: *mut *mut c_void) -> HRESULT {
+            E_NOINTERFACE
+        }
+        unsafe extern "system" fn add(p: *mut c_void) -> u32 {
+            (*(p as *const OrderFence)).refs.fetch_add(1, Ordering::Relaxed) + 1
+        }
+        unsafe extern "system" fn rel(p: *mut c_void) -> u32 {
+            (*(p as *const OrderFence)).refs.fetch_sub(1, Ordering::AcqRel) - 1
+        }
+        unsafe extern "system" fn sig(p: *mut c_void, v: u64) -> HRESULT {
+            let f = &*(p as *const OrderFence);
+            let last = f.last.swap(v, Ordering::AcqRel);
+            let mut bad = f.bad.lock().unwrap();
+            if v != last + 1 {
+                bad.get_or_insert(format!("signal {v} after {last}"));
+            }
+            for k in 0..f.count {
+                let at = std::ptr::read_volatile(f.blocks.add(k * BLOCK));
+                let want = if (k as u64) < v { f.seed.wrapping_add(k as u8) } else { 0 };
+                if at != want {
+                    bad.get_or_insert(format!("at signal {v}: block {k} holds {at:#x}, not {want:#x}"));
+                }
+            }
+            S_OK
+        }
+        static V: OnceLock<&'static [usize]> = OnceLock::new();
+        V.get_or_init(|| {
+            let mut v = vec![0usize; FENCE_SIGNAL + 1];
+            v[0] = qi as usize;
+            v[1] = add as usize;
+            v[2] = rel as usize;
+            v[FENCE_SIGNAL] = sig as usize;
+            Box::leak(v.into_boxed_slice())
+        })
+    }
+
+    struct PoolQueue {
+        q: *mut c_void,
+        file: *mut c_void,
+        path: std::path::PathBuf,
+        status: *mut c_void,
+    }
+
+    impl PoolQueue {
+        /// A queue (a file queue when `data` is given, a memory queue otherwise) and a status array.
+        unsafe fn new(priority: i8, capacity: u16, statuses: u32, data: Option<&[u8]>, name: &str) -> PoolQueue {
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&u32::from(data.is_none()).to_le_bytes());
+            desc[8..10].copy_from_slice(&capacity.to_le_bytes());
+            desc[10] = priority as u8;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(desc.as_ptr(), false, &IID_QUEUE, &mut q), S_OK);
+            let path = std::env::temp_dir().join(format!("xcl-dstorage-pool-{name}-{}.bin", std::process::id()));
+            let mut file = std::ptr::null_mut();
+            if let Some(data) = data {
+                std::fs::write(&path, data).unwrap();
+                let wide: Vec<u16> = path.to_string_lossy().encode_utf16().chain([0]).collect();
+                assert_eq!(factory_open_file(std::ptr::null_mut(), wide.as_ptr(), &IID_FILE, &mut file), S_OK);
+            }
+            let mut status = std::ptr::null_mut();
+            assert_eq!(factory_create_status_array(std::ptr::null_mut(), statuses, std::ptr::null(), &IID_STATUS_ARRAY, &mut status), S_OK);
+            PoolQueue { q, file, path, status }
+        }
+
+        fn lane(&self) -> u64 {
+            unsafe { queue(self.q).lane }
+        }
+
+        unsafe fn wait(&self, index: u32) -> HRESULT {
+            let t = std::time::Instant::now();
+            while !status_is_complete(self.status, index) && t.elapsed().as_secs() < 20 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(status_is_complete(self.status, index), "status {index} still pending");
+            status_get_hresult(self.status, index)
+        }
+
+        unsafe fn errors(&self) -> (u32, HRESULT) {
+            let mut rec = [0u8; ERROR_RECORD_BYTES];
+            queue_retrieve_error_record(self.q, rec.as_mut_ptr());
+            (u32::from_le_bytes(rec[0..4].try_into().unwrap()), i32::from_le_bytes(rec[8..12].try_into().unwrap()))
+        }
+
+        unsafe fn end(self) {
+            queue_close(self.q);
+            queue_release(self.q);
+            if !self.file.is_null() {
+                file_release(self.file);
+                let _ = std::fs::remove_file(&self.path);
+            }
+            status_release(self.status);
+        }
+    }
+
+    unsafe fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let t = std::time::Instant::now();
+        while !done() && t.elapsed().as_secs() < 20 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(done(), "{what}");
+    }
+
+    /// `count` blocks of `BLOCK` bytes, block k all `seed + k`, each zlib-compressed: the file and
+    /// each block's (offset, packed size).
+    fn packed_blocks(count: usize, seed: u8) -> (Vec<u8>, Vec<(u64, u32)>) {
+        let (mut file, mut at) = (Vec::new(), Vec::new());
+        for k in 0..count {
+            let packed = miniz_oxide::deflate::compress_to_vec_zlib(&[seed.wrapping_add(k as u8); BLOCK], 6);
+            at.push((file.len() as u64, packed.len() as u32));
+            file.extend_from_slice(&packed);
+        }
+        (file, at)
+    }
+
+    /// Queues of every priority on the pool at once (file queues reading zlib blocks ahead, one
+    /// memory queue): each one's requests write at their turn and in order, and each signal comes
+    /// after exactly the requests before it.
+    #[test]
+    fn the_shared_pool_keeps_each_queues_order() {
+        const N: usize = 48;
+        unsafe {
+            let mut runs = Vec::new();
+            for (i, priority) in [-1i8, 0, 1, 2].into_iter().enumerate() {
+                let seed = 0x10 + 0x40 * i as u8;
+                let (file, at) = packed_blocks(N, seed);
+                let memory = priority == 2;
+                let pq = PoolQueue::new(priority, 256, 1, (!memory).then_some(&file[..]), &format!("order{i}"));
+                let dst = vec![0u8; N * BLOCK].into_boxed_slice();
+                let fence = Box::new(OrderFence {
+                    vtbl: order_fence_vtbl().as_ptr(),
+                    refs: AtomicU32::new(1),
+                    blocks: dst.as_ptr(),
+                    count: N,
+                    seed,
+                    last: AtomicU64::new(0),
+                    bad: Mutex::new(None),
+                });
+                runs.push((pq, file, at, dst, fence, memory));
+            }
+            for (pq, file, at, dst, fence, memory) in &runs {
+                for (k, &(offset, size)) in at.iter().enumerate() {
+                    let d = dst.as_ptr().add(k * BLOCK) as u64;
+                    let r = if *memory {
+                        request(SOURCE_MEMORY_BIT | ZLIB_BIT, d, BLOCK as u32, file.as_ptr() as u64 + offset, 0, size)
+                    } else {
+                        request(ZLIB_BIT, d, BLOCK as u32, pq.file as u64, offset, size)
+                    };
+                    queue_enqueue_request(pq.q, r.as_ptr());
+                    queue_enqueue_signal(pq.q, &**fence as *const OrderFence as *mut c_void, k as u64 + 1);
+                }
+                queue_enqueue_status(pq.q, pq.status, 0);
+            }
+            for (pq, ..) in &runs {
+                queue_submit(pq.q);
+            }
+            for (pq, _, _, dst, fence, _) in runs {
+                assert_eq!(pq.wait(0), S_OK);
+                assert_eq!(fence.bad.lock().unwrap().take(), None);
+                assert_eq!(fence.last.load(Ordering::Acquire), N as u64);
+                assert!((0..N).all(|k| dst[k * BLOCK..(k + 1) * BLOCK].iter().all(|&b| b == fence.seed.wrapping_add(k as u8))));
+                assert_eq!(pq.errors().0, 0);
+                pq.end();
+                assert_eq!(fence.refs.load(Ordering::Acquire), 1, "every fence reference released");
+            }
+        }
+    }
+
+    /// Requests read ahead and then cancelled before their turn write nothing and report nothing;
+    /// one enqueued after the cancel with the same tag runs.
+    #[test]
+    fn a_cancel_covers_requests_already_read_ahead() {
+        const N: usize = 16;
+        unsafe {
+            let (file, at) = packed_blocks(N + 1, 0x21);
+            let pq = PoolQueue::new(0, 64, 1, Some(&file), "cancel");
+            pool::hold(pq.lane(), true);
+            let mut dst = vec![0u8; (N + 1) * BLOCK];
+            for (k, &(offset, size)) in at.iter().take(N).enumerate() {
+                let tag = if k % 2 == 0 { 0x10 } else { 0x20 };
+                let d = dst.as_mut_ptr().add(k * BLOCK) as u64;
+                queue_enqueue_request(pq.q, request_ex(ZLIB_BIT, d, 0, BLOCK as u32, pq.file as u64, offset, size, 0, tag).as_ptr());
+            }
+            queue_submit(pq.q);
+            wait_until("every request read ahead", || pool::read_ahead(pq.lane()) == N);
+            queue_cancel(pq.q, 0xF0, 0x10);
+            let (offset, size) = at[N];
+            let d = dst.as_mut_ptr().add(N * BLOCK) as u64;
+            queue_enqueue_request(pq.q, request_ex(ZLIB_BIT, d, 0, BLOCK as u32, pq.file as u64, offset, size, 0, 0x10).as_ptr());
+            queue_enqueue_status(pq.q, pq.status, 0);
+            queue_submit(pq.q);
+            pool::hold(pq.lane(), false);
+            assert_eq!(pq.wait(0), S_OK);
+            for k in 0..=N {
+                let block = &dst[k * BLOCK..(k + 1) * BLOCK];
+                let runs = k == N || k % 2 == 1;
+                assert!(block.iter().all(|&b| b == if runs { 0x21 + k as u8 } else { 0 }), "block {k}");
+            }
+            assert_eq!(pq.errors().0, 0, "cancelled requests record no error");
+            assert!(queue(pq.q).cancels.lock().unwrap().is_empty(), "expired cancel rules are pruned at the turn");
+            pq.end();
+        }
+    }
+
+    /// Failures found while reading ahead (out of order) still reach the statuses and the error
+    /// record in queue order.
+    #[test]
+    fn read_ahead_failures_report_in_queue_order() {
+        unsafe {
+            let (file, at) = packed_blocks(1, 0x33);
+            let pq = PoolQueue::new(1, 64, 3, Some(&file), "errors");
+            pool::hold(pq.lane(), true);
+            let mut dst = vec![0u8; BLOCK];
+            let d = dst.as_mut_ptr() as u64;
+            let len = file.len() as u64;
+            queue_enqueue_request(pq.q, request(0, d, 16, pq.file as u64, len, 16).as_ptr());
+            queue_enqueue_status(pq.q, pq.status, 0);
+            queue_enqueue_request(pq.q, request(ZLIB_BIT, d, BLOCK as u32, pq.file as u64, at[0].0, at[0].1).as_ptr());
+            queue_enqueue_status(pq.q, pq.status, 1);
+            queue_enqueue_request(pq.q, request(ZLIB_BIT, d, BLOCK as u32, pq.file as u64, 2, at[0].1 - 2).as_ptr());
+            queue_enqueue_request(pq.q, request(0, d, 16, pq.file as u64, len, 16).as_ptr());
+            queue_enqueue_status(pq.q, pq.status, 2);
+            queue_submit(pq.q);
+            wait_until("every request read ahead", || pool::read_ahead(pq.lane()) == 4);
+            pool::hold(pq.lane(), false);
+            assert_eq!((pq.wait(0), pq.wait(1), pq.wait(2)), (E_END_OF_FILE, S_OK, E_ZLIB_DATA));
+            assert!(dst.iter().all(|&b| b == 0x33));
+            assert_eq!(pq.errors(), (3, E_END_OF_FILE), "the first failure in queue order");
+            pq.end();
+        }
+    }
+
+    /// A low queue submitted behind a long high burst finishes long before the burst does.
+    #[test]
+    fn a_high_burst_does_not_starve_a_low_queue() {
+        const BURST: u32 = 1500;
+        unsafe {
+            let data = vec![0x5Cu8; 64 << 10];
+            let high = PoolQueue::new(1, 4096, 1, Some(&data), "burst");
+            let low = PoolQueue::new(-1, 8, 1, Some(&data), "starve");
+            let mut sink = vec![0u8; data.len()];
+            let mut mine = vec![0u8; data.len()];
+            pool::hold(high.lane(), true);
+            for _ in 0..BURST {
+                queue_enqueue_request(high.q, request(0, sink.as_mut_ptr() as u64, data.len() as u32, high.file as u64, 0, data.len() as u32).as_ptr());
+            }
+            queue_enqueue_status(high.q, high.status, 0);
+            queue_submit(high.q);
+            queue_enqueue_request(low.q, request(0, mine.as_mut_ptr() as u64, data.len() as u32, low.file as u64, 0, data.len() as u32).as_ptr());
+            queue_enqueue_status(low.q, low.status, 0);
+            queue_submit(low.q);
+            pool::hold(high.lane(), false);
+            assert_eq!(low.wait(0), S_OK);
+            let left = pool::submitted(high.lane());
+            assert!(left > BURST as usize / 2, "the low queue waited for most of the burst: {left} of {BURST} high entries left");
+            assert_eq!(mine, data);
+            assert_eq!(high.wait(0), S_OK);
+            let stats = pool::stats();
+            assert!(stats.priorities["low"].done >= 2 && stats.priorities["high"].done > BURST as u64, "{stats:?}");
+            high.end();
+            low.end();
         }
     }
 }

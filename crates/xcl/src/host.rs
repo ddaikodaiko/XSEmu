@@ -52,6 +52,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
     crate::xlog_info!("XCL {} – host for '{}'", env!("CARGO_PKG_VERSION"), boot.title);
     crate::xlog_info!("game: {} (read-only folder: {})", boot.exe_path.display(), boot.game_root.display());
     crate::xlog_info!("XCL data: {}", boot.data_dir.display());
+    crate::gpu::pix_capture::load_before_d3d12();
 
     if std::env::var_os("XCL_UMA_MB").is_none() && boot.config.uma_mb != 0 {
         std::env::set_var("XCL_UMA_MB", boot.config.uma_mb.to_string());
@@ -76,15 +77,17 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 if tick % 15 == 0 {
                     let (live, idle, again) = crate::hle::d3d12x::pso_async::live();
                     crate::xlog_info!(
-                        "caches: {}; {}; pipelines live {live} (released unbound {idle}, built again {again}), commit {} MB; {}",
+                        "caches: {}; {}; pipelines live {live} (released unbound {idle}, built again {again}), commit {} MB; {}{}",
                         crate::gpu::recomp::dxc::stage_summary(),
                         crate::hle::d3d12x::real::driver_compiles_summary(),
                         crate::util::process_commit_bytes() >> 20,
-                        crate::hle::d3d12x::bind::indirect_calls()
+                        crate::hle::d3d12x::bind::indirect_calls(),
+                        crate::hle::d3d12x::real::pipeline_library_summary().map_or_else(String::new, |s| format!("; {s}"))
                     );
                     crate::xlog_info!("commit: {}", commit_breakdown());
                     note_resident_memory();
                     crate::xlog_info!("{}", crate::hle::d3d12x::bind::mesh_counts());
+                    crate::hle::d3d12x::bind::log_loop_profiles();
                 }
                 let now = snap();
                 let d: Vec<u64> = now.iter().zip(last).map(|(a, b)| a - b).collect();

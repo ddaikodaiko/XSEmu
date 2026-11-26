@@ -294,6 +294,10 @@ impl Texture {
         self.plane_surface(self.main as u32).map(|(s, _)| s)
     }
 
+    pub(crate) fn has_packed_volume_mips(&self) -> bool {
+        self.texels().is_some_and(|s| s.depth > 0 && s.chain.levels.len() > 1 && s.first_tail < s.chain.levels.len())
+    }
+
     /// byte offset of level `i` of the texels from the start of the resource's first slice
     pub fn mip_offset(&self, i: usize) -> u64 {
         self.plane_surface(self.main as u32).map_or(0, |(s, at)| at + s.mip_offset(i))

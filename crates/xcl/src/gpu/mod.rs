@@ -9,6 +9,8 @@ pub mod desc;
 pub mod dxbc;
 pub(crate) mod fence;
 pub mod pack;
+pub(crate) mod physical_binding;
+pub(crate) mod pix_capture;
 pub mod rdna2;
 pub mod recomp;
 mod rdna2_spec;

@@ -143,6 +143,168 @@ void main() {
 /// it is the only argument).
 static SIGNATURES: Mutex<Option<HashMap<usize, (u32, u32, bool)>>> = Mutex::new(None);
 
+const RECORD_LAYOUT_ID: windows::core::GUID = windows::core::GUID::from_u128(0xaf05f94d_19cf_4cc1_863d_55231cb0a7c6);
+const RECORD_ROOT_ID: windows::core::GUID = windows::core::GUID::from_u128(0x93669287_011b_47dc_a778_85fde225daaa);
+
+pub(super) unsafe fn store_record_layout(raw: *mut c_void, root: usize, stride: u32, arguments: &[[u32; 4]]) {
+    let Some(signature) = ID3D12CommandSignature::from_raw_borrowed(&raw) else {
+        return;
+    };
+    let mut words = Vec::with_capacity(1 + arguments.len() * 4);
+    words.push(stride);
+    words.extend_from_slice(arguments.as_flattened());
+    let _ = signature.SetPrivateData(&RECORD_LAYOUT_ID, (words.len() * 4) as u32, Some(words.as_ptr().cast()));
+    if let Some(rs) = ID3D12RootSignature::from_raw_borrowed(&(root as *mut c_void)) {
+        let _ = signature.SetPrivateDataInterface(&RECORD_ROOT_ID, rs);
+    }
+}
+
+unsafe fn record_arguments(signature: &ID3D12CommandSignature) -> Option<(u32, Vec<[u32; 4]>)> {
+    let mut words = [0u32; 257];
+    let mut len = std::mem::size_of_val(&words) as u32;
+    signature.GetPrivateData(&RECORD_LAYOUT_ID, &mut len, Some(words.as_mut_ptr().cast())).ok()?;
+    if len < 20 || len > 1028 || (len - 4) % 16 != 0 {
+        return None;
+    }
+    let (args, _) = words[1..len as usize / 4].as_chunks::<4>();
+    Some((words[0], args.to_vec()))
+}
+
+pub(crate) unsafe fn plain_action(signature: &ID3D12CommandSignature) -> Option<(u32, u32)> {
+    let (stride, args) = record_arguments(signature)?;
+    if args.len() != 1 || !matches!(args[0][0], 0..=2 | 10) {
+        return None;
+    }
+    super::list_x::native_buffer::recipes::Layout::parse(stride, &args).ok()?;
+    Some((args[0][0], stride))
+}
+
+pub(crate) struct IndirectRecipe {
+    pub(crate) signature: ID3D12CommandSignature,
+    pub(crate) layout: super::list_x::native_buffer::recipes::Layout,
+    pub(crate) max: u32,
+    pub(crate) arguments: super::list_x::native_buffer::Operand,
+    pub(crate) count: Option<super::list_x::native_buffer::Operand>,
+}
+
+impl IndirectRecipe {
+    pub(crate) unsafe fn translated_rows(
+        &self,
+        native_pso: usize,
+        guest_root: &ID3D12RootSignature,
+        base_args: &[u8],
+        io: &[u32; 128],
+    ) -> Option<super::list_x::native_buffer::translated::Rows> {
+        use windows::core::IUnknown;
+        let gfx = super::real::is_translated_graphics(native_pso);
+        if gfx == super::real::is_translated_compute(native_pso) || super::real::two_pass_of(native_pso).is_some() {
+            return None;
+        }
+        let layout = super::console_list::layout_of(guest_root.as_raw() as usize)?;
+        let (stride, args) = record_arguments(&self.signature)?;
+        if args.len() != 1 {
+            let (mut bytes, mut raw) = (std::mem::size_of::<usize>() as u32, std::ptr::null_mut::<c_void>());
+            self.signature
+                .GetPrivateData(&RECORD_ROOT_ID, &mut bytes, Some((&mut raw as *mut *mut c_void).cast()))
+                .ok()?;
+            if raw.is_null() {
+                return None;
+            }
+            let root = IUnknown::from_raw(raw);
+            if root.cast::<IUnknown>().ok()? != guest_root.cast::<IUnknown>().ok()? {
+                return None;
+            }
+        }
+        super::list_x::native_buffer::translated::Rows::prepare(stride, &args, &layout, gfx, super::real::pso_user_sgprs(native_pso), base_args, io)
+    }
+    pub(crate) fn prebuilt_reads(
+        &self,
+        locator: u32,
+        is_native: impl Fn(&super::list_x::native_buffer::Operand) -> bool,
+        fallback: impl FnMut(&super::list_x::native_buffer::Operand, u32) -> Option<super::list_x::native_buffer::FallbackPage>,
+    ) -> Option<IndirectReads> {
+        if self.layout.embeds_addresses() {
+            return None;
+        }
+        self.read_inputs(locator, is_native, fallback)
+    }
+
+    pub(crate) unsafe fn prebuilt_translated(
+        &self,
+        native_pso: usize,
+        root: &ID3D12RootSignature,
+        base_args: &[u8],
+        io: &[u32; 128],
+        is_native: impl Fn(&super::list_x::native_buffer::Operand) -> bool,
+        fallback: impl FnMut(&super::list_x::native_buffer::Operand, u32) -> Option<super::list_x::native_buffer::FallbackPage>,
+    ) -> Option<(super::list_x::native_buffer::translated::Rows, IndirectReads)> {
+        let generated = self.translated_rows(native_pso, root, base_args, io)?;
+        let inputs = self.read_inputs(io[crate::gpu::recomp::IO_PHYSICAL_TABLE], is_native, fallback)?;
+        Some((generated, inputs))
+    }
+
+    fn read_inputs(
+        &self,
+        locator: u32,
+        is_native: impl Fn(&super::list_x::native_buffer::Operand) -> bool,
+        mut fallback: impl FnMut(&super::list_x::native_buffer::Operand, u32) -> Option<super::list_x::native_buffer::FallbackPage>,
+    ) -> Option<IndirectReads> {
+        use super::list_x::native_buffer::{Copy, Operand};
+        let mut operand = |op: &Operand, bytes: u64| -> Option<IndirectInput> {
+            match op.guest_address {
+                Some(address) => {
+                    let d = unsafe { op.resource.GetDesc() };
+                    if d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || op.native_offset.checked_add(bytes)? > d.Width {
+                        return None;
+                    }
+                    if let Some((base, len)) = super::real::console_buffer(op.resource.as_raw() as usize) {
+                        if address.checked_sub(base as u64)?.checked_add(bytes)? > len as u64 { return None; }
+                    }
+                    Some(IndirectInput::Gather(Copy::read(address, bytes, locator, |page| fallback(op, page))?))
+                }
+                None if is_native(op) => {
+                    let end = op.native_offset.checked_add(bytes)?;
+                    let d = unsafe { op.resource.GetDesc() };
+                    if d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || end > d.Width {
+                        return None;
+                    }
+                    Some(IndirectInput::Native(op.resource.clone(), op.native_offset))
+                }
+                None => None,
+            }
+        };
+        Some(IndirectReads {
+            arguments: operand(&self.arguments, self.layout.active_bytes(self.max, None)? as u64)?,
+            count: match self.count.as_ref() {
+                Some(c) => Some(operand(c, 4)?),
+                None => None,
+            },
+        })
+    }
+    pub(crate) unsafe fn retain(sig: usize, max: u32, args: usize, args_off: u64, count: usize, count_off: u64) -> Option<Self> {
+        use super::list_x::native_buffer::Operand;
+        if args_off & 3 != 0 || (count != 0 && count_off & 3 != 0) {
+            return None;
+        }
+        let arguments = Operand::retain(args, args_off)?;
+        let count = if count == 0 { None } else { Some(Operand::retain(count, count_off)?) };
+        let signature = ID3D12CommandSignature::from_raw_borrowed(&(sig as *mut c_void))?.clone();
+        let (stride, records) = record_arguments(&signature)?;
+        let layout = super::list_x::native_buffer::recipes::Layout::parse(stride, &records).ok()?;
+        Some(Self { signature, layout, max, arguments, count })
+    }
+}
+
+pub(crate) enum IndirectInput {
+    Native(ID3D12Resource, u64),
+    Gather(super::list_x::native_buffer::Read),
+}
+
+pub(crate) struct IndirectReads {
+    pub(crate) arguments: IndirectInput,
+    pub(crate) count: Option<IndirectInput>,
+}
+
 pub(super) fn note_signature(sig: usize, last: u32, stride: u32, single: bool) {
     SIGNATURES.lock().unwrap().get_or_insert_with(HashMap::new).insert(sig, (last, stride, single));
 }
@@ -204,7 +366,7 @@ pub(super) fn calls_summary() -> String {
     format!("{} dispatch, {} draw, {} indexed draw, {} mesh, {} other", c[0], c[1], c[2], c[3], c[4])
 }
 
-fn signature(sig: usize) -> Option<(u32, u32, bool)> {
+pub(super) fn signature(sig: usize) -> Option<(u32, u32, bool)> {
     SIGNATURES.lock().unwrap().as_ref()?.get(&sig).copied()
 }
 
@@ -400,7 +562,7 @@ unsafe fn scratch_buffer() -> Option<(usize, u64)> {
     Some((res, ID3D12Resource::from_raw_borrowed(&p)?.GetGPUVirtualAddress()))
 }
 
-fn transition(res: usize, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
+pub(super) fn transition(res: usize, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
     let mut b = D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, ..Default::default() };
     b.Anonymous.Transition = std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
         pResource: unsafe { std::mem::transmute_copy(&res) },
@@ -425,7 +587,7 @@ pub(super) unsafe fn sanitise(this: usize, list: &ID3D12GraphicsCommandList, sig
         return None;
     }
     let bytes = stride as u64 * max as u64;
-    let raw_bytes = if capture { RAW_BYTES as u32 } else { 0 };
+    let raw_bytes = if capture { bytes.min(RAW_BYTES) as u32 } else { 0 };
     let two_pass = two_pass.filter(|_| kind == DISPATCH_MESH);
     let copies = if two_pass.is_some() { 2 } else { 1 };
     if copies * bytes + 4 + raw_bytes as u64 > SCRATCH_BYTES {
@@ -492,6 +654,7 @@ struct Captured {
     logged: bool,
     at: Option<(usize, u32, usize)>,
     writer_at: Option<(usize, u32, usize)>,
+    raw_bytes: u64,
 }
 
 static CAPTURED: Mutex<Vec<Captured>> = Mutex::new(Vec::new());
@@ -516,7 +679,7 @@ fn capture_buffer() -> Option<(usize, u64, usize)> {
 /// After an indirect call ran on `list` from the sanitised copy `safe` (`sanitise` with capture):
 /// its words copied on the GPU to a readback slot, logged with `what` once the copy has retired.
 /// None: not sanitised – logged at once, nothing to copy.
-pub(super) unsafe fn capture(list: &ID3D12GraphicsCommandList, safe: Option<(usize, u64, u64)>, what: String, at: Option<(usize, u32, usize)>, writer_at: Option<(usize, u32, usize)>) {
+pub(super) unsafe fn capture(list: &ID3D12GraphicsCommandList, safe: Option<(usize, u64, u64)>, what: String, at: Option<(usize, u32, usize)>, writer_at: Option<(usize, u32, usize)>, raw: bool) {
     let k = {
         let mut c = CAPTURED.lock().unwrap();
         if c.len() >= CAPTURES {
@@ -527,7 +690,8 @@ pub(super) unsafe fn capture(list: &ID3D12GraphicsCommandList, safe: Option<(usi
         if !copy {
             crate::xlog_warn!("D3D12.X: ExecuteIndirect capture {k}: {what}; not sanitised, so not copied");
         }
-        c.push(Captured { what, slot: copy.then_some(k), logged: !copy, at, writer_at });
+        let raw_bytes = if raw { safe.map_or(0, |(_, off, count_off)| (count_off - off).min(RAW_BYTES)) } else { 0 };
+        c.push(Captured { what, slot: copy.then_some(k), logged: !copy, at, writer_at, raw_bytes });
         if !copy {
             return;
         }
@@ -540,7 +704,7 @@ pub(super) unsafe fn capture(list: &ID3D12GraphicsCommandList, safe: Option<(usi
     let (Some(dst), Some(src)) = (ID3D12Resource::from_raw_borrowed(&cap), ID3D12Resource::from_raw_borrowed(&scratch)) else { return };
     list.ResourceBarrier(&[transition(res, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
     list.CopyBufferRegion(dst, at, src, off, records);
-    list.CopyBufferRegion(dst, at + RAW_BYTES, src, count_off, 4 + RAW_BYTES);
+    list.CopyBufferRegion(dst, at + RAW_BYTES, src, count_off, 4 + if raw { records } else { 0 });
     list.ResourceBarrier(&[transition(res, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT)]);
     let raw = list.as_raw();
     if let Some(l2) = ID3D12GraphicsCommandList2::from_raw_borrowed(&raw) {
@@ -573,15 +737,15 @@ pub(super) fn log_captures(all: bool) -> bool {
         e.logged = true;
         let (what, call) = (&e.what, e.call());
         if !done {
-            crate::xlog_error!("D3D12.X: ExecuteIndirect capture {k}: {what}; the call: {call}; its copy has not retired (the GPU never got past the call)");
+            crate::xlog_error!("D3D12.X: ExecuteIndirect capture {k}: {what}; the call: {call}; its copy did not retire (the list may not have been submitted)");
             continue;
         }
         let trim = |w: Vec<u32>| { let n = w.iter().rposition(|&x| x != 0).map_or(0, |i| i + 1); format!("{:x?}{}", &w[..n], if n < w.len() { " (zeros after)" } else { "" }) };
         crate::xlog_info!(
-            "D3D12.X: ExecuteIndirect capture {k}: {what}; the call: {call}; ran with records {} and count {}; the title's words {}",
+            "D3D12.X: ExecuteIndirect capture {k}: {what}; the call: {call}; sanitised records {} and count {}; the title's words {}",
             trim(words(0, RAW_BYTES / 4)),
             words(RAW_BYTES, 1)[0],
-            trim(words(RAW_BYTES + 4, RAW_BYTES / 4))
+            if e.raw_bytes != 0 { format!("{:x?}", words(RAW_BYTES + 4, e.raw_bytes / 4)) } else { "not captured".into() }
         );
     }
     c.len() >= CAPTURES && c.iter().all(|e| e.logged)

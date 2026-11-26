@@ -18,9 +18,13 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 
+use windows::Win32::Graphics::Direct3D12::D3D12_COMMAND_LIST_TYPE_BUNDLE;
 use windows_sys::core::GUID;
 
 use crate::util::HRESULT;
+
+#[path = "native_buffer/bundle.rs"]
+mod bundle;
 
 const LIST_SLOTS: usize = 600;
 const NEWER_RESET_SLOT: usize = 139;
@@ -78,6 +82,41 @@ fn vtable() -> usize {
     .0
 }
 
+static BUNDLE_VTABLE: OnceLock<Vtable> = OnceLock::new();
+
+/// The vtable of a BUNDLE's console object (`bundle`): the slots with a recipe command log and
+/// run their canonical method; queries and names (#3–#8) are forwarded; every other slot marks
+/// the recording incomplete and is forwarded.
+fn bundle_vtable() -> usize {
+    BUNDLE_VTABLE
+        .get_or_init(|| {
+            let mut v: Vec<usize> = (0..LIST_SLOTS).map(|slot| if (3..=8).contains(&slot) { forward(slot) } else { uncovered(slot) }).collect();
+            for (slot, f) in bundle::slots() {
+                v[slot] = f;
+            }
+            v[0] = qi as usize;
+            v[1] = add_ref as usize;
+            v[2] = release as usize;
+            v[9] = close as usize;
+            v[10] = reset as usize;
+            let older = v[NEWER_RESET_SLOT];
+            v[NEWER_RESET_SLOT] = super::guard::make_layout_switch(older, reset_with_flags as usize, &super::real::QUEUE_SHIFTED);
+            Vtable(Box::leak(v.into_boxed_slice()).as_ptr() as usize)
+        })
+        .0
+}
+
+fn is_bundle(o: *mut c_void) -> bool {
+    BUNDLE_VTABLE.get().is_some_and(|v| unsafe { *(o as *const usize) } == v.0)
+}
+
+/// `forward` after `bundle::uncovered(this, slot)`
+fn uncovered(slot: usize) -> usize {
+    let mut args = vec![0xBA];
+    args.extend_from_slice(&(slot as u32).to_le_bytes());
+    super::guard::call_preserving_arguments(&args, bundle::uncovered as usize, &forward_code(slot))
+}
+
 /// `mov rcx, [rcx + F_BACKING]; mov rax, [rcx]; jmp [rax + slot * 8]`
 fn forward_code(slot: usize) -> Vec<u8> {
     let mut c = vec![0x48, 0x8B, 0x89];
@@ -117,6 +156,9 @@ unsafe extern "system" fn close(this: *mut c_void) -> HRESULT {
     super::gpu_timing::before_close(pc);
     let f: unsafe extern "system" fn(*mut c_void) -> HRESULT = std::mem::transmute(pc_slot(pc, 9));
     let hr = f(pc);
+    if hr >= 0 && is_bundle(this) {
+        bundle::closed(*((this as usize + F_PRIMARY) as *const *mut c_void));
+    }
     let n = *((this as usize + F_RING_AT) as *const usize);
     if hr < 0 && n > 0 {
         let first = n.saturating_sub(RING);
@@ -145,12 +187,16 @@ unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso: usize) -> 
         let f: unsafe extern "system" fn(*mut c_void, usize, usize) -> HRESULT = std::mem::transmute(pc_slot(primary, 10));
         let hr = f(primary, alloc, pso);
         if hr >= 0 {
+            super::physical_directory::recordings::ended(primary as usize);
             super::gpu_timing::opened(primary, pso);
         }
         hr
     };
     if hr >= 0 {
         *((this as usize + F_BACKING) as *mut usize) = primary as usize;
+        if is_bundle(this) {
+            bundle::begin(primary as usize, pso);
+        }
         let moved = {
             let mut sg = SEGMENTS.lock().unwrap();
             sg.as_mut()
@@ -195,7 +241,8 @@ pub unsafe fn wrap(pc: *mut c_void) -> *mut c_void {
     if o.is_null() {
         return pc;
     }
-    *(o as *mut usize) = vtable();
+    let is_bundle = super::list_x::tracked_list_type(pc) == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE);
+    *(o as *mut usize) = if is_bundle { bundle_vtable() } else { vtable() };
     let room = o as usize + ROOM;
     for f in [F_WRITE, F_DISPATCH_END, F_END] {
         *(o.add(f) as *mut usize) = room;
@@ -203,6 +250,9 @@ pub unsafe fn wrap(pc: *mut c_void) -> *mut c_void {
     *(o.add(F_PRIMARY) as *mut usize) = pc as usize;
     *(o.add(F_BACKING) as *mut usize) = pc as usize;
     WRAPPER_OF.lock().unwrap().get_or_insert_with(HashMap::new).insert(pc as usize, o as usize);
+    if is_bundle {
+        bundle::begin(pc as usize, super::list_x::draw_gate_pso(pc));
+    }
     o as *mut c_void
 }
 
@@ -211,7 +261,7 @@ pub fn backing(list: *mut c_void) -> Option<*mut c_void> {
     if list.is_null() || !crate::gpu::shader::readable(list as usize, 8) {
         return None;
     }
-    unsafe { (*(list as *const usize) == vtable()).then(|| *((list as usize + F_PRIMARY) as *const *mut c_void)) }
+    unsafe { (*(list as *const usize) == vtable() || is_bundle(list)).then(|| *((list as usize + F_PRIMARY) as *const *mut c_void)) }
 }
 
 /// Expand a console list object into all of its recorded PC command list segments (in exact
@@ -335,6 +385,9 @@ unsafe extern "system" fn qi(this: *mut c_void, riid: *const GUID, ppv: *mut *mu
     if hr >= 0 && !ppv.is_null() && *ppv == pc {
         *ppv = this;
     }
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() && *ppv != this && is_bundle(this) {
+        bundle::taint(pc as usize);
+    }
     hr
 }
 
@@ -351,7 +404,7 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
     let pc = *((this as usize + F_PRIMARY) as *const *mut c_void);
     let timing = super::gpu_timing::list_token(pc);
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(pc, 2));
-    let n = f(pc);
+    let n = super::physical_directory::recordings::release(pc as usize, || f(pc));
     if n == 0 {
         super::gpu_timing::list_released(timing);
         let book = SEGMENTS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
@@ -372,12 +425,13 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
                 super::bind::forget(raw);
                 let timing = super::gpu_timing::list_token(raw);
                 let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(raw, 2));
-                if rel(raw) == 0 {
+                if super::physical_directory::recordings::release(raw as usize, || rel(raw)) == 0 {
                     super::gpu_timing::list_released(timing);
                 }
             }
         }
         super::bind::forget(pc);
+        bundle::forget(pc as usize);
         std::alloc::dealloc(this as *mut u8, std::alloc::Layout::from_size_align(OBJECT_BYTES, 64).unwrap());
     }
     n

@@ -1241,9 +1241,14 @@ impl<'a> Parser<'a> {
                 self.bump();
                 let inner = self.lx.tok;
                 match inner.kind {
-                    Tok::TyNum => {
-                        self.bump();
-                        let ty = self.num_type(inner.aux);
+                    Tok::TyNum | Tok::KwVector | Tok::KwMatrix => {
+                        // `vector<T, n>` and `matrix<T, r, c>` are the numeric types `Tn` and `Trxc`
+                        let ty = if inner.kind == Tok::TyNum {
+                            self.bump();
+                            self.num_type(inner.aux)
+                        } else {
+                            self.type_spec()?
+                        };
                         match self.lx.tok.kind {
                             Tok::RParen => {
                                 self.bump();
@@ -1277,7 +1282,7 @@ impl<'a> Parser<'a> {
                         self.grow(self.height + 1)?;
                         Ok(self.push(Expr::Cast(ty, e)))
                     }
-                    Tok::TyRes | Tok::TySampler | Tok::TyStream | Tok::TyPatch | Tok::KwVector | Tok::KwMatrix | Tok::KwVoid => {
+                    Tok::TyRes | Tok::TySampler | Tok::TyStream | Tok::TyPatch | Tok::KwVoid => {
                         let what = format!("cast to {}", self.u.syms.name(Sym(inner.val as u32)));
                         Err(self.unsupported(what))
                     }
@@ -1288,12 +1293,16 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
-            Tok::TyNum => {
-                self.bump();
+            Tok::TyNum | Tok::KwVector | Tok::KwMatrix => {
+                let ty = if t.kind == Tok::TyNum {
+                    self.bump();
+                    self.num_type(t.aux)
+                } else {
+                    self.type_spec()?
+                };
                 if self.lx.tok.kind != Tok::LParen {
                     return Err(self.unexpected("'(' after a type in an expression"));
                 }
-                let ty = self.num_type(t.aux);
                 let args = self.args()?;
                 self.grow(self.height + 1)?;
                 Ok(self.push(Expr::Construct(ty, args)))
@@ -1310,7 +1319,7 @@ impl<'a> Parser<'a> {
             }
             Tok::Str => Err(self.unsupported("string literal in an expression".into())),
             Tok::LBrace => Err(self.source("initialiser list outside an initialiser".into())),
-            Tok::KwVector | Tok::KwMatrix | Tok::TyRes | Tok::TySampler | Tok::TyStream | Tok::TyPatch => {
+            Tok::TyRes | Tok::TySampler | Tok::TyStream | Tok::TyPatch => {
                 let what = format!("{} in an expression", self.u.syms.name(Sym(t.val as u32)));
                 Err(self.unsupported(what))
             }

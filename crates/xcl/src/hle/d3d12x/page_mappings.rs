@@ -29,6 +29,125 @@ use std::sync::Mutex;
 
 use crate::util::{E_INVALIDARG, HRESULT, S_OK};
 
+pub(super) mod queue;
+use super::physical_directory::{self, Change, Mapping, Plane};
+
+/// Paths where the GPU directory keeps what it had before (an entry inherits the canonical
+/// view, or a version or reader is not ordered) while the guest call goes on as before.
+#[derive(Clone, Copy)]
+pub(super) enum Fallback {
+    GuestRange,
+    Unbindable,
+    SourceRefused,
+    Hole,
+    SelfMapped,
+    Unencodable,
+    PrepareFailed,
+    Unordered,
+    PublishFailed,
+    UnroutedReader,
+    LaneMissing,
+}
+
+const FALLBACKS: [&str; 11] = [
+    "map entry inherits: pool slot shows guest memory with no owned physical identity",
+    "map entry inherits: physical page cannot be bound in the directory",
+    "map entry inherits: pool slot source refused by the physical owner",
+    "map entry inherits: pool slot shows no physical page",
+    "map entry inherits: pool slot mapped onto itself",
+    "map entry skipped: GPU address outside the 48-bit directory",
+    "map version dropped: cannot be prepared",
+    "map version dropped: queue not ordered",
+    "map version dropped: native queue refused it",
+    "reader submitted directly",
+    "queue has no ordering lane",
+];
+static FALLBACK_N: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+
+pub(super) fn fallback(class: Fallback, reason: &str) {
+    let n = FALLBACK_N[class as usize].fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        crate::xlog_warn!("D3D12.X: physical directory: {} ({reason}); {n} so far", FALLBACKS[class as usize]);
+    }
+}
+
+/// The queue-ordered GPU directory version of one CopyPageMappingsBatchX, published on the
+/// title's queue after the canonical CPU views were made.
+pub(super) struct Update {
+    version: physical_directory::PreparedVersion,
+}
+
+impl Update {
+    /// None while the directory is inactive, the batch maps nothing, or it cannot be prepared.
+    fn prepare(maps: &[(usize, Option<usize>)]) -> Option<Self> {
+        use crate::hle::kernelx::{snapshot_queue_sources, QueuePageSource};
+        if maps.is_empty() || physical_directory::current_topology().is_none() {
+            return None;
+        }
+        let mut slots = Vec::new();
+        let mut index = HashMap::new();
+        for &(at, slot) in maps {
+            if let Some(slot) = slot.filter(|&s| s != at) {
+                index.entry(slot).or_insert_with(|| {
+                    slots.push(slot);
+                    slots.len() - 1
+                });
+            }
+        }
+        let sources: Vec<Result<QueuePageSource, &'static str>> = match snapshot_queue_sources(&slots) {
+            Ok(all) => all.into_iter().map(Ok).collect(),
+            Err(_) => slots.iter().map(|&s| snapshot_queue_sources(&[s]).map(|mut v| v.remove(0))).collect(),
+        };
+        let targets: Vec<Mapping> = sources
+            .into_iter()
+            .map(|source| match source {
+                Ok(QueuePageSource::Physical(p)) => physical_directory::bind(&p).map_or_else(
+                    |reason| {
+                        fallback(Fallback::Unbindable, reason);
+                        Mapping::Inherit
+                    },
+                    Mapping::Page,
+                ),
+                Ok(QueuePageSource::Hole) => {
+                    fallback(Fallback::Hole, "canonical copied view of the slot");
+                    Mapping::Inherit
+                }
+                Ok(QueuePageSource::GuestRange { .. }) => {
+                    fallback(Fallback::GuestRange, "awaiting owned backing");
+                    Mapping::Inherit
+                }
+                Err(reason) => {
+                    fallback(Fallback::SourceRefused, reason);
+                    Mapping::Inherit
+                }
+            })
+            .collect();
+        let mut changes = Vec::with_capacity(maps.len());
+        for &(at, slot) in maps {
+            if at >> 48 != 0 {
+                fallback(Fallback::Unencodable, "not encodable");
+                continue;
+            }
+            let target = match slot {
+                None => Mapping::Unmapped,
+                Some(s) if s == at => {
+                    fallback(Fallback::SelfMapped, "no separate source");
+                    Mapping::Inherit
+                }
+                Some(s) => targets[index[&s]].clone(),
+            };
+            changes.push(Change { guest: at as u64, plane: Plane::Gpu, target });
+        }
+        match physical_directory::prepare_version(changes) {
+            Ok(version) => Some(Self { version }),
+            Err(reason) => {
+                fallback(Fallback::PrepareFailed, reason);
+                None
+            }
+        }
+    }
+}
+
 const PAGE: usize = 0x1_0000;
 
 #[repr(C)]
@@ -182,7 +301,7 @@ impl Gpu {
 
 /// CopyPageMappingsBatchX(count, batches, pool, pool pages, flags); the flags (a fifth argument
 /// on the stack) only order the mapping against other queue work, which has all been submitted.
-pub(super) unsafe fn copy_batch(count: u32, batches: *const Batch, pool: usize, pool_pages: u32) -> HRESULT {
+pub(super) unsafe fn copy_batch(queue: *mut std::ffi::c_void, count: u32, batches: *const Batch, pool: usize, pool_pages: u32) -> HRESULT {
     if count > 0 && batches.is_null() {
         return E_INVALIDARG;
     }
@@ -218,6 +337,7 @@ pub(super) unsafe fn copy_batch(count: u32, batches: *const Batch, pool: usize, 
     }
     static FIRST: std::sync::Once = std::sync::Once::new();
     FIRST.call_once(|| crate::xlog_info!("D3D12.X: queue CopyPageMappingsBatchX: {count} batches, pool {pool:#x} ({pool_pages} pages), first {} page mappings", maps.len()));
+    let snapshot = maps.clone();
     let mut failed = 0;
     let (mut viewed, mut copied) = (0usize, 0usize);
     crate::hle::kernelx::hold_physical_pages(|held| {
@@ -266,6 +386,12 @@ pub(super) unsafe fn copy_batch(count: u32, batches: *const Batch, pool: usize, 
     if copied > 0 {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| crate::xlog_info!("D3D12.X: CopyPageMappingsBatchX: {copied} GPU view pages are copies ({viewed} views of the page itself in this batch): their address cannot hold a view or the pool slot shows no physical page"));
+    }
+    // after the canonical effects: a pool page whose data was in its copy is in its section now
+    // that a GPU address shows it (`map_at`), and the directory names that section
+    let directory = Update::prepare(&snapshot);
+    if let Some(update) = directory {
+        queue::publish(queue, update);
     }
     S_OK
 }
@@ -518,3 +644,5 @@ pub(super) unsafe fn after_look(dirty: &mut Vec<usize>, watched: &[(usize, usize
         );
     }
 }
+
+#[cfg(test)] mod queue_order_test;

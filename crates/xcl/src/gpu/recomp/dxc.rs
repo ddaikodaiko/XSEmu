@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use windows::core::{Interface, GUID, HRESULT, PCWSTR};
-use windows::Win32::Graphics::Direct3D::Dxc::{DxcBuffer, IDxcBlob, IDxcCompiler3, IDxcResult, CLSID_DxcCompiler, DXC_CP_UTF8};
+use windows::Win32::Graphics::Direct3D::Dxc::{DxcBuffer, IDxcBlob, IDxcCompiler3, IDxcResult, IDxcUtils, IDxcValidator, CLSID_DxcCompiler, CLSID_DxcUtils, CLSID_DxcValidator, DXC_CP_ACP, DXC_CP_UTF8};
 
 type CreateInstance = unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut c_void) -> HRESULT;
 
@@ -310,7 +310,8 @@ fn load() -> Result<&'static (PathBuf, usize), String> {
                     let mut t = Toolchain { dir: dir.display().to_string(), ..Default::default() };
                     t.dxcompiler = library(std::mem::transmute::<usize, CreateInstance>(f as usize), &CLSID_DxcCompiler, &dxc);
                     if let Some(g) = if signer.is_null() { None } else { GetProcAddress(signer, b"DxcCreateInstance\0".as_ptr()) } {
-                        t.dxil = library(std::mem::transmute::<usize, CreateInstance>(g as usize), &windows::Win32::Graphics::Direct3D::Dxc::CLSID_DxcValidator, &dxil);
+                        t.dxil = library(std::mem::transmute::<usize, CreateInstance>(g as usize), &CLSID_DxcValidator, &dxil);
+                        let _ = VALIDATOR_CREATE.set(g as usize);
                     }
                     let signer = if signer.is_null() { "no dxil.dll".to_string() } else { format!("dxil {}", t.dxil) };
                     crate::xlog_info!("DXC: dxcompiler {}, {signer}, from {}", t.dxcompiler, t.dir);
@@ -338,8 +339,61 @@ fn create_fn() -> Result<CreateInstance, String> {
     Ok(unsafe { std::mem::transmute::<usize, CreateInstance>(f) })
 }
 
+/// The DxcCreateInstance of the dxil.dll that was loaded beside dxcompiler.dll, when there is one.
+static VALIDATOR_CREATE: OnceLock<usize> = OnceLock::new();
+
 thread_local! {
     static COMPILER: RefCell<Option<IDxcCompiler3>> = const { RefCell::new(None) };
+    static VALIDATOR: RefCell<Option<(IDxcValidator, IDxcUtils)>> = const { RefCell::new(None) };
+}
+
+fn validator() -> Result<(IDxcValidator, IDxcUtils), String> {
+    VALIDATOR.with(|v| {
+        if let Some(x) = v.borrow().as_ref() {
+            return Ok(x.clone());
+        }
+        let utils_create = create_fn()?;
+        let validator_create = *VALIDATOR_CREATE.get().ok_or("no dxil.dll beside dxcompiler.dll to validate with")?;
+        let validator_create = unsafe { std::mem::transmute::<usize, CreateInstance>(validator_create) };
+        let (mut pv, mut pu) = (std::ptr::null_mut(), std::ptr::null_mut());
+        let hr = unsafe { validator_create(&CLSID_DxcValidator, &IDxcValidator::IID, &mut pv) };
+        if hr.is_err() || pv.is_null() {
+            return Err(format!("dxil.dll DxcCreateInstance: {hr:?}"));
+        }
+        let validator = unsafe { IDxcValidator::from_raw(pv) };
+        let hr = unsafe { utils_create(&CLSID_DxcUtils, &IDxcUtils::IID, &mut pu) };
+        if hr.is_err() || pu.is_null() {
+            return Err(format!("DxcCreateInstance(DxcUtils): {hr:?}"));
+        }
+        let x = (validator, unsafe { IDxcUtils::from_raw(pu) });
+        *v.borrow_mut() = Some(x.clone());
+        Ok(x)
+    })
+}
+
+/// What dxil.dll's validator says of a container: what DXC runs on every container it makes,
+/// here run on the direct backend's before anything uses them.
+fn validate(dxil: &[u8]) -> Result<(), String> {
+    let (validator, utils) = validator()?;
+    let size = u32::try_from(dxil.len()).map_err(|_| "container larger than 4 GiB".to_string())?;
+    unsafe {
+        let blob = utils.CreateBlobFromPinned(dxil.as_ptr() as *const c_void, size, DXC_CP_ACP).map_err(|e| format!("CreateBlobFromPinned: {e}"))?;
+        let blob: IDxcBlob = blob.cast().map_err(|e| format!("{e}"))?;
+        let r = validator.Validate(&blob, 0).map_err(|e| format!("Validate: {e}"))?;
+        let status = r.GetStatus().map_err(|e| format!("{e}"))?;
+        if status.is_ok() {
+            return Ok(());
+        }
+        let msg = r
+            .GetErrorBuffer()
+            .ok()
+            .map(|b| {
+                let s = std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize());
+                String::from_utf8_lossy(s).trim_end_matches('\0').trim().to_string()
+            })
+            .unwrap_or_default();
+        Err(if msg.is_empty() { format!("{status:?}") } else { msg })
+    }
 }
 
 fn compiler() -> Result<IDxcCompiler3, String> {
@@ -369,10 +423,6 @@ struct Job {
     entry: String,
     profile: String,
     extra: Vec<String>,
-    /// what the caller calls the program (`for_program`), for the log
-    program: Option<String>,
-    /// DXC whatever the backend is (`compile_dxc_only`)
-    dxc_only: bool,
     reply: std::sync::mpsc::Sender<Result<Vec<u8>, String>>,
 }
 
@@ -532,7 +582,7 @@ fn pool() -> bool {
                 let job = next_job();
                 let _slot = wait_for_memory();
                 let extra: Vec<&str> = job.extra.iter().map(|s| s.as_str()).collect();
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_here(&job.src, &job.entry, &job.profile, &extra, job.program.as_deref(), job.dxc_only)))
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_with_dxc(&job.src, &job.entry, &job.profile, &extra)))
                     .unwrap_or_else(|_| Err("DXC: panic in the compile thread".into()));
                 let _ = job.reply.send(r);
             }).is_ok();
@@ -571,10 +621,39 @@ pub fn compile_dxc_only(src: &str, entry: &str, profile: &str) -> Result<Vec<u8>
     Ok(dxil)
 }
 
+/// The direct backend first, on the caller's thread (it takes milliseconds to a second, and
+/// in the DXC queue it waited behind DXC's minutes-long compiles), then DXC on its workers for
+/// what the direct backend did not make. DXC arguments (an optimisation level, a define) ask
+/// for DXC itself, and so does `dxc_only`.
 fn submit(src: &str, entry: &str, profile: &str, extra: &[&str], dxc_only: bool) -> Result<Vec<u8>, String> {
+    if backend() != Backend::Dxc && extra.is_empty() && !dxc_only {
+        let direct = {
+            let _slot = wait_for_memory();
+            std::thread::scope(|s| match std::thread::Builder::new().name("xcl-dxil".into()).stack_size(DXC_STACK).spawn_scoped(s, || compile_direct(src, entry, profile)) {
+                Ok(t) => t.join().unwrap_or_else(|_| Err("error: panic in the backend thread".into())),
+                Err(e) => Err(format!("error: no thread for the backend ({e})")),
+            })
+        };
+        match direct {
+            Ok(dxil) => return Ok(dxil),
+            Err(why) if backend() == Backend::DirectOnly => return Err(format!("xcl-dxil: {why}")),
+            Err(why) => {
+                let c = direct_counts();
+                // every fallback is logged: a warm-up's log is the proof of what the backend covers
+                let program = PROGRAM.with(|p| p.borrow().clone()).map_or(String::new(), |p| format!(" of {p}"));
+                crate::xlog_warn!(
+                    "[SHADER] direct DXIL backend: {why}; DXC compiles this {profile} program{program} (fallback {}: {} unsupported, {} failed, {} invalid; {} direct)",
+                    c.fallbacks(),
+                    c.unsupported,
+                    c.failed,
+                    c.invalid,
+                    c.compiled
+                );
+            }
+        }
+    }
     let (reply, rx) = std::sync::mpsc::channel();
-    let program = PROGRAM.with(|p| p.borrow().clone());
-    let job = Job { src: src.into(), entry: entry.into(), profile: profile.into(), extra: extra.iter().map(|s| s.to_string()).collect(), program, dxc_only, reply };
+    let job = Job { src: src.into(), entry: entry.into(), profile: profile.into(), extra: extra.iter().map(|s| s.to_string()).collect(), reply };
     if !pool() {
         return Err("DXC: no compile threads".to_string());
     }
@@ -634,10 +713,11 @@ const STRICT: &str = "-Gis";
 /// translated programs.
 const NO_LOC: &str = "-fdisable-loc-tracking";
 
-/// Which compiler turns translated HLSL into DXIL: `XCL_SHADER_BACKEND=hlsl` (the default) is DXC;
-/// `dxil` is the direct backend (`xcl_dxil`: linear time, no DXC), with DXC compiling what that
-/// backend does not support or fails on; `dxil-only` (tests) has no fallback, so a run shows
-/// what the direct backend alone does.
+/// Which compiler turns translated HLSL into DXIL. `XCL_SHADER_BACKEND=dxil` (the default) is
+/// the direct backend (`xcl_dxil`: linear time, no DXC): dxil.dll validates each container it
+/// makes before anything uses it, and DXC compiles what the backend does not support, fails on or
+/// makes invalid, each such program logged and counted. `hlsl` is DXC for every program;
+/// `dxil-only` (tests) has no fallback, so a run shows what the direct backend alone does.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Backend {
     Dxc,
@@ -648,41 +728,61 @@ enum Backend {
 fn backend() -> Backend {
     static B: OnceLock<Backend> = OnceLock::new();
     *B.get_or_init(|| match std::env::var("XCL_SHADER_BACKEND").unwrap_or_default().trim() {
-        "dxil" => Backend::Direct,
+        "" | "dxil" => Backend::Direct,
         "dxil-only" => Backend::DirectOnly,
-        "" | "hlsl" => Backend::Dxc,
+        "hlsl" => Backend::Dxc,
         other => {
-            crate::xlog_warn!("XCL_SHADER_BACKEND={other:?} is not hlsl or dxil: using hlsl");
-            Backend::Dxc
+            crate::xlog_warn!("XCL_SHADER_BACKEND={other:?} is not dxil, hlsl or dxil-only: using dxil");
+            Backend::Direct
         }
     })
 }
 
-static DIRECT: [std::sync::atomic::AtomicUsize; 3] = [const { std::sync::atomic::AtomicUsize::new(0) }; 3];
-
-/// Programs the direct DXIL backend compiled, left to DXC as unsupported, and left to DXC after
-/// an error or a panic, in this process.
-pub fn direct_counts() -> (usize, usize, usize) {
-    let n = |k: usize| DIRECT[k].load(Ordering::Relaxed);
-    (n(0), n(1), n(2))
+/// What the direct DXIL backend did with the programs of this process.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DirectCounts {
+    /// compiled, and dxil.dll found the container valid
+    pub compiled: usize,
+    /// a construct the backend does not handle: DXC compiled it
+    pub unsupported: usize,
+    /// an error or a panic in the backend: DXC compiled it
+    pub failed: usize,
+    /// dxil.dll rejected the container, or could not be asked: DXC compiled it
+    pub invalid: usize,
 }
 
-/// The direct backend on one program: its container, or why DXC has to compile it (a panic in
-/// the backend is an error like any other). `XCL_DXIL_BACKEND_LOG=<file>`: one line per program
-/// (FNV-1a 64 of the source, profile, outcome, seconds, source bytes).
+impl DirectCounts {
+    pub fn fallbacks(&self) -> usize {
+        self.unsupported + self.failed + self.invalid
+    }
+}
+
+static DIRECT: [std::sync::atomic::AtomicUsize; 4] = [const { std::sync::atomic::AtomicUsize::new(0) }; 4];
+
+pub fn direct_counts() -> DirectCounts {
+    let n = |k: usize| DIRECT[k].load(Ordering::Relaxed);
+    DirectCounts { compiled: n(0), unsupported: n(1), failed: n(2), invalid: n(3) }
+}
+
+/// The direct backend on one program: its validated container, or why DXC has to compile it (a
+/// panic in the backend is an error like any other). A container dxil.dll does not pass is never
+/// returned. `XCL_DXIL_BACKEND_LOG=<file>`: one line per program (FNV-1a 64 of the source,
+/// profile, outcome, seconds compiling, source bytes, seconds validating).
 fn compile_direct(src: &str, entry: &str, profile: &str) -> Result<Vec<u8>, String> {
     let t0 = std::time::Instant::now();
-    let r = std::panic::catch_unwind(|| xcl_dxil::compile(src, entry, profile));
+    let compiled = std::panic::catch_unwind(|| xcl_dxil::compile(src, entry, profile));
     let secs = t0.elapsed().as_secs_f64();
-    let (slot, outcome) = match &r {
-        Ok(Ok(_)) => (0, "direct".to_string()),
-        Ok(Err(xcl_dxil::Error::Unsupported(what))) => (1, format!("unsupported: {what}")),
-        Ok(Err(e)) => (2, format!("error: {e}")),
-        Err(_) => (2, "error: panic in the backend".to_string()),
+    let t1 = std::time::Instant::now();
+    let r = match compiled {
+        Ok(Ok(dxil)) => validate(&dxil).map(|()| dxil).map_err(|e| (3, format!("invalid: {e}"))),
+        Ok(Err(xcl_dxil::Error::Unsupported(what))) => Err((1, format!("unsupported: {what}"))),
+        Ok(Err(e)) => Err((2, format!("error: {e}"))),
+        Err(_) => Err((2, "error: panic in the backend".to_string())),
     };
-    DIRECT[slot].fetch_add(1, Ordering::Relaxed);
-    if slot == 0 && std::env::var_os("XCL_DXIL_BACKEND_LOG").is_none() {
-        return r.ok().and_then(Result::ok).ok_or(outcome);
+    let validate_secs = t1.elapsed().as_secs_f64();
+    DIRECT[r.as_ref().map_or_else(|(slot, _)| *slot, |_| 0)].fetch_add(1, Ordering::Relaxed);
+    if r.is_ok() && std::env::var_os("XCL_DXIL_BACKEND_LOG").is_none() {
+        return r.map_err(|(_, why)| why);
     }
     // what names the program here is its HLSL: the hash the fallback warning and the log carry
     let mut h = 0xcbf2_9ce4_8422_2325u64;
@@ -690,34 +790,14 @@ fn compile_direct(src: &str, entry: &str, profile: &str) -> Result<Vec<u8>, Stri
         h ^= b as u64;
         h = h.wrapping_mul(0x100_0000_01b3);
     }
+    let outcome = r.as_ref().map_or_else(|(_, why)| why.as_str(), |_| "direct");
     if let Some(log) = std::env::var_os("XCL_DXIL_BACKEND_LOG") {
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
-            let _ = f.write_all(format!("{h:016x}\t{profile}\t{}\t{secs:.4}\t{}\n", outcome.replace(['\n', '\t'], " "), src.len()).as_bytes());
+            let _ = f.write_all(format!("{h:016x}\t{profile}\t{}\t{secs:.4}\t{}\t{validate_secs:.4}\n", outcome.replace(['\n', '\t'], " "), src.len()).as_bytes());
         }
     }
-    match r {
-        Ok(Ok(dxil)) => Ok(dxil),
-        _ => Err(format!("{outcome} (HLSL {h:016x}, {} bytes)", src.len())),
-    }
-}
-
-fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str], program: Option<&str>, dxc_only: bool) -> Result<Vec<u8>, String> {
-    // DXC arguments (an optimisation level, a define) ask for DXC itself
-    if backend() != Backend::Dxc && extra.is_empty() && !dxc_only {
-        match compile_direct(src, entry, profile) {
-            Ok(dxil) => return Ok(dxil),
-            Err(why) if backend() == Backend::DirectOnly => return Err(format!("xcl-dxil: {why}")),
-            Err(why) => {
-                let (direct, unsupported, failed) = direct_counts();
-                let n = unsupported + failed;
-                // every fallback is logged: a warm-up's log is the proof of what the backend covers
-                let program = program.map_or(String::new(), |p| format!(" of {p}"));
-                crate::xlog_warn!("[SHADER] direct DXIL backend: {why}; DXC compiles this {profile} program{program} (fallback {n}: {unsupported} unsupported, {failed} failed; {direct} direct)");
-            }
-        }
-    }
-    compile_with_dxc(src, entry, profile, extra)
+    r.map_err(|(_, why)| format!("{} (HLSL {h:016x}, {} bytes)", why.lines().next().unwrap_or_default(), src.len()))
 }
 
 fn compile_with_dxc(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
@@ -752,8 +832,9 @@ pub(super) fn toolchain_identity() -> &'static str {
     static IDENTITY: OnceLock<String> = OnceLock::new();
     IDENTITY.get_or_init(|| {
         // DXIL of the direct backend and of DXC never share a cache entry, nor do two builds of
-        // the direct backend (its id is a hash of its sources)
-        let direct = if backend() == Backend::Dxc { String::new() } else { format!("xcl-dxil {}", xcl_dxil::BUILD_ID) };
+        // the direct backend (its id is a hash of its sources), nor its validated containers and
+        // those of builds that did not validate them
+        let direct = if backend() == Backend::Dxc { String::new() } else { format!("xcl-dxil {} validated", xcl_dxil::BUILD_ID) };
         let Ok(dir) = location() else {
             return format!("unavailable{direct}");
         };
@@ -901,9 +982,15 @@ pub fn stage_summary() -> String {
     let s = |us: &AtomicU64| us.load(Ordering::Relaxed) as f64 / 1e6;
     let direct = match (backend(), direct_counts()) {
         (Backend::Dxc, _) => String::new(),
-        (_, (direct, unsupported, failed)) => {
-            format!("; direct DXIL backend {direct} compiled, {unsupported} unsupported and {failed} failed left to DXC, {} recompiled by DXC after the driver refused them", DXC_RETRIES.load(Ordering::Relaxed))
-        }
+        (_, c) => format!(
+            "; direct DXIL backend {} compiled and validated, {} left to DXC ({} unsupported, {} failed, {} invalid), {} recompiled by DXC after the driver refused them",
+            c.compiled,
+            c.fallbacks(),
+            c.unsupported,
+            c.failed,
+            c.invalid,
+            DXC_RETRIES.load(Ordering::Relaxed)
+        ),
     };
     format!(
         "translation {} from disk, {} made; DXC {} hits, {} compiled in {:.0} thread-s; driver {} pipelines in {:.0} thread-s{direct}",
@@ -1305,6 +1392,31 @@ mod cache_tests {
         assert!(hit && a == b);
         assert_ne!(cache_key(src, "main", "cs_6_6"), cache_key(src, "main", "cs_6_7"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The direct backend's container goes through dxil.dll before use; one dxil.dll rejects is
+    /// never returned, and DXC's compiles that program instead.
+    #[test]
+    fn the_validator_passes_direct_containers_and_rejects_damaged_ones() {
+        if location().is_err() || VALIDATOR_CREATE.get().is_none() {
+            crate::gpu::recomp::runner::skip_test("no DXC with dxil.dll");
+            return;
+        }
+        let src = "RWByteAddressBuffer o : register(u0);\n[numthreads(64, 1, 1)] void main(uint3 t : SV_DispatchThreadID) { o.Store(t.x * 4u, t.x * 3u + 1u); }\n";
+        let direct = xcl_dxil::compile(src, "main", "cs_6_6").unwrap();
+        validate(&direct).unwrap();
+        validate(&compile_with_dxc(src, "main", "cs_6_6", &[]).unwrap()).unwrap();
+        let dxil = (0..direct.len() - 4).find(|&i| &direct[i..i + 4] == b"DXIL").unwrap();
+        let mut damaged = direct.clone();
+        let at = dxil + (damaged.len() - dxil) / 2;
+        damaged[at] ^= 0x5a;
+        assert!(validate(&damaged).is_err());
+        assert!(validate(&direct[..direct.len() / 2]).is_err());
+        if backend() == Backend::Direct {
+            let before = direct_counts();
+            assert_eq!(compile(src, "main", "cs_6_6", &[]).unwrap(), direct);
+            assert!(direct_counts().compiled > before.compiled);
+        }
     }
 
     #[test]

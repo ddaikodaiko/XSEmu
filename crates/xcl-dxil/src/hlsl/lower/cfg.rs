@@ -5,7 +5,7 @@
 //! SimplifyCFG leaves no such blocks, and the driver's compiler pays for every block it is
 //! handed, so they are removed here: one pass over the blocks, no instruction moves.
 
-use crate::ir::{Block, Body, Const, Module, Op, Ty, Value};
+use crate::ir::{flag, Block, Body, Const, Inst, Module, Op, Ty, Value, ValueKind};
 
 /// Apply the forwarding the lowering recorded ([`Body::replace`]: the phis that turned out
 /// trivial) to every operand, and leave a body without any. The passes that follow (flags,
@@ -404,5 +404,333 @@ fn fold_phi_blocks(body: &mut Body, keep: &[bool], live: &[bool], reachable: &[b
         if !changed {
             break;
         }
+    }
+}
+
+/// Branch folding and block merging, what SimplifyCFG does to the shape the passes above
+/// leave: a conditional branch or switch whose condition is a constant, or whose edges all
+/// end in one block, becomes a branch; an empty block on one edge of a conditional branch
+/// whose other edge ends where it does becomes a select ([`fold_empty_sides`]), an empty
+/// block entered from several ends in its successor ([`fold_empty_joins`]); then a block
+/// that is the only successor of its only
+/// predecessor joins that predecessor, its phis (one value each) forwarded to that value.
+/// Every lane runs both blocks of such a pair or neither, so no wave operation, store or
+/// reconvergence point sees a difference; the driver's compiler gets fewer blocks.
+pub(super) fn simplify(body: &mut Body, m: &Module, keep: &[u32], exits: &[u32], handle: Ty) {
+    let n = body.blocks.len();
+    // a phi entry per edge from `p` into each block of `old`, now that `p` branches to `to` alone
+    let drop_edges = |body: &mut Body, p: u32, old: &[u32], to: u32| {
+        let mut seen: Vec<u32> = Vec::with_capacity(old.len());
+        for &x in old {
+            if seen.contains(&x) {
+                continue;
+            }
+            seen.push(x);
+            for &phi in &body.blocks[x as usize].phis {
+                let k = body.insts[phi as usize].a.0 as usize;
+                let mut kept = x != to;
+                body.phis[k].retain(|inc| {
+                    if inc.1 .0 != p {
+                        return true;
+                    }
+                    let keep = !kept;
+                    kept = true;
+                    keep
+                });
+            }
+        }
+    };
+    let mut succ: Vec<u32> = Vec::new();
+    for b in 0..n {
+        let Some(&t) = body.blocks[b].insts.last() else { continue };
+        let inst = body.insts[t as usize];
+        let int = |v: Value| match v.kind() {
+            ValueKind::Const(i) => match m.consts.get(i as usize).map(|c| &c.c) {
+                Some(Const::Int(x)) => Some(*x),
+                Some(Const::Zero) => Some(0),
+                _ => None,
+            },
+            _ => None,
+        };
+        let to = match inst.op {
+            Op::CondBr if inst.b == inst.c => inst.b.0,
+            Op::CondBr if inst.flags & flag::LOOP_UNROLL_DISABLE == 0 => match int(inst.a) {
+                Some(x) => if x & 1 != 0 { inst.b.0 } else { inst.c.0 },
+                None => continue,
+            },
+            Op::Switch => {
+                let cases = &body.switches[inst.c.0 as usize];
+                let first = cases.first().map_or(inst.b, |c| Value(c.1 .0));
+                if first == inst.b && cases.iter().all(|c| c.1 .0 == inst.b.0) {
+                    inst.b.0
+                } else {
+                    match int(inst.a) {
+                        Some(x) => cases.iter().find(|c| c.0 == x).map_or(inst.b.0, |c| c.1 .0),
+                        None => continue,
+                    }
+                }
+            }
+            _ => continue,
+        };
+        succ.clear();
+        crate::bcwriter::successors(body, &inst, |s| succ.push(s));
+        if to as usize >= n {
+            continue;
+        }
+        body.insts[t as usize] = Inst { op: Op::Br, flags: inst.flags & !flag::HINTS, ty: inst.ty, a: Value(to), b: Value::NONE, c: Value::NONE };
+        drop_edges(body, b as u32, &succ, to);
+    }
+
+    fold_empty_sides(body, keep, handle);
+    fold_empty_joins(body, keep, exits);
+
+    // predecessor edges from the blocks the writer keeps
+    let mut work = Vec::new();
+    let reachable = crate::bcwriter::reachable_blocks(body, &mut work);
+    let mut npred = vec![0u32; n];
+    for b in (0..n).filter(|&b| reachable[b]) {
+        let Some(&t) = body.blocks[b].insts.last() else { continue };
+        crate::bcwriter::successors(body, &body.insts[t as usize], |s| npred[s as usize] += 1);
+    }
+    let mut forwarded = false;
+    let mut single: Vec<(u32, Value)> = Vec::new();
+    for b in (0..n).filter(|&b| reachable[b]) {
+        loop {
+            let Some(&t) = body.blocks[b].insts.last() else { break };
+            let br = body.insts[t as usize];
+            let s = br.a.0 as usize;
+            if br.op != Op::Br || br.flags & !flag::EFFECT != 0 || s == b || s == 0 || s >= n || npred[s] != 1 {
+                break;
+            }
+            // each phi of the block takes the one value of its one edge
+            single.clear();
+            let ok = body.blocks[s].phis.iter().all(|&phi| {
+                let inc = body.phi_incoming(Value::inst(phi));
+                let Some(&(v, _)) = inc.first() else { return false };
+                single.push((phi, v));
+                v != Value::inst(phi) && inc.iter().all(|&(w, from)| w == v && from.0 as usize == b)
+            });
+            // a successor that already has an entry from `b` would get a second one
+            succ.clear();
+            if let Some(&st) = body.blocks[s].insts.last() {
+                crate::bcwriter::successors(body, &body.insts[st as usize], |x| succ.push(x));
+            }
+            if !ok || succ.iter().any(|&x| body.blocks[x as usize].phis.iter().any(|&phi| body.phi_incoming(Value::inst(phi)).iter().any(|inc| inc.1 .0 as usize == b))) {
+                break;
+            }
+            for &(phi, v) in &single {
+                body.replace(Value::inst(phi), v);
+                forwarded = true;
+            }
+            body.blocks[s].phis.clear();
+            succ.sort_unstable();
+            succ.dedup();
+            for &x in &succ {
+                for &phi in &body.blocks[x as usize].phis {
+                    let k = body.insts[phi as usize].a.0 as usize;
+                    for inc in body.phis[k].iter_mut().filter(|inc| inc.1 .0 as usize == s) {
+                        inc.1 = Block(b as u32);
+                    }
+                }
+            }
+            let moved = std::mem::take(&mut body.blocks[s].insts);
+            let into = &mut body.blocks[b].insts;
+            into.pop();
+            into.extend_from_slice(&moved);
+            npred[s] = 0;
+        }
+    }
+    if forwarded {
+        apply_forwarding(body);
+    }
+}
+
+/// SimplifyCFG's `FoldTwoEntryPHINode` for a side that holds nothing: `P: br c, E, M` with
+/// `E: br M` becomes `P: br M`, and each phi of `M` takes `select c, (from E), (from P)`
+/// from `P`, the select placed before `P`'s branch. Both values are there before the branch
+/// and every lane reaches `M` either way, so nothing runs that did not run before and no
+/// lane sees another value. Not done for the blocks of `keep` (a loop's preheader, latch and
+/// exit), a branch marked `[branch]` or closing a loop, `dx.break`'s branch (a compare of
+/// a load, which the driver must not fold), or a phi of type `handle`, which DXIL does not
+/// allow a select of.
+fn fold_empty_sides(body: &mut Body, keep: &[u32], handle: Ty) {
+    let n = body.blocks.len();
+    let crate::bcwriter::Live { blocks: reachable, insts: live } = crate::bcwriter::liveness(body);
+    let is_live = |i: u32| live.get(i as usize).copied().unwrap_or(true);
+    let mut npred = vec![0u32; n];
+    let mut pred = vec![0usize; n];
+    for b in (0..n).filter(|&b| reachable[b]) {
+        let Some(&t) = body.blocks[b].insts.last() else { continue };
+        crate::bcwriter::successors(body, &body.insts[t as usize], |s| {
+            npred[s as usize] += 1;
+            pred[s as usize] = b;
+        });
+    }
+    let mut kept = vec![false; n];
+    for &k in keep {
+        kept[k as usize] = true;
+    }
+    let mut sels: Vec<(u32, Value)> = Vec::new();
+    for e in 1..n {
+        let data = &body.blocks[e];
+        if !reachable[e] || kept[e] || npred[e] != 1 || data.phis.iter().any(|&p| is_live(p)) {
+            continue;
+        }
+        let Some(&et) = data.insts.last() else { continue };
+        if data.insts[..data.insts.len() - 1].iter().any(|&i| is_live(i)) {
+            continue;
+        }
+        let br = body.insts[et as usize];
+        let mm = br.a.0 as usize;
+        if br.op != Op::Br || br.flags & flag::LOOP_UNROLL_DISABLE != 0 || mm == e || mm >= n {
+            continue;
+        }
+        let p = pred[e];
+        let Some(&pt) = body.blocks[p].insts.last() else { continue };
+        let cb = body.insts[pt as usize];
+        let on_true = cb.b.0 as usize == e;
+        let other = if on_true { cb.c.0 } else { cb.b.0 } as usize;
+        if cb.op != Op::CondBr || other != mm || p == e || kept[p] || cb.flags & (flag::HINT_BRANCH | flag::LOOP_UNROLL_DISABLE) != 0 {
+            continue;
+        }
+        if cb.a.is_inst() {
+            let c = body.insts[cb.a.0 as usize];
+            if matches!(c.op, Op::ICmp(_)) && c.a.is_inst() && body.insts[c.a.0 as usize].op == Op::Load {
+                continue;
+            }
+        }
+        // each phi of the target: one entry from each edge
+        sels.clear();
+        let ok = body.blocks[mm].phis.iter().all(|&phi| {
+            let inc = body.phi_incoming(Value::inst(phi));
+            let from = |b: usize| {
+                let mut it = inc.iter().filter(|x| x.1 .0 as usize == b);
+                let first = it.next().map(|x| x.0);
+                if it.next().is_some() { None } else { first }
+            };
+            match (from(e), from(p)) {
+                (Some(ve), Some(vp)) if body.insts[phi as usize].ty != handle || !is_live(phi) => {
+                    sels.push((phi, if ve == vp { ve } else { Value::NONE }));
+                    true
+                }
+                _ => false,
+            }
+        });
+        if !ok {
+            continue;
+        }
+        for k in 0..sels.len() {
+            let (phi, same) = sels[k];
+            let kq = body.insts[phi as usize].a.0 as usize;
+            let ve = body.phis[kq].iter().find(|x| x.1 .0 as usize == e).unwrap().0;
+            let vp = body.phis[kq].iter().find(|x| x.1 .0 as usize == p).unwrap().0;
+            let v = if !same.is_none() || !is_live(phi) {
+                if same.is_none() { vp } else { same }
+            } else {
+                let i = body.insts.len() as u32;
+                let (t, f) = if on_true { (ve, vp) } else { (vp, ve) };
+                body.insts.push(Inst { op: Op::Select, flags: 0, ty: body.insts[phi as usize].ty, a: cb.a, b: t, c: f });
+                let at = body.blocks[p].insts.len() - 1;
+                body.blocks[p].insts.insert(at, i);
+                Value::inst(i)
+            };
+            body.phis[kq].retain(|x| x.1 .0 as usize != e);
+            for x in body.phis[kq].iter_mut().filter(|x| x.1 .0 as usize == p) {
+                x.0 = v;
+            }
+        }
+        let pt = *body.blocks[p].insts.last().unwrap();
+        body.insts[pt as usize] = Inst { op: Op::Br, flags: cb.flags & !flag::HINTS, ty: cb.ty, a: Value(mm as u32), b: Value::NONE, c: Value::NONE };
+        npred[e] = 0;
+        npred[mm] = u32::MAX;
+    }
+}
+
+/// SimplifyCFG's `TryToSimplifyUncondBranchFromEmptyBlock`: a block that holds nothing but
+/// a branch to `T` and is entered from several blocks, none of which also enters `T`, is
+/// left out: its predecessors branch to `T`, and each phi of `T` takes the value it took
+/// from the block once per edge it gets in its place. Nothing ran in the block, and every lane
+/// that entered it went on to `T`, so no lane runs anything else or meets other lanes
+/// anywhere else. Not done for a loop's preheader or latch (`keep` without `exits`) nor for a
+/// branch that closes a loop.
+fn fold_empty_joins(body: &mut Body, keep: &[u32], exits: &[u32]) {
+    let n = body.blocks.len();
+    let crate::bcwriter::Live { blocks: reachable, insts: live } = crate::bcwriter::liveness(body);
+    let is_live = |i: u32| live.get(i as usize).copied().unwrap_or(true);
+    let mut preds: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for b in (0..n).filter(|&b| reachable[b]) {
+        let Some(&t) = body.blocks[b].insts.last() else { continue };
+        crate::bcwriter::successors(body, &body.insts[t as usize], |s| preds[s as usize].push(b as u32));
+    }
+    let mut kept = vec![false; n];
+    for &k in keep {
+        kept[k as usize] = true;
+    }
+    for &x in exits {
+        kept[x as usize] = false;
+    }
+    let mut succ: Vec<u32> = Vec::new();
+    for e in 1..n {
+        let data = &body.blocks[e];
+        if !reachable[e] || kept[e] || preds[e].len() < 2 || data.phis.iter().any(|&p| is_live(p)) {
+            continue;
+        }
+        let Some(&et) = data.insts.last() else { continue };
+        if data.insts[..data.insts.len() - 1].iter().any(|&i| is_live(i)) {
+            continue;
+        }
+        let br = body.insts[et as usize];
+        let t = br.a.0 as usize;
+        if br.op != Op::Br || br.flags & flag::LOOP_UNROLL_DISABLE != 0 || t == e || t >= n || !reachable[t] {
+            continue;
+        }
+        // a predecessor that also enters `t` would give a phi there two entries from one block
+        let shared = preds[e].iter().any(|&p| {
+            succ.clear();
+            let pt = *body.blocks[p as usize].insts.last().unwrap();
+            crate::bcwriter::successors(body, &body.insts[pt as usize], |x| succ.push(x));
+            p as usize == e || succ.contains(&(t as u32))
+        });
+        let single = body.blocks[t].phis.iter().all(|&phi| body.phi_incoming(Value::inst(phi)).iter().filter(|x| x.1 .0 as usize == e).count() == 1);
+        if shared || !single {
+            continue;
+        }
+        let from = std::mem::take(&mut preds[e]);
+        for &phi in &body.blocks[t].phis {
+            let k = body.insts[phi as usize].a.0 as usize;
+            let j = body.phis[k].iter().position(|x| x.1 .0 as usize == e).unwrap();
+            let (v, _) = body.phis[k].swap_remove(j);
+            body.phis[k].extend(from.iter().map(|&p| (v, Block(p))));
+        }
+        let mut last = u32::MAX;
+        for &p in &from {
+            if p == last {
+                continue;
+            }
+            last = p;
+            let pt = *body.blocks[p as usize].insts.last().unwrap();
+            let term = &mut body.insts[pt as usize];
+            let to = |v: &mut Value| {
+                if v.0 as usize == e {
+                    *v = Value(t as u32);
+                }
+            };
+            match term.op {
+                Op::Br => to(&mut term.a),
+                Op::CondBr => {
+                    to(&mut term.b);
+                    to(&mut term.c);
+                }
+                Op::Switch => {
+                    to(&mut term.b);
+                    for case in body.switches[term.c.0 as usize].iter_mut().filter(|case| case.1 .0 as usize == e) {
+                        case.1 = Block(t as u32);
+                    }
+                }
+                _ => {}
+            }
+        }
+        preds[t].retain(|&p| p as usize != e);
+        preds[t].extend_from_slice(&from);
     }
 }

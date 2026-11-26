@@ -72,6 +72,7 @@ pub(crate) unsafe fn wait(
         return Err(api_error(dev, "SetEventOnCompletion", e));
     }
     let start = Instant::now();
+    let _live = crate::live_stall::begin(crate::live_stall::Stage::FenceWait, 0, 0, Some(target), None);
     let mut remaining = timeout_ms;
     loop {
         let status = WaitForSingleObject(event, remaining);

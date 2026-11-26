@@ -9,6 +9,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 
 pub(super) use super::gpu_timing_stats::Kind;
+use super::depth_lineage_queue as lineage;
 use super::gpu_timing_stats::{self as stats, Batch, Span};
 use super::gpu_timing_waits as waits;
 
@@ -90,6 +91,17 @@ fn dispatch_min_groups() -> Option<u64> {
     })
 }
 
+fn dispatch_qpc_selection() -> Option<&'static (usize, Vec<u64>)> {
+    static SELECT: OnceLock<Option<(usize, Vec<u64>)>> = OnceLock::new();
+    SELECT.get_or_init(|| {
+        let value = std::env::var("XCL_GPU_LIST_TIMING_QPC").ok()?;
+        let (queue, shaders) = value.split_once(':')?;
+        let queue = queue.trim().parse::<usize>().ok()?;
+        let shaders = shaders.split(',').map(|s| u64::from_str_radix(s.trim(), 16)).collect::<Result<Vec<_>, _>>().ok()?;
+        (queue != 0).then_some((queue, shaders))
+    }).as_ref()
+}
+
 #[derive(Clone, Copy)]
 struct Op {
     kind: Kind,
@@ -102,6 +114,7 @@ struct Op {
 #[derive(Default)]
 struct Recording {
     id: usize,
+    depth_capture: Option<Arc<super::depth_capture::Capture>>,
     pipeline: usize,
     owned: bool,
     started: bool,
@@ -162,9 +175,22 @@ struct Submission {
     frame: u64,
     queue: QueueInfo,
     seq: u64,
+    lineage_id: u64,
     uncovered: bool,
     recordings: Vec<(usize, usize)>,
     folded_drops: u64,
+    dispatch_clock: Option<DispatchClock>,
+}
+
+struct DispatchClock {
+    gpu_ref: u64,
+    qpc_ref: u64,
+    qpc_hz: i64,
+    raw_queue: usize,
+    fence: usize,
+    fence_value: u64,
+    signal_qpc: i64,
+    signal_tid: u32,
 }
 
 struct Flight {
@@ -241,7 +267,7 @@ impl Drop for NativeQueue {
     }
 }
 
-unsafe fn native<F: Copy>(object: *mut c_void, slot: usize) -> F {
+pub(super) unsafe fn native<F: Copy>(object: *mut c_void, slot: usize) -> F {
     let addr = if super::real::is_adopted(object) {
         super::real::orig_fn(object, slot)
     } else {
@@ -600,6 +626,13 @@ unsafe fn poll(queue: Option<usize>) {
         let flight = STATE.lock().unwrap().flights.remove(&id);
         let Some(flight) = flight else { continue };
         let valid = completed == marker.value;
+        if valid {
+            let fence = marker.fence.as_raw() as usize;
+            lineage::retired(flight.lineage_id, id, fence, marker.value);
+            for covered in &flight.covered {
+                lineage::retired(covered.lineage_id, id, fence, marker.value);
+            }
+        }
         finish(flight.submission, Some(id), valid);
         for covered in flight.covered {
             finish(covered, None, valid);
@@ -625,7 +658,7 @@ unsafe fn finish(submission: Submission, readable: Option<usize>, valid: bool) {
         let gate = (valid && readable.is_some())
             .then(|| STATE.lock().unwrap().slots[index].read_gate.clone());
         let _read = gate.as_ref().map(|gate| gate.lock().unwrap());
-        let (snapshot, count, timestamps) = {
+        let (snapshot, depth, count, timestamps) = {
             let state = STATE.lock().unwrap();
             let slot = &state.slots[index];
             let Some(recording) = slot.recording.as_ref().filter(|r| r.id == generation) else {
@@ -643,11 +676,19 @@ unsafe fn finish(submission: Submission, readable: Option<usize>, valid: bool) {
             };
             (
                 snapshot,
+                recording.depth_capture.as_ref().filter(|c| c.first_flight() == readable && readable.is_some()).cloned(),
                 slot.count(),
                 if valid { slot.timestamps() } else { 0 },
             )
         };
         batch.timestamps += timestamps;
+        if let Some(depth) = depth {
+            if snapshot.is_some() {
+                depth.retired(generation, submission.queue.id, submission.seq);
+            } else {
+                crate::xlog_warn!("depth capture: skipped unreadable or replayed recording {generation}, q{} seq {}", submission.queue.id, submission.seq);
+            }
+        }
         if let Some(snapshot) = snapshot {
             snapshot.collect(&mut batch);
         } else {
@@ -672,6 +713,19 @@ unsafe fn finish(submission: Submission, readable: Option<usize>, valid: bool) {
                 })
         };
         waits::completed(batch.queue, submission.seq, batch.hz, bounds);
+    }
+    if let Some((clock, (_, selected))) = submission.dispatch_clock.as_ref().zip(dispatch_qpc_selection()) {
+        let DispatchClock { gpu_ref, qpc_ref, qpc_hz, raw_queue, fence, fence_value, signal_qpc, signal_tid } = clock;
+        let (queue, hz, seq) = (batch.queue, batch.hz, submission.seq);
+        for span in &batch.spans {
+            if span.kind != Kind::Dispatch || !span.sampled || span.begin == 0 {
+                continue;
+            }
+            let (Some((hash, 0)), Some([x, y, z])) = (span.shaders, span.grid) else { continue };
+            if selected.contains(&hash) {
+                crate::xlog_info!("GPU dispatch clock: CS {hash:016x} groups {x}x{y}x{z}: gpu_start={} gpu_end={} gpu_ref={gpu_ref} qpc_ref={qpc_ref} gpu_hz={hz} qpc_hz={qpc_hz} timing_queue={queue} queue={raw_queue:#x} submit_seq={seq} submission_fence={fence:#x} fence_value={fence_value} signal_qpc={signal_qpc} signal_tid={signal_tid}", span.begin, span.end);
+            }
+        }
     }
     stats::record(batch);
 }
@@ -735,6 +789,7 @@ unsafe fn allocate_spill(base: &SlotGpu) -> Option<Arc<SlotGpu>> {
 }
 
 pub(super) unsafe fn opened(raw: *mut c_void, pipeline: usize) {
+    let lineage_generation = lineage::opened(raw as usize);
     if !enabled() || raw.is_null() {
         return;
     }
@@ -808,11 +863,13 @@ pub(super) unsafe fn opened(raw: *mut c_void, pipeline: usize) {
             state.free.push(index);
             return;
         }
-        let Some(id) = state.next_list.checked_add(1) else {
+        let Some(id) = lineage_generation.or_else(|| {
+            (!lineage::enabled()).then(|| state.next_list.checked_add(1)).flatten()
+        }) else {
             state.free.push(index);
             return;
         };
-        state.next_list = id;
+        state.next_list = state.next_list.max(id);
         id
     };
     if list
@@ -920,9 +977,35 @@ pub(super) unsafe fn before_close(raw: *mut c_void) {
 }
 
 pub(super) fn forget(list: usize) {
+    lineage::forget(list, None);
     if enabled() {
         STATE.lock().unwrap().forget(list);
     }
+}
+
+pub(super) unsafe fn attach_depth(raw: *mut c_void, capture: Arc<super::depth_capture::Capture>) -> Result<usize, String> {
+    let (id, start) = {
+        let mut state = STATE.lock().unwrap();
+        let index = *state.lists.get(&(raw as usize)).ok_or("no timed list generation")?;
+        let slot = &mut state.slots[index];
+        let r = slot.recording.as_mut().ok_or("no active recording")?;
+        if !r.owned || r.sealed || r.quarantined || r.in_flight != 0 || r.pass.is_some() || r.suspended || r.depth_capture.is_some() {
+            return Err("recording is not open outside a render pass".into());
+        }
+        r.depth_capture = Some(capture);
+        (r.id, slot.start())
+    };
+    if let Some(gpu) = start {
+        native::<EndQuery>(raw, 53)(raw, gpu.heap.as_raw(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+    }
+    Ok(id)
+}
+
+pub(super) fn query_scope_open(list: usize, generation: u64) -> bool {
+    let state = STATE.lock().unwrap();
+    state.lists.get(&list).and_then(|i| state.slots.get(*i)).is_some_and(|s|
+        !state.faulted_devices.contains(&(s.gpu.device.as_raw() as usize)) && s.recording.as_ref().is_some_and(|r|
+            r.id as u64 == generation && r.owned && !r.sealed && !r.quarantined && r.in_flight == 0 && r.pass.is_none() && !r.suspended))
 }
 
 pub(super) fn pipeline(list: *mut c_void, pso: usize) {
@@ -946,6 +1029,10 @@ unsafe fn get_token(raw: *mut c_void, guid: &GUID) -> Option<usize> {
 }
 
 pub(super) unsafe fn list_token(raw: *mut c_void) -> Option<(usize, usize)> {
+    let generation = lineage::recording(raw as usize);
+    if generation != 0 {
+        return Some((raw as usize, generation as usize));
+    }
     if !enabled() {
         return None;
     }
@@ -954,6 +1041,7 @@ pub(super) unsafe fn list_token(raw: *mut c_void) -> Option<(usize, usize)> {
 
 pub(super) fn list_released(token: Option<(usize, usize)>) {
     let Some((list, id)) = token else { return };
+    lineage::forget(list, Some(id as u64));
     let mut state = STATE.lock().unwrap();
     if state.lists.get(&list).is_some_and(|&index| {
         state.slots[index]
@@ -1170,14 +1258,22 @@ unsafe fn capture<R>(
     value
 }
 
-fn observed_submit(raw: *mut c_void, queue: usize, frame: u64, f: impl FnOnce()) -> u64 {
+fn observed_submit(
+    raw: *mut c_void,
+    queue: usize,
+    frame: u64,
+    lists: &[*mut c_void],
+    f: impl FnOnce(),
+) -> (u64, u64) {
     let seq = waits::submitted(queue, frame);
+    let lineage_id = lineage::enter(raw as usize, queue, seq, lists);
     {
         let _native = NativeQueue::enter(raw, queue);
         f();
     }
     waits::returned(queue, seq);
-    seq
+    lineage::returned(lineage_id);
+    (seq, lineage_id)
 }
 
 unsafe fn marker_for(device: &ID3D12Device) -> Option<Marker> {
@@ -1253,13 +1349,30 @@ fn park(queue: &Arc<ID3D12CommandQueue>, mut submission: Submission, flight: Opt
 unsafe fn arm(
     raw: *mut c_void,
     id: usize,
-    submission: Submission,
+    mut submission: Submission,
     covered: Vec<Submission>,
     marker: Marker,
 ) {
     type Signal = unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT;
     let armed = {
         let _native = NativeQueue::enter(raw, submission.queue.id);
+        if submission.queue.hz != 0 && dispatch_qpc_selection().is_some_and(|(q, _)| *q == submission.queue.id) {
+            use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+            let (mut gpu_ref, mut qpc_ref, mut qpc_hz, mut signal_qpc) = (0, 0, 0, 0);
+            if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&raw) {
+                if QueryPerformanceFrequency(&mut qpc_hz) != 0
+                    && qpc_hz > 0
+                    && q.GetClockCalibration(&mut gpu_ref, &mut qpc_ref).is_ok()
+                    && QueryPerformanceCounter(&mut signal_qpc) != 0
+                {
+                    submission.dispatch_clock = Some(DispatchClock {
+                        gpu_ref, qpc_ref, qpc_hz, raw_queue: raw as usize,
+                        fence: marker.fence.as_raw() as usize, fence_value: marker.value,
+                        signal_qpc, signal_tid: windows_sys::Win32::System::Threading::GetCurrentThreadId(),
+                    });
+                }
+            }
+        }
         native::<Signal>(raw, 14)(raw, marker.fence.as_raw(), marker.value).is_ok()
     };
     if armed {
@@ -1334,8 +1447,14 @@ unsafe fn retry_parked() {
 }
 
 pub(super) unsafe fn submit(raw: *mut c_void, lists: &[*mut c_void], f: impl FnOnce()) {
-    if !enabled() || raw.is_null() || lists.is_empty() {
+    if raw.is_null() || lists.is_empty() {
         return f();
+    }
+    if !enabled() {
+        let lineage_id = lineage::enter(raw as usize, 0, 0, lists);
+        f();
+        lineage::returned(lineage_id);
+        return;
     }
     let queue = get_queue(raw);
     let info = queue.as_ref().map_or(
@@ -1389,6 +1508,9 @@ pub(super) unsafe fn submit(raw: *mut c_void, lists: &[*mut c_void], f: impl FnO
                 continue;
             }
             r.readable_flight = (r.in_flight == 0).then_some(id);
+            if let Some(capture) = &r.depth_capture {
+                capture.submitted(id);
+            }
             r.in_flight += 1;
             recordings.push((index, r.id));
         }
@@ -1416,7 +1538,7 @@ pub(super) unsafe fn submit(raw: *mut c_void, lists: &[*mut c_void], f: impl FnO
     for gate in gates {
         drop(gate.lock().unwrap());
     }
-    let seq = observed_submit(raw, info.id, batch.frame, f);
+    let (seq, lineage_id) = observed_submit(raw, info.id, batch.frame, lists, f);
     let Some(base) = base else {
         stats::record(batch);
         return;
@@ -1425,9 +1547,11 @@ pub(super) unsafe fn submit(raw: *mut c_void, lists: &[*mut c_void], f: impl FnO
         frame: batch.frame,
         queue: info,
         seq,
+        lineage_id,
         uncovered: batch.dropped != 0,
         recordings,
         folded_drops: 0,
+        dispatch_clock: None,
     };
     let Some(marker) = marker else {
         UNAVAILABLE.fetch_add(1, Ordering::Relaxed);

@@ -29,7 +29,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{LazyLock, Mutex, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
 
 use windows_sys::Win32::Foundation as fnd;
 use windows_sys::Win32::System::Memory as mem;
@@ -64,17 +64,268 @@ fn page_index(page: usize) -> Option<usize> {
     page.is_multiple_of(FRAMES).then(|| (page / FRAMES).checked_sub(1)).flatten()
 }
 
+fn take_page_indices(next: &AtomicUsize, count: usize, clustered: bool) -> Option<usize> {
+    let mut old = next.load(Ordering::Relaxed);
+    loop {
+        let first = if clustered { old.checked_add(1)?.checked_next_multiple_of(32)? - 1 } else { old };
+        let end = first.checked_add(count).filter(|&n| n <= usize::MAX / FRAMES)?;
+        match next.compare_exchange_weak(old, end, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Some(first),
+            Err(actual) => old = actual,
+        }
+    }
+}
+
 struct Block {
     count: usize,
     /// pages not freed yet
     live: usize,
     freed: Vec<usize>,
-    section: usize,
+    section: Arc<Section>,
+    clustered: bool,
+    section_home: Option<(usize, usize)>,
     /// the view of the whole allocation
     view: usize,
     /// unified memory the title gets for these pages when it maps them at no chosen address
     uma_home: Option<usize>,
 }
+
+#[derive(Debug)]
+struct Section { raw: usize, len: usize }
+
+impl Drop for Section {
+    fn drop(&mut self) {
+        unsafe { fnd::CloseHandle(self.raw as HANDLE) };
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PhysicalPageRef {
+    token: usize,
+    offset: usize,
+    section: Arc<Section>,
+}
+
+impl PhysicalPageRef {
+    pub(crate) fn section_identity(&self) -> usize {
+        Arc::as_ptr(&self.section) as usize
+    }
+    pub(crate) fn id(&self) -> usize {
+        self.token
+    }
+    pub(crate) fn section_offset(&self) -> usize {
+        self.offset
+    }
+    pub(crate) fn same_section(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.section, &other.section)
+    }
+}
+
+pub(crate) const PHYSICAL_SEGMENT_BYTES: usize = 8 << 20;
+
+impl PhysicalPageRef {
+    pub(crate) fn pin_committed_segment(&self, offsets: std::ops::Range<usize>) -> Option<(usize, PhysicalSectionView)> {
+        let lo = offsets.start;
+        let hi = offsets.end.min(self.section.len);
+        let len = hi.checked_sub(lo)?;
+        if len == 0 || len > PHYSICAL_SEGMENT_BYTES || !lo.is_multiple_of(PHYS_PAGE) || !hi.is_multiple_of(PHYS_PAGE)
+            || self.offset < lo || self.offset.checked_add(PHYS_PAGE)? > hi {
+            return None;
+        }
+        unsafe {
+            let view = PhysicalSectionView { base: view_anywhere(self.section.raw, lo, len)?, len };
+            let mut at = view.base;
+            let end = view.base.checked_add(len)?;
+            while at < end {
+                let mut mbi = mem::MEMORY_BASIC_INFORMATION::default();
+                if mem::VirtualQuery(at as *const _, &mut mbi, std::mem::size_of_val(&mbi)) == 0 || mbi.AllocationBase as usize != view.base {
+                    return None;
+                }
+                let next = (mbi.BaseAddress as usize).checked_add(mbi.RegionSize)?.min(end);
+                if next <= at { return None; }
+                let start = lo + (at - view.base).checked_next_multiple_of(PHYS_PAGE)?;
+                let stop = lo + ((next - view.base) & !(PHYS_PAGE - 1));
+                if start <= self.offset && self.offset + PHYS_PAGE <= stop {
+                    if mbi.Type != mem::MEM_MAPPED || mbi.State != mem::MEM_COMMIT || mbi.Protect != mem::PAGE_READWRITE {
+                        return None;
+                    }
+                    if start == lo && stop == hi { return Some((lo, view)); }
+                    let bytes = stop - start;
+                    let base = view_anywhere(self.section.raw, start, bytes)?;
+                    return Some((start, PhysicalSectionView { base, len: bytes }));
+                }
+                at = next;
+            }
+        }
+        None
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum QueuePageSource {
+    Physical(PhysicalPageRef),
+    GuestRange { base: usize, len: usize },
+    Hole,
+}
+
+pub(crate) fn snapshot_queue_sources(slots: &[usize]) -> Result<Vec<QueuePageSource>, &'static str> {
+    let g = PHYS.lock().unwrap();
+    slots.iter().map(|&at| g.queue_source(at)).collect()
+}
+
+pub(crate) fn snapshot_default_gpu_sources(slots: &[usize]) -> Result<Vec<Option<QueuePageSource>>, &'static str> {
+    let g = PHYS.lock().unwrap();
+    slots.iter().map(|&at| g.cpu_reservation(at).filter(|r| r.class.default_gpu).map(|_| g.queue_source(at)).transpose()).collect()
+}
+
+impl Phys {
+    fn queue_source(&self, at: usize) -> Result<QueuePageSource, &'static str> {
+        if !at.is_multiple_of(PHYS_PAGE) {
+            return Err("unaligned source");
+        }
+        let mapped = self.at.get(&at);
+        let page = mapped.map(|m| m.page).or_else(|| {
+            self.blocks.iter().find_map(|(&first, b)| {
+                let i = at.checked_sub(b.view)? / PHYS_PAGE;
+                b.is_live(i).then(|| page_number(first + i))
+            })
+        });
+        if let Some(page) = page {
+            if !self.has_views(page) && !self.copies(page).is_empty() {
+                return Err("physical source data lives in a copy");
+            }
+            if let Some(owned) = mapped.and_then(|m| m.backing.as_ref()) {
+                return Ok(QueuePageSource::Physical(owned.clone()));
+            }
+            let (b, offset) = self.block_of(page).ok_or("physical source freed")?;
+            if !unsafe { use_page(b.view + offset) } {
+                return Err("physical source commitment failed");
+            }
+            return Ok(QueuePageSource::Physical(PhysicalPageRef { token: page, offset, section: Arc::clone(&b.section) }));
+        }
+        if let Some(r) = self.reservations.range(..=at).next_back().map(|(_, r)| r).filter(|r| at < r.end) {
+            if r.slots.get(&at) != Some(&Slot::Private) {
+                return Ok(QueuePageSource::Hole);
+            }
+        }
+        let end = at.checked_add(PHYS_PAGE - 1).ok_or("guest source range wraps")?;
+        if let Some(u) = crate::gpu::uma::get().filter(|u| u.contains(at)) {
+            let region = u.sparse_reservation(at).or_else(|| u.committed_reservation(at)).or_else(|| u.block_size(at).map(|n| (at, n)));
+            if !region.is_some_and(|(base, len)| end - base < len) {
+                return Err("guest source is not covered by one known UMA allocation");
+            }
+        }
+        match crate::memmap::access(at, PHYS_PAGE) {
+            Some(crate::memmap::Access::Read | crate::memmap::Access::Write) => Ok(QueuePageSource::GuestRange { base: at, len: PHYS_PAGE }),
+            _ => Err("unclassified or inaccessible guest source"),
+        }
+    }
+}
+
+pub(crate) fn cpu_reservation_at(at: usize) -> Option<CpuReservation> {
+    PHYS.lock().unwrap().cpu_reservation(at)
+}
+
+pub(crate) fn pin_physical_view_run(pages: &[PhysicalPageRef]) -> Option<PhysicalSectionView> {
+    let first = pages.first()?;
+    if pages.len() > (8 << 20) / PHYS_PAGE
+        || !pages.iter().enumerate().all(|(i, p)| first.same_section(p) && first.offset + i * PHYS_PAGE == p.offset)
+    {
+        return None;
+    }
+    let len = pages.len() * PHYS_PAGE;
+    let base = unsafe { view_anywhere(first.section.raw, first.offset, len) }?;
+    Some(PhysicalSectionView { base, len })
+}
+
+pub(crate) struct PhysicalSectionView {
+    base: usize,
+    len: usize,
+}
+
+impl PhysicalSectionView {
+    pub(crate) fn base(&self) -> usize {
+        self.base
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+}
+
+impl Drop for PhysicalSectionView {
+    fn drop(&mut self) {
+        unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: self.base as *mut c_void }) };
+    }
+}
+
+pub(crate) fn physical_import_probe_views() -> Option<(PhysicalSectionView, PhysicalSectionView)> {
+    unsafe {
+        let section = create_section(3 * PHYS_PAGE)?;
+        let make = || view_anywhere(section, PHYS_PAGE, PHYS_PAGE).map(|base| PhysicalSectionView { base, len: PHYS_PAGE });
+        let a = make();
+        let b = make();
+        fnd::CloseHandle(section as HANDLE);
+        let (a, b) = (a?, b?);
+        if mem::VirtualAlloc(a.base as *const c_void, a.len, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
+            return None;
+        }
+        Some((a, b))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VirtualGrain {
+    K64,
+    M2,
+}
+
+impl VirtualGrain {
+    fn bytes(self) -> usize {
+        match self {
+            Self::K64 => PHYS_PAGE,
+            Self::M2 => 32 * PHYS_PAGE,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MapClass {
+    pub(crate) grain: VirtualGrain,
+    pub(crate) default_gpu: bool,
+}
+
+pub(crate) struct GdkPhysicalAbi {
+    pub(crate) mappable_reservation: fn(u32, u64, u32) -> Option<MapClass>,
+    pub(crate) source_pool_allocation: fn(u32, u64, u32) -> Option<MapClass>,
+    pub(crate) clustered_allocation: fn(u64) -> bool,
+}
+
+static SECTION_BACKEND: OnceLock<GdkPhysicalAbi> = OnceLock::new();
+
+pub(crate) fn install_section_backend(abi: GdkPhysicalAbi) -> Result<(), GdkPhysicalAbi> {
+    SECTION_BACKEND.set(abi)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CpuReservation {
+    pub(crate) id: usize,
+    pub(crate) requested: usize,
+    pub(crate) base: usize,
+    pub(crate) len: usize,
+    pub(crate) allocation: u32,
+    pub(crate) flags: u64,
+    pub(crate) protection: u32,
+    pub(crate) accepts_physical_map: bool,
+    pub(crate) class: MapClass,
+}
+
+impl CpuReservation {
+    pub(crate) fn cache(&self) -> u32 { self.protection & (mem::PAGE_NOCACHE | mem::PAGE_WRITECOMBINE) }
+    pub(crate) fn cpu_access(&self) -> u32 { super::sanitize_protect(self.protection) & 0xff }
+}
+
+static NEXT_RESERVATION: AtomicUsize = AtomicUsize::new(1);
 
 impl Block {
     const WORD_BITS: usize = usize::BITS as usize;
@@ -101,10 +352,11 @@ enum Kind {
     Copy,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Mapping {
     page: usize,
     kind: Kind,
+    backing: Option<PhysicalPageRef>,
 }
 
 /// A 64 KiB slot of a placeholder reservation split out of it.
@@ -117,8 +369,26 @@ enum Slot {
 }
 
 struct Reservation {
+    cpu: Option<CpuReservation>,
+    raw_gdk64: Option<RawGdk64>,
     end: usize,
     slots: BTreeMap<usize, Slot>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RawGdk64 {
+    pub(crate) requested: usize,
+    pub(crate) requested_size: usize,
+    pub(crate) allocation: u32,
+    pub(crate) flags: u64,
+    pub(crate) protection: u32,
+}
+
+pub(crate) fn compat_gdk64_reservation_at(at: usize) -> Option<(usize, usize, RawGdk64)> {
+    let g = PHYS.lock().unwrap();
+    let (&base, r) = g.reservations.range(..=at).next_back()?;
+    if at >= r.end { return None; }
+    Some((base, r.end - base, r.raw_gdk64?))
 }
 
 #[derive(Default)]
@@ -182,7 +452,7 @@ fn committed(a: usize) -> bool {
 }
 
 unsafe fn commit(a: usize, len: usize) -> bool {
-    let ok = !mem::VirtualAlloc(a as *const c_void, len, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null();
+    let ok = lazy::commit_memory(a, len);
     if ok {
         crate::memmap::committed(a, len, mem::PAGE_READWRITE);
     }
@@ -214,14 +484,76 @@ unsafe fn reserve_placeholder(len: usize) -> Option<usize> {
     (!p.is_null()).then_some(p as usize)
 }
 
+unsafe fn cpu_reserve(g: &mut Phys, requested: usize, size: usize, allocation: u32, flags: u64, protection: u32, class: MapClass) -> Option<usize> {
+    let grain = class.grain.bytes();
+    if size == 0 || !requested.is_multiple_of(grain) {
+        fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+        return None;
+    }
+    let len = size.checked_next_multiple_of(grain)?;
+    let mut req = mem::MEM_ADDRESS_REQUIREMENTS { Alignment: grain, ..Default::default() };
+    let mut ext = mem::MEM_EXTENDED_PARAMETER {
+        Anonymous1: mem::MEM_EXTENDED_PARAMETER_0 { _bitfield: mem::MemExtendedParameterAddressRequirements as u64 },
+        Anonymous2: mem::MEM_EXTENDED_PARAMETER_1 { Pointer: (&mut req as *mut mem::MEM_ADDRESS_REQUIREMENTS).cast() },
+    };
+    let (ext, n) = if requested == 0 && grain > PHYS_PAGE { (&mut ext as *mut _, 1) } else { (std::ptr::null_mut(), 0) };
+    let base = mem::VirtualAlloc2(
+        GetCurrentProcess(),
+        requested as *const c_void,
+        len,
+        mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER,
+        mem::PAGE_NOACCESS,
+        ext,
+        n,
+    ) as usize;
+    if base == 0 {
+        return None;
+    }
+    let cpu = CpuReservation { id: NEXT_RESERVATION.fetch_add(1, Ordering::Relaxed), requested, base, len, allocation, flags, protection, class, accepts_physical_map: true };
+    g.reservations.insert(base, Reservation { end: base + len, slots: BTreeMap::new(), cpu: Some(cpu), raw_gdk64: None });
+    crate::memmap::reserved(base, len);
+    Some(base)
+}
+
+pub(super) unsafe fn gdk_reserve(addr: *const c_void, size: usize, t: u32, flags: u64, protection: u32) -> Option<*mut c_void> {
+    gdk_reserve_with(SECTION_BACKEND.get()?, addr, size, t, flags, protection)
+}
+
+unsafe fn gdk_reserve_with(abi: &GdkPhysicalAbi, addr: *const c_void, size: usize, t: u32, flags: u64, protection: u32) -> Option<*mut c_void> {
+    let committed = match t & (mem::MEM_RESERVE | mem::MEM_COMMIT | mem::MEM_REPLACE_PLACEHOLDER) {
+        mem::MEM_RESERVE => false,
+        bits if bits == mem::MEM_RESERVE | mem::MEM_COMMIT || (bits == mem::MEM_COMMIT && addr.is_null()) => true,
+        _ => return None,
+    };
+    let (class, mappable) = (abi.mappable_reservation)(t, flags, protection)
+        .map(|class| (class, true)).or_else(|| (abi.source_pool_allocation)(t, flags, protection).map(|class| (class, false)))?;
+    let mut g = PHYS.lock().unwrap();
+    let Some(base) = cpu_reserve(&mut g, addr as usize, size, t, flags, protection, class) else { return Some(std::ptr::null_mut()) };
+    g.reservation(base).unwrap().cpu.as_mut().unwrap().accepts_physical_map = mappable;
+    if committed {
+        if !g.commit_anonymous(base, size, protection) {
+            let error = fnd::GetLastError();
+            free_reservation(&mut g, base, 0, mem::MEM_RELEASE);
+            fnd::SetLastError(error);
+            return Some(std::ptr::null_mut());
+        }
+    }
+    Some(base as *mut c_void)
+}
+
 /// The 64 KiB at `at` split out of the placeholder holding them.
 unsafe fn split(at: usize) -> bool {
     mem::VirtualFree(at as *mut c_void, PHYS_PAGE, PRESERVE) != 0
 }
 
 /// The 64 KiB placeholder at `at` replaced by a view of `section` from `offset`.
+#[cfg(test)]
 unsafe fn map_into(section: usize, offset: usize, at: usize) -> bool {
-    let v = mem::MapViewOfFile3(section as HANDLE, GetCurrentProcess(), at as *const c_void, offset as u64, PHYS_PAGE, mem::MEM_REPLACE_PLACEHOLDER, mem::PAGE_READWRITE, std::ptr::null_mut(), 0);
+    map_with_access(section, offset, at, mem::PAGE_READWRITE)
+}
+
+unsafe fn map_with_access(section: usize, offset: usize, at: usize, access: u32) -> bool {
+    let v = mem::MapViewOfFile3(section as HANDLE, GetCurrentProcess(), at as *const c_void, offset as u64, PHYS_PAGE, mem::MEM_REPLACE_PLACEHOLDER, access, std::ptr::null_mut(), 0);
     v.Value as usize == at
 }
 
@@ -311,6 +643,80 @@ impl Phys {
         self.reservations.range(..=at).next_back().is_some_and(|(_, r)| at < r.end)
     }
 
+    fn cpu_reservation(&self, at: usize) -> Option<CpuReservation> {
+        self.reservations.range(..=at).next_back().and_then(|(_, r)| (at < r.end).then_some(r.cpu).flatten())
+    }
+
+    unsafe fn commit_anonymous(&mut self, at: usize, size: usize, protect: u32) -> bool {
+        let cpu = self.cpu_reservation(at).unwrap();
+        let grain = cpu.class.grain.bytes();
+        let first = at & !(grain - 1);
+        let Some(end) = at.checked_add(size.max(1)).and_then(|e| e.checked_next_multiple_of(grain)).filter(|&e| e <= cpu.base + cpu.len) else {
+            fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
+            return false;
+        };
+        let access = super::sanitize_protect(protect) & 0xff;
+        let mut installed = Vec::new();
+        let mut slot = first;
+        let install = |g: &mut Phys, installed: &mut Vec<usize>, start: usize, count: usize| -> Option<()> {
+            let len = count * PHYS_PAGE;
+            let section = Arc::new(Section { raw: create_section(len)?, len });
+            let view = PhysicalSectionView { base: view_anywhere(section.raw, 0, len)?, len };
+            if mem::VirtualAlloc(view.base as *const _, len, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() { return None; }
+            let index = take_page_indices(&NEXT_PAGE_INDEX, count, false)?;
+            for i in 0..count {
+                let a = start + i * PHYS_PAGE;
+                let r = g.reservation(a)?;
+                if !r.placeholder(a) || !map_with_access(section.raw, i * PHYS_PAGE, a, access) { return None; }
+                r.slots.insert(a, Slot::View);
+                let page = page_number(index + i);
+                let owned = PhysicalPageRef { token: page, offset: i * PHYS_PAGE, section: Arc::clone(&section) };
+                g.record(a, page, Kind::View, Some(owned));
+                lazy::view(a, PHYS_PAGE);
+                crate::memmap::committed(a, PHYS_PAGE, access);
+                installed.push(a);
+            }
+            Some(())
+        };
+        while slot < end {
+            if self.at.contains_key(&slot) { slot += PHYS_PAGE; continue; }
+            let start = slot;
+            while slot < end && slot - start < 8 << 20 && !self.at.contains_key(&slot)
+                && self.reservation(slot).is_some_and(|r| r.slots.get(&slot) != Some(&Slot::Private)) {
+                slot += PHYS_PAGE;
+            }
+            if start == slot || install(self, &mut installed, start, (slot - start) / PHYS_PAGE).is_none() {
+                for a in installed { self.unmap_at(a); }
+                fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
+                return false;
+            }
+        }
+        true
+    }
+
+    unsafe fn home_for_mapping(&mut self, page: usize, protection: u32) -> Option<usize> {
+        if SECTION_BACKEND.get().is_none() {
+            return self.uma_home(page);
+        }
+        self.section_home_for_mapping(page, protection)
+    }
+
+    unsafe fn section_home_for_mapping(&mut self, page: usize, protection: u32) -> Option<usize> {
+        let (block, offset) = self.block_of(page)?;
+        let first = page_index(page)? - offset / PHYS_PAGE;
+        let base = match block.section_home.filter(|&(home, id)| self.cpu_reservation(home).is_some_and(|r| r.id == id)) {
+            Some((home, _)) => home,
+            None => {
+                let bytes = block.count * PHYS_PAGE;
+                let home = cpu_reserve(self, 0, bytes, mem::MEM_RESERVE, 0, protection, MapClass { grain: VirtualGrain::K64, default_gpu: true })?;
+                let id = self.cpu_reservation(home)?.id;
+                self.blocks.get_mut(&first)?.section_home = Some((home, id));
+                home
+            }
+        };
+        base.checked_add(offset)
+    }
+
     fn places(&self, page: usize) -> &[usize] {
         self.places.get(&page).map_or(&[], |v| v.as_slice())
     }
@@ -341,7 +747,7 @@ impl Phys {
         self.history.push(crate::alias::MapEvent { t: crate::log::uptime() as f32, thread: unsafe { GetCurrentThreadId() }, at, len, page, what, site: self.site });
     }
 
-    fn record(&mut self, at: usize, page: usize, kind: Kind) {
+    fn record(&mut self, at: usize, page: usize, kind: Kind, owned: Option<PhysicalPageRef>) {
         self.note(
             match kind {
                 Kind::View => "map view of",
@@ -355,7 +761,10 @@ impl Phys {
         if kind == Kind::Copy {
             COPIES.fetch_add(1, Ordering::Release);
         }
-        self.at.insert(at, Mapping { page, kind });
+        let backing = if kind == Kind::View {
+            self.block_of(page).map(|(b, offset)| PhysicalPageRef { token: page, offset, section: Arc::clone(&b.section) })
+        } else { None };
+        self.at.insert(at, Mapping { page, kind, backing: owned.or(backing) });
         self.places.entry(page).or_default().push(at);
     }
 
@@ -380,7 +789,7 @@ impl Phys {
             return false;
         }
         if self.in_reservation(at) {
-            let Some((section, offset)) = self.block_of(page).map(|(b, off)| (b.section, off)) else { return false };
+            let Some((section, offset)) = self.block_of(page).map(|(b, off)| (b.section.raw, off)) else { return false };
             let home = self.home(page).unwrap();
             let from = if self.has_views(page) { None } else { self.copies(page).first().copied() };
             // (committed now: the page is written through its views)
@@ -394,14 +803,15 @@ impl Phys {
                 crate::eh::note_guest_write("physical page section filled from the page's copy (its first view)", home, PHYS_PAGE);
             }
             let r = self.reservation(at).unwrap();
-            if !r.placeholder(at) || !map_into(section, offset, at) {
+            let access = r.cpu.map_or(mem::PAGE_READWRITE, |cpu| cpu.cpu_access());
+            if !r.placeholder(at) || !map_with_access(section, offset, at, access) {
                 fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
                 return false;
             }
             r.slots.insert(at, Slot::View);
             lazy::view(at, PHYS_PAGE);
-            crate::memmap::committed(at, PHYS_PAGE, mem::PAGE_READWRITE);
-            self.record(at, page, Kind::View);
+            crate::memmap::committed(at, PHYS_PAGE, access);
+            self.record(at, page, Kind::View, None);
             return true;
         }
         let uma = crate::gpu::uma::get();
@@ -413,7 +823,7 @@ impl Phys {
         // submit's look for CPU writes walked it)
         if owner.is_none() && !in_committed && !committed(at) {
             lazy::mark(at, self.home(page));
-            self.record(at, page, Kind::Copy);
+            self.record(at, page, Kind::Copy, None);
             return true;
         }
         let fresh = !in_committed && !committed(at);
@@ -436,7 +846,7 @@ impl Phys {
             None if !fresh => std::ptr::write_bytes(at as *mut u8, 0, PHYS_PAGE),
             None => {} // freshly committed: zeros
         }
-        self.record(at, page, Kind::Copy);
+        self.record(at, page, Kind::Copy, None);
         true
     }
 
@@ -473,7 +883,7 @@ impl Phys {
                         r.slots.insert(at, Slot::Placeholder);
                     } else {
                         let error = fnd::GetLastError();
-                        self.at.insert(at, m);
+                        self.at.insert(at, m.clone());
                         self.places.entry(m.page).or_default().push(at);
                         self.note("UNMAP REFUSED BY WINDOWS, the view stays: of", at, PHYS_PAGE, m.page);
                         static SITES: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
@@ -557,11 +967,19 @@ impl Phys {
 }
 
 pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, num: *mut usize, arr: *mut usize) -> BOOL {
+    allocate_pages(num, arr, false)
+}
+
+unsafe fn allocate_pages(num: *mut usize, arr: *mut usize, clustered: bool) -> BOOL {
     if num.is_null() || arr.is_null() || *num == 0 {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return 0;
     }
     let n = *num;
+    if clustered && !n.is_multiple_of(32) {
+        fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     let Some(bytes) = n.checked_mul(PHYS_PAGE).filter(|&b| b <= 1 << 40) else {
         fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
         return 0;
@@ -577,13 +995,18 @@ pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, nu
         fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
         return 0;
     };
+    let Some(first) = take_page_indices(&NEXT_PAGE_INDEX, n, clustered) else {
+        mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut c_void });
+        fnd::CloseHandle(section as HANDLE);
+        fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    };
     lazy::view(view, bytes);
     crate::memmap::reserved(view, bytes);
-    let first = NEXT_PAGE_INDEX.fetch_add(n, Ordering::Relaxed);
     for i in 0..n {
         *arr.add(i) = page_number(first + i);
     }
-    PHYS.lock().unwrap().blocks.insert(first, Block { count: n, live: n, freed: vec![0; n.div_ceil(Block::WORD_BITS)], section, view, uma_home: None });
+    PHYS.lock().unwrap().blocks.insert(first, Block { count: n, live: n, freed: vec![0; n.div_ceil(Block::WORD_BITS)], section: Arc::new(Section { raw: section, len: bytes }), clustered, section_home: None, view, uma_home: None });
     1
 }
 
@@ -617,7 +1040,9 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
         // (forgotten before it goes: once unmapped, the address may be another thread's)
         crate::memmap::released(b.view);
         mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: b.view as *mut c_void });
-        fnd::CloseHandle(b.section as HANDLE);
+        if let Some((home, _)) = b.section_home.filter(|&(h, id)| g.cpu_reservation(h).is_some_and(|r| r.id == id)) {
+            free_reservation(&mut g, home, 0, mem::MEM_RELEASE);
+        }
         if let (Some(h), Some(u)) = (b.uma_home, crate::gpu::uma::get()) {
             // (the unified memory the allocation had goes back: nothing stays mapped in it)
             for at in g.mapped_in(h, h + b.count * PHYS_PAGE) {
@@ -633,12 +1058,12 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
     1
 }
 
-pub unsafe extern "system" fn MapTitlePhysicalPages(va: *mut c_void, n: usize, _t: u32, _p: u32, arr: *mut usize) -> *mut c_void {
+pub unsafe extern "system" fn MapTitlePhysicalPages(va: *mut c_void, n: usize, _t: u32, p: u32, arr: *mut usize) -> *mut c_void {
     let t0 = std::time::Instant::now();
     let mut g = PHYS.lock().unwrap();
     let locked = t0.elapsed();
     g.site = "MapTitlePhysicalPages";
-    let r = map_pages(&mut g, va, n, arr);
+    let r = map_pages(&mut g, va, n, arr, Some(p));
     trace_map("MapPhysicalPages", va as usize, n, arr, r as usize, (locked, t0.elapsed()));
     r
 }
@@ -658,7 +1083,7 @@ pub fn gpu_view_map_gen() -> u64 {
     GPU_VIEW_MAP_GEN.load(Ordering::Acquire)
 }
 
-unsafe fn map_pages(g: &mut Phys, va: *mut c_void, n: usize, arr: *mut usize) -> *mut c_void {
+unsafe fn map_pages(g: &mut Phys, va: *mut c_void, n: usize, arr: *mut usize, legacy_protection: Option<u32>) -> *mut c_void {
     if n == 0 || (va.is_null() && arr.is_null()) {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return std::ptr::null_mut();
@@ -672,7 +1097,10 @@ unsafe fn map_pages(g: &mut Phys, va: *mut c_void, n: usize, arr: *mut usize) ->
         // consecutive pages of one allocation at no chosen address: unified memory of its own
         let consecutive = pages[0] != 0 && (1..n).all(|i| pages[0].checked_add(i * FRAMES) == Some(pages[i]));
         let same_block = consecutive && g.block_of(pages[n - 1]).zip(g.block_of(pages[0])).is_some_and(|((a, _), (b, _))| std::ptr::eq(a, b));
-        let Some(home) = same_block.then(|| g.uma_home(pages[0])).flatten() else {
+        let Some(home) = same_block.then(|| match legacy_protection {
+            Some(p) => g.home_for_mapping(pages[0], p),
+            None => g.uma_home(pages[0]),
+        }).flatten() else {
             fnd::SetLastError(fnd::ERROR_NOT_SUPPORTED);
             return std::ptr::null_mut();
         };
@@ -685,7 +1113,9 @@ unsafe fn map_pages(g: &mut Phys, va: *mut c_void, n: usize, arr: *mut usize) ->
         return std::ptr::null_mut();
     }
     // (no longer the GPU's view of anything there)
-    crate::hle::d3d12x::page_mappings::forget(base, n * PHYS_PAGE);
+    if g.cpu_reservation(base).is_none() {
+        crate::hle::d3d12x::page_mappings::forget(base, n * PHYS_PAGE);
+    }
     if super::mirrors::source(base).is_some() {
         GPU_VIEW_MAP_GEN.fetch_add(1, Ordering::Release);
     }
@@ -704,13 +1134,73 @@ unsafe fn map_pages(g: &mut Phys, va: *mut c_void, n: usize, arr: *mut usize) ->
 
 /// `BOOL XMemAllocatePhysicalPages(XALLOC_ATTRIBUTES, SIZE_T* count, ULONG64* pages)`: the
 /// title physical pages above (64 KiB)
-pub unsafe extern "system" fn XMemAllocatePhysicalPages(_attrs: u64, num: *mut usize, arr: *mut u64) -> BOOL {
-    AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, num, arr as *mut usize)
+pub unsafe extern "system" fn XMemAllocatePhysicalPages(flags: u64, num: *mut usize, arr: *mut u64) -> BOOL {
+    allocate_pages(num, arr.cast(), SECTION_BACKEND.get().is_some_and(|abi| (abi.clustered_allocation)(flags)))
 }
 
 /// `void* XMemMapPhysicalPages(void* address, SIZE_T count, ULONG64* pages)`
 pub unsafe extern "system" fn XMemMapPhysicalPages(va: *mut c_void, n: usize, arr: *mut u64) -> *mut c_void {
-    MapTitlePhysicalPages(va, n, 0, 0, arr as *mut usize)
+    let t0 = std::time::Instant::now();
+    let mut g = PHYS.lock().unwrap();
+    let locked = t0.elapsed();
+    if let Some(cpu) = g.cpu_reservation(va as usize) {
+        g.site = "XMemMapPhysicalPages";
+        return map_gdk(&mut g, cpu, va as usize, n, arr).map_or(std::ptr::null_mut(), |_| va);
+    }
+    g.site = "MapTitlePhysicalPages";
+    let r = map_pages(&mut g, va, n, arr.cast(), None);
+    trace_map("MapPhysicalPages", va as usize, n, arr.cast(), r as usize, (locked, t0.elapsed()));
+    r
+}
+
+unsafe fn map_gdk(g: &mut Phys, cpu: CpuReservation, at: usize, n: usize, arr: *const u64) -> Option<()> {
+    let grain = cpu.class.grain.bytes();
+    let fail = || {
+        fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+        None
+    };
+    if !cpu.accepts_physical_map || n == 0 || !at.is_multiple_of(grain) || n > (cpu.base + cpu.len - at) / grain {
+        return fail();
+    }
+    let mut tokens = Vec::new();
+    if tokens.try_reserve_exact(n * (grain / PHYS_PAGE)).is_err() {
+        fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
+        return None;
+    }
+    for i in 0..n {
+        let head = if arr.is_null() { 0 } else { *arr.add(i) as usize };
+        if head != 0 {
+            let Some((b, offset)) = g.block_of(head) else { return fail() };
+            if grain > PHYS_PAGE && (!b.clustered || !head.is_multiple_of(grain >> 12) || !offset.is_multiple_of(grain)) {
+                return fail();
+            }
+            if grain > b.count * PHYS_PAGE - offset {
+                return fail();
+            }
+            for j in 0..grain / PHYS_PAGE {
+                if !b.is_live(offset / PHYS_PAGE + j) {
+                    return fail();
+                }
+                let token = head + j * FRAMES;
+                if g.places(token).iter().any(|&old_at| {
+                    !(at..at + n * grain).contains(&old_at)
+                        && g.cpu_reservation(old_at).is_some_and(|c| c.cache() != cpu.cache())
+                }) {
+                    return fail();
+                }
+                tokens.push(token);
+            }
+        } else {
+            tokens.resize(tokens.len() + grain / PHYS_PAGE, 0);
+        }
+    }
+    for (i, token) in tokens.into_iter().enumerate() {
+        let va = at + i * PHYS_PAGE;
+        if !(if token == 0 { g.unmap_at(va) } else { g.map_at(va, token) }) {
+            return None;
+        }
+    }
+    Some(())
 }
 
 /// `BOOL XMemMapPhysicalPagesScatter(void** addresses, SIZE_T count, ULONG64* pages)`: one 64 KiB
@@ -736,7 +1226,15 @@ pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(addresses: *const *mut
     for i in 0..n {
         let at = *addresses.add(i) as usize;
         let t1 = std::time::Instant::now();
-        let r = map_pages(&mut g, at as *mut c_void, 1, page(i));
+        let r = if let Some(cpu) = g.cpu_reservation(at) {
+            if cpu.class.grain != VirtualGrain::K64 {
+                fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+                return 0;
+            }
+            map_gdk(&mut g, cpu, at, 1, page(i).cast()).map_or(std::ptr::null_mut(), |_| at as *mut c_void)
+        } else {
+            map_pages(&mut g, at as *mut c_void, 1, page(i), None)
+        };
         trace_map("MapPhysicalPagesScatter", at, 1, page(i), r as usize, (if i == 0 { locked } else { Default::default() }, t1.elapsed()));
         if r.is_null() {
             return 0;
@@ -755,10 +1253,14 @@ pub unsafe extern "system" fn XMemFreePhysicalPages(n: usize, arr: *mut u64) -> 
 /// A reservation of 64 KiB pages for the title (MEM_RESERVE | MEM_64K_PAGES, no address chosen)
 /// as a placeholder, so the pages it maps there are views (None: Windows refused).
 pub(crate) unsafe fn reserve(size: usize) -> Option<usize> {
+    reserve_compat(size, None)
+}
+
+pub(super) unsafe fn reserve_compat(size: usize, raw_gdk64: Option<RawGdk64>) -> Option<usize> {
     let len = size.checked_next_multiple_of(PHYS_PAGE).filter(|&l| l > 0)?;
     let base = reserve_placeholder(len)?;
     crate::memmap::reserved(base, len);
-    PHYS.lock().unwrap().reservations.insert(base, Reservation { end: base + len, slots: BTreeMap::new() });
+    PHYS.lock().unwrap().reservations.insert(base, Reservation { end: base + len, slots: BTreeMap::new(), cpu: None, raw_gdk64 });
     Some(base)
 }
 
@@ -771,6 +1273,9 @@ pub(crate) fn in_reservation(a: usize) -> bool {
 /// private memory in the slots that hold no page, the page's own memory in those that do.
 pub(crate) unsafe fn commit_in_reservation(a: usize, size: usize, protect: u32) -> Option<*mut c_void> {
     let mut g = PHYS.lock().unwrap();
+    if g.cpu_reservation(a).is_some() {
+        return Some(if g.commit_anonymous(a, size, protect) { a as *mut c_void } else { std::ptr::null_mut() });
+    }
     let r = g.reservation(a)?;
     let Some(end) = a.checked_add(size.max(1)).filter(|&e| e <= r.end) else {
         fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
@@ -810,8 +1315,13 @@ pub(crate) unsafe fn commit_in_reservation(a: usize, size: usize, protect: u32) 
 /// pages in the range and decommits the private memory there.
 pub(crate) unsafe fn free_in_reservation(a: usize, size: usize, t: u32) -> Option<BOOL> {
     let mut g = PHYS.lock().unwrap();
+    free_reservation(&mut g, a, size, t)
+}
+
+unsafe fn free_reservation(g: &mut Phys, a: usize, size: usize, t: u32) -> Option<BOOL> {
     let (&base, r) = g.reservations.range(..=a).next_back().filter(|(_, r)| a < r.end)?;
     let end = r.end;
+    let legacy = r.cpu.is_none();
     let fail = || {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         Some(0)
@@ -820,11 +1330,17 @@ pub(crate) unsafe fn free_in_reservation(a: usize, size: usize, t: u32) -> Optio
     if release == decommitting || (release && (a != base || size != 0)) {
         return fail();
     }
-    let range_end = if release || size == 0 { end } else { a.saturating_add(size).min(end) };
+    let grain = r.cpu.map_or(PHYS_PAGE, |cpu| cpu.class.grain.bytes());
+    let range_end = if release || size == 0 { end } else if legacy { a.saturating_add(size).min(end) } else {
+        a.saturating_add(size).min(end).next_multiple_of(grain)
+    };
+    let a = if legacy { a } else { a & !(grain - 1) };
     g.site = "VirtualFree";
     g.note(if release { "the title releases its reservation (pages unmapped, private memory gone)" } else { "the title decommits in its reservation (pages unmapped, private memory decommitted)" }, a & !(PHYS_PAGE - 1), range_end - (a & !(PHYS_PAGE - 1)), 0);
     crate::alias::mapping_changed(if release { "the title's reservation of 64 KiB pages is released" } else { "a range of the title's reservation of 64 KiB pages is decommitted" }, "VirtualFree", a & !(PHYS_PAGE - 1), range_end - (a & !(PHYS_PAGE - 1)));
-    crate::hle::d3d12x::page_mappings::forget(a & !(PHYS_PAGE - 1), range_end - (a & !(PHYS_PAGE - 1)));
+    if legacy {
+        crate::hle::d3d12x::page_mappings::forget(a & !(PHYS_PAGE - 1), range_end - (a & !(PHYS_PAGE - 1)));
+    }
     let mapped: Vec<usize> = g.at.keys().copied().filter(|&x| x >= (a & !(PHYS_PAGE - 1)) && x < range_end).collect();
     for x in mapped {
         g.unmap_at(x);
@@ -938,6 +1454,9 @@ pub unsafe fn write_physical_pages(pages: &[usize], offset: usize, src: &[u8]) -
     let g = PHYS.lock().unwrap();
     let Some(need) = span(pages, offset, src.len()) else { return false };
     if pages[..need].iter().any(|&p| g.block_of(p).is_none()) {
+        return false;
+    }
+    if pages[..need].iter().any(|&p| g.owner(p).is_none() && !use_page(g.home(p).unwrap())) {
         return false;
     }
     let mut done = 0;
@@ -1178,13 +1697,17 @@ pub(crate) struct AliasFacts {
 /// nothing (plain memory no page was mapped at within the history kept), or the model is locked
 /// by another thread – at a crash it is not waited for.
 pub(crate) fn alias_facts(va: usize) -> Option<AliasFacts> {
+    alias_facts_inner(va, &PHYS, false)
+}
+
+pub(crate) fn crash_alias_facts(va: usize) -> Option<AliasFacts> {
+    alias_facts_inner(va, LazyLock::get(&PHYS)?, true)
+}
+
+fn alias_facts_inner(va: usize, phys: &Mutex<Phys>, compact: bool) -> Option<AliasFacts> {
     let at = va & !(PHYS_PAGE - 1);
-    let Some(g) = crate::alias::try_lock(&PHYS) else {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| crate::xlog_warn!("alias report: the physical pages are locked by another thread, no account of them"));
-        return None;
-    };
-    let mapped = g.at.get(&at).copied();
+    let g = crate::alias::try_lock(phys)?;
+    let mapped = g.at.get(&at);
     let page = mapped.map(|m| m.page).or_else(|| g.page_at(at));
     let slot = g.reservations.range(..=at).next_back().filter(|(_, r)| at < r.end).map(|(&base, r)| (base, r.end, r.slots.get(&at).copied()));
     let history_here: Vec<String> = g.history.at(at, 8).iter().map(|e| e.to_string()).collect();
@@ -1192,7 +1715,7 @@ pub(crate) fn alias_facts(va: usize) -> Option<AliasFacts> {
         return None;
     }
     let mut what = match (mapped, page) {
-        (Some(m), _) => format!("physical page {:#x} is mapped here as a {}", m.page, kind_name(m.kind, lazy::is_lazy(at))),
+        (Some(m), _) => format!("physical page {:#x} is mapped here as a {}", m.page, kind_name(m.kind, !compact && lazy::is_lazy(at))),
         (None, Some(p)) => format!("XCL's own view of physical page {p:#x} (its place in its allocation's view, or its unified-memory home)"),
         (None, None) => "no physical page is mapped here".to_string(),
     };
@@ -1221,12 +1744,14 @@ pub(crate) fn alias_facts(va: usize) -> Option<AliasFacts> {
             Some(o) => format!("; its data is in its copy at {o:#x} (it has no view)"),
             None => "; it was never used (zeros)".to_string(),
         };
-        if let Some(h) = home.filter(|&h| h != at) {
-            aliases.push((h, "XCL's view of the page's section".to_string()));
-        }
-        for &a in g.places(p) {
-            if a != at {
-                aliases.push((a, g.at.get(&a).map_or("?", |m| kind_name(m.kind, lazy::is_lazy(a))).to_string()));
+        if !compact {
+            if let Some(h) = home.filter(|&h| h != at) {
+                aliases.push((h, "XCL's view of the page's section".to_string()));
+            }
+            for &a in g.places(p) {
+                if a != at {
+                    aliases.push((a, g.at.get(&a).map_or("?", |m| kind_name(m.kind, lazy::is_lazy(a))).to_string()));
+                }
             }
         }
         history_page = g.history.of_page(p, at, 8).iter().map(|e| e.to_string()).collect();
@@ -1272,9 +1797,216 @@ unsafe fn trace_map(what: &str, va: usize, n: usize, arr: *const usize, result: 
     }
 }
 
+/// (tests) pages physical pages shown at two reserved addresses: (address, alias, pages).
+#[cfg(test)]
+pub(crate) unsafe fn test_alias_views(pages: usize) -> Option<(usize, usize, Vec<usize>)> {
+    let mut n = pages;
+    let mut ids = vec![0usize; pages];
+    if allocate_pages(&mut n, ids.as_mut_ptr(), false) == 0 {
+        return None;
+    }
+    let at = reserve(pages * PHYS_PAGE)?;
+    let alias = reserve(pages * PHYS_PAGE)?;
+    hold_physical_pages(|h| (0..pages).all(|i| h.view(at + i * PHYS_PAGE, ids[i]) && h.view(alias + i * PHYS_PAGE, ids[i]))).then_some((at, alias, ids))
+}
+
+/// (tests) What test_alias_views made goes.
+#[cfg(test)]
+pub(crate) unsafe fn test_free_alias_views(at: usize, alias: usize, mut ids: Vec<usize>) {
+    free_in_reservation(at, 0, mem::MEM_RELEASE);
+    free_in_reservation(alias, 0, mem::MEM_RELEASE);
+    FreeTitlePhysicalPages(std::ptr::null_mut(), ids.len(), ids.as_mut_ptr());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn committed_segment_excludes_holes_and_obeys_live_segment_boundaries() {
+        unsafe {
+            let mut n = 8;
+            let mut ids = [0usize; 8];
+            assert_ne!(allocate_pages(&mut n, ids.as_mut_ptr(), false), 0);
+            let at = reserve(3 * PHYS_PAGE).unwrap();
+            assert!(hold_physical_pages(|h| h.view(at, ids[2]) && h.view(at + PHYS_PAGE, ids[3]) && h.view(at + 2 * PHYS_PAGE, ids[6])));
+            let get = |va| match snapshot_queue_sources(&[va]).unwrap().remove(0) {
+                QueuePageSource::Physical(page) => page,
+                _ => panic!("expected a committed physical page"),
+            };
+            let p = get(at + PHYS_PAGE);
+            let (off, view) = p.pin_committed_segment(0..PHYSICAL_SEGMENT_BYTES).unwrap();
+            assert_eq!((off, view.len()), (2 * PHYS_PAGE, 2 * PHYS_PAGE));
+            assert_eq!(get(at + 2 * PHYS_PAGE).pin_committed_segment(0..PHYSICAL_SEGMENT_BYTES).unwrap().0, 6 * PHYS_PAGE);
+            assert!(hold_physical_pages(|h| h.view(at, ids[4]) && h.view(at + PHYS_PAGE, ids[5])));
+            let joined = get(at);
+            let (off, clipped) = joined.pin_committed_segment(4 * PHYS_PAGE..6 * PHYS_PAGE).unwrap();
+            assert_eq!((off, clipped.len()), (4 * PHYS_PAGE, 2 * PHYS_PAGE));
+            assert!(joined.pin_committed_segment(6 * PHYS_PAGE..8 * PHYS_PAGE).is_none());
+            assert_eq!(free_in_reservation(at, 0, mem::MEM_RELEASE), Some(1));
+            assert_ne!(FreeTitlePhysicalPages(std::ptr::null_mut(), n, ids.as_mut_ptr()), 0);
+            assert_eq!(p.pin_committed_segment(0..PHYSICAL_SEGMENT_BYTES).unwrap().1.len(), 5 * PHYS_PAGE);
+        }
+    }
+
+    #[test]
+    fn clustered_reservation_maps_cluster_heads_and_retains_queue_sources() {
+        unsafe {
+            let cluster = 32 * PHYS_PAGE;
+            let mut n = 64usize;
+            let mut ids = [0usize; 64];
+            assert_ne!(allocate_pages(&mut n, ids.as_mut_ptr(), true), 0);
+            assert_eq!(ids[0] % (cluster >> 12), 0);
+            let class = MapClass { grain: VirtualGrain::M2, default_gpu: true };
+            let reserve = |addr, access| cpu_reserve(&mut PHYS.lock().unwrap(), addr, 2 * cluster, mem::MEM_RESERVE, 0, access, class);
+            let va = reserve(0, mem::PAGE_READWRITE).unwrap();
+            assert_eq!(va % cluster, 0);
+            assert!(reserve(va, mem::PAGE_READWRITE).is_none());
+            let ro = reserve(0, mem::PAGE_READONLY).unwrap();
+            let mut heads = [ids[32] as u64, ids[0] as u64];
+            assert_eq!(XMemMapPhysicalPages(va as *mut _, 2, heads.as_mut_ptr()) as usize, va);
+            assert_eq!(XMemMapPhysicalPages(ro as *mut _, 2, heads.as_mut_ptr()) as usize, ro);
+            *((va + 31 * PHYS_PAGE) as *mut u32) = 0xafa513;
+            assert_eq!(*((ro + 31 * PHYS_PAGE) as *const u32), 0xafa513);
+            let mut mbi = mem::MEMORY_BASIC_INFORMATION::default();
+            assert_ne!(mem::VirtualQuery(ro as *const _, &mut mbi, std::mem::size_of_val(&mbi)), 0);
+            assert_eq!(mbi.Protect, mem::PAGE_READONLY);
+            let take = |s| match s { QueuePageSource::Physical(p) => p, _ => panic!("not physical") };
+            let sources = snapshot_queue_sources(&[va, va + 31 * PHYS_PAGE, ro + 31 * PHYS_PAGE]).unwrap();
+            let old = take(sources[1].clone());
+            assert_eq!(old.id(), ids[63]);
+            assert_eq!(take(sources[2].clone()).id(), old.id());
+            assert!(take(sources[0].clone()).same_section(&old));
+            assert!(matches!(snapshot_default_gpu_sources(&[va]).unwrap()[0], Some(QueuePageSource::Physical(_))));
+            assert!(XMemMapPhysicalPagesScatter([va as *mut _].as_ptr(), 1, heads.as_mut_ptr()) == 0);
+            let mut unaligned = ids[1] as u64;
+            assert!(XMemMapPhysicalPages(va as *mut _, 1, &mut unaligned).is_null());
+            assert_eq!(XMemMapPhysicalPages(va as *mut _, 2, std::ptr::null_mut()) as usize, va);
+            assert!(matches!(snapshot_queue_sources(&[va]).unwrap()[0], QueuePageSource::Hole));
+            assert!(matches!(snapshot_default_gpu_sources(&[va]).unwrap()[0], Some(QueuePageSource::Hole)));
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), n, ids.as_mut_ptr()), 1);
+            assert_eq!(take(snapshot_queue_sources(&[ro + 31 * PHYS_PAGE]).unwrap().remove(0)).id(), ids[63]);
+            assert_eq!(free_in_reservation(va, 0, mem::MEM_RELEASE), Some(1));
+            assert_eq!(free_in_reservation(ro, 0, mem::MEM_RELEASE), Some(1));
+            let pin = pin_physical_view_run(&[old]).unwrap();
+            assert_eq!(*(pin.base() as *const u32), 0xafa513);
+        }
+    }
+
+    #[test]
+    fn legacy_section_home_is_stable_and_default_gpu_mapping_is_selective() {
+        unsafe {
+            let mut n = 2usize;
+            let mut ids = [0usize; 2];
+            assert_ne!(allocate_pages(&mut n, ids.as_mut_ptr(), false), 0);
+            let mut g = PHYS.lock().unwrap();
+            let home = g.section_home_for_mapping(ids[0], mem::PAGE_READWRITE).unwrap();
+            assert_eq!(g.section_home_for_mapping(ids[1], mem::PAGE_READWRITE), Some(home + PHYS_PAGE));
+            assert!(g.map_at(home, ids[0]));
+            let cls = MapClass { grain: VirtualGrain::K64, default_gpu: false };
+            let cpu = cpu_reserve(&mut g, 0, PHYS_PAGE, mem::MEM_RESERVE, 0, mem::PAGE_READWRITE, cls).unwrap();
+            assert!(g.map_at(cpu, ids[0]));
+            drop(g);
+            *(home as *mut u32) = 77;
+            assert_eq!(*(cpu as *const u32), 77);
+            let defaults = snapshot_default_gpu_sources(&[cpu, home]).unwrap();
+            assert!(defaults[0].is_none());
+            assert!(matches!(defaults[1], Some(QueuePageSource::Physical(_))));
+            assert_eq!(free_in_reservation(cpu, 0, mem::MEM_RELEASE), Some(1));
+            assert_ne!(FreeTitlePhysicalPages(std::ptr::null_mut(), n, ids.as_mut_ptr()), 0);
+            assert!(cpu_reservation_at(home).is_none());
+        }
+    }
+
+    #[test]
+    fn compatibility_storage_records_raw_xmem_request_without_granting_mapping_rights() {
+        unsafe {
+            let flags = 0xca73_4000_0000_0000u64;
+            let allocation = mem::MEM_RESERVE | super::super::MEM_64K_PAGES;
+            let access = mem::PAGE_READWRITE;
+            let bytes = 5 * crate::gpu::uma::WINDOW;
+            let v = super::super::XMemVirtualAlloc(std::ptr::null(), bytes, allocation, flags, access) as usize;
+            let (base, len, req) = compat_gdk64_reservation_at(v + PHYS_PAGE).unwrap();
+            assert_eq!((base, len, req.requested, req.requested_size, req.allocation, req.flags, req.protection), (v, bytes, 0, bytes, allocation, flags, access));
+            assert!(cpu_reservation_at(v).is_none());
+            assert!(snapshot_default_gpu_sources(&[v]).unwrap()[0].is_none());
+            let mut n = 1;
+            let mut id = 0u64;
+            assert_ne!(XMemAllocatePhysicalPages(0, &mut n, &mut id), 0);
+            assert_eq!(XMemMapPhysicalPages(v as _, 1, &mut id) as usize, v);
+            let page = match snapshot_queue_sources(&[v]).unwrap().remove(0) { QueuePageSource::Physical(p) => p, _ => unreachable!() };
+            *(v as *mut u32) = 0x6125;
+            let next = v + PHYS_PAGE;
+            assert_eq!(super::super::VirtualAlloc((next + 4096) as _, 4096, mem::MEM_COMMIT, access) as usize, next + 4096);
+            *((next + 4096) as *mut u32) = 7;
+            assert_eq!(written_pages(next, PHYS_PAGE), vec![next + 4096]);
+            assert_ne!(super::super::VirtualFree(v as _, 0, mem::MEM_RELEASE), 0);
+            assert!(compat_gdk64_reservation_at(v).is_none());
+            assert_ne!(XMemFreePhysicalPages(1, &mut id), 0);
+            assert_eq!(*(pin_physical_view_run(&[page]).unwrap().base() as *const u32), 0x6125);
+        }
+    }
+
+    #[test]
+    fn physical_source_snapshot_distinguishes_private_memory_from_a_hole() {
+        unsafe {
+            let va = reserve(2 * PHYS_PAGE).unwrap();
+            assert!(commit_in_reservation(va, PHYS_PAGE, mem::PAGE_READWRITE).is_some_and(|p| p as usize == va));
+            let sources = snapshot_queue_sources(&[va, va + PHYS_PAGE]).unwrap();
+            assert!(matches!(sources[0], QueuePageSource::GuestRange { base, len: PHYS_PAGE } if base == va));
+            assert!(matches!(sources[1], QueuePageSource::Hole));
+            assert_eq!(free_in_reservation(va, 0, mem::MEM_RELEASE), Some(1));
+        }
+    }
+
+    #[test]
+    fn anonymous_pool_refs_survive_decommit_recommit_and_release() {
+        unsafe {
+            let va = cpu_reserve(&mut PHYS.lock().unwrap(), 0, 2 * PHYS_PAGE, mem::MEM_RESERVE, 0, mem::PAGE_READWRITE,
+                MapClass { grain: VirtualGrain::K64, default_gpu: true }).unwrap();
+            assert_eq!(commit_in_reservation(va, 2 * PHYS_PAGE, mem::PAGE_READWRITE), Some(va as *mut _));
+            *(va as *mut u32) = 0xdeca_fbad;
+            let refs = |slots: &[usize]| snapshot_queue_sources(slots).unwrap().into_iter().map(|s| match s {
+                QueuePageSource::Physical(p) => p, _ => panic!("missing anonymous PFN"),
+            }).collect::<Vec<_>>();
+            let original = refs(&[va, va + PHYS_PAGE]);
+            assert!(original[0].same_section(&original[1]));
+            assert_eq!(free_in_reservation(va, PHYS_PAGE, mem::MEM_DECOMMIT), Some(1));
+            assert!(matches!(snapshot_queue_sources(&[va]).unwrap()[0], QueuePageSource::Hole));
+            assert_eq!(commit_in_reservation(va, PHYS_PAGE, mem::PAGE_READWRITE), Some(va as *mut _));
+            let replacement = refs(&[va, va + PHYS_PAGE]);
+            assert_ne!(original[0].id(), replacement[0].id());
+            assert_eq!(original[1].id(), replacement[1].id());
+            assert_eq!(*(va as *const u32), 0);
+            assert_eq!(free_in_reservation(va, 0, mem::MEM_RELEASE), Some(1));
+            let pin = pin_physical_view_run(&original).unwrap();
+            assert_eq!(*(pin.base() as *const u32), 0xdeca_fbad);
+        }
+    }
+
+    #[test]
+    fn abi_classifier_observes_unmodified_gdk_flags() {
+        const FIXTURE: u64 = 0x7812_ba32_eb43_9107;
+        let abi = GdkPhysicalAbi {
+            mappable_reservation: |_, _, _| None,
+            source_pool_allocation: |t, flags, p| (flags == FIXTURE && p == mem::PAGE_READWRITE && t == mem::MEM_COMMIT | mem::MEM_RESERVE)
+                .then_some(MapClass { grain: VirtualGrain::K64, default_gpu: true }),
+            clustered_allocation: |_| false,
+        };
+        unsafe {
+            let t = mem::MEM_RESERVE | mem::MEM_COMMIT;
+            assert!(gdk_reserve_with(&abi, std::ptr::null(), PHYS_PAGE, t, 0, mem::PAGE_READWRITE).is_none());
+            let va = gdk_reserve_with(&abi, std::ptr::null(), PHYS_PAGE, t, FIXTURE, mem::PAGE_READWRITE).unwrap() as usize;
+            let r = cpu_reservation_at(va).unwrap();
+            assert_eq!((r.requested, r.base, r.allocation, r.flags, r.protection), (0, va, t, FIXTURE, mem::PAGE_READWRITE));
+            assert!(!r.accepts_physical_map);
+            let owned = match snapshot_queue_sources(&[va]).unwrap().remove(0) { QueuePageSource::Physical(p) => p, _ => panic!("missing pool owner") };
+            *(va as *mut u32) = 0x1234;
+            assert_eq!(free_in_reservation(va, 0, mem::MEM_RELEASE), Some(1));
+            let pin = pin_physical_view_run(&[owned]).unwrap();
+            assert_eq!(*(pin.base() as *const u32), 0x1234);
+        }
+    }
 
     /// The pages of `[base, base + len)` written since the last look (write-watched memory).
     unsafe fn written_pages(base: usize, len: usize) -> Vec<usize> {
@@ -1470,7 +2202,7 @@ mod tests {
             assert_eq!(PHYS.lock().unwrap().places(pages[0]), [pool], "still counted among the page's addresses");
             assert!(alias_facts(pool).unwrap().history_here[0].contains("UNMAP REFUSED BY WINDOWS"));
             // (put back: now it goes)
-            let (section, offset) = PHYS.lock().unwrap().block_of(pages[0]).map(|(b, off)| (b.section, off)).unwrap();
+            let (section, offset) = PHYS.lock().unwrap().block_of(pages[0]).map(|(b, off)| (b.section.raw, off)).unwrap();
             assert!(map_into(section, offset, pool));
             assert_eq!(MapTitlePhysicalPages(pool as *mut c_void, 1, 0, 4, std::ptr::null_mut()) as usize, pool);
             assert!(PHYS.lock().unwrap().places(pages[0]).is_empty());

@@ -36,6 +36,7 @@
 //! `XCL_DEPTH_UAV_TWIN=0` (upstream's name): no shadows, null views as before.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -45,6 +46,8 @@ use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
+use super::depth_lineage;
+use super::depth_state::{self, Range};
 use super::real;
 
 const ALL: u32 = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
@@ -54,6 +57,18 @@ const PIXEL_READ: u32 = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32;
 const DEPTH_WRITE: u32 = D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32;
 const COPY_DEST: u32 = D3D12_RESOURCE_STATE_COPY_DEST.0 as u32;
 const COPY_SOURCE: u32 = D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32;
+
+fn legacy_range(sub: u32) -> Range {
+    if sub == ALL { Range::All } else { Range::One(sub) }
+}
+
+fn depth_range(s: &Shadow, sub: u32) -> Range {
+    if sub == ALL {
+        Range::Rect { ranges: [(0, s.mips), (0, s.slices), (0, 1)], mips: s.mips, slices: s.slices }
+    } else {
+        Range::One(sub)
+    }
+}
 
 // PC command list methods (the runtime's own: `raw`)
 const GET_TYPE: usize = 8;
@@ -297,6 +312,18 @@ fn known(res: usize) -> Option<Option<Arc<Shadow>>> {
     SHADOWS.lock().unwrap().as_ref()?.get(&res).cloned()
 }
 
+pub(super) fn capture_twin(res: usize) -> Option<(usize, i32, bool, bool)> {
+    let s = known(res)??;
+    Some((s.texture.as_raw() as usize, s.view_format.0, s.exact, s.written.load(Ordering::Relaxed)))
+}
+
+pub(super) fn select_twin_probe(owner: usize, mip: u32, slice: u32, sub: u32) {
+    if !depth_lineage::twin_enabled() { return }
+    if let Some(Some(s)) = known(owner) {
+        super::depth_twin_probe::select(owner, &s, s.texture.as_raw() as usize, mip, slice, sub);
+    }
+}
+
 /// The shadow of the depth buffer `res` (described by `rd`), made now if it has none.
 unsafe fn shadow_of(res: *mut c_void, rd: &D3D12_RESOURCE_DESC) -> Option<Arc<Shadow>> {
     if let Some(s) = known(res as usize) {
@@ -324,8 +351,20 @@ unsafe fn shadow_of(res: *mut c_void, rd: &D3D12_RESOURCE_DESC) -> Option<Arc<Sh
         }
     };
     let mut g = SHADOWS.lock().unwrap();
-    let kept = g.get_or_insert_with(HashMap::new).entry(res as usize).or_insert(shadow).clone();
+    let (kept, created) = match g.get_or_insert_with(HashMap::new).entry(res as usize) {
+        Entry::Occupied(e) => (e.get().clone(), false),
+        Entry::Vacant(e) => (e.insert(shadow).clone(), true),
+    };
     ACTIVE.store(true, Ordering::Release);
+    drop(g);
+    if let Some(s) = kept.as_ref().filter(|_| created) {
+        let twin = s.texture.as_raw() as usize;
+        depth_lineage::start(res as usize, twin);
+        depth_lineage::note(res as usize, 0, Range::All, "twin-created", || {
+            format!("twin={twin:#x} size={}x{} mips={} slices={} depth_format={} twin_format={} exact={}",
+                s.width, s.height, s.mips, s.slices, s.depth_format.0, s.typeless.0, s.exact)
+        });
+    }
     kept
 }
 
@@ -358,6 +397,12 @@ unsafe fn make(res: *mut c_void, rd: &D3D12_RESOURCE_DESC) -> Result<Shadow, Str
         )
         .map_err(|e| format!("the texture: {e}"))?;
         let texture = texture.ok_or("no texture")?;
+        if rd.Format == typeless {
+            if let Ok(mut placement) = crate::gpu::texture::image_bridge::GuestImage::get(depth) {
+                placement.host = crate::gpu::texture::image_bridge::ownership::HostBacking::PRIVATE;
+                let _ = placement.tag(texture.as_raw());
+            }
+        }
         let views: ID3D12DescriptorHeap = dev
             .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
@@ -433,10 +478,16 @@ unsafe fn make(res: *mut c_void, rd: &D3D12_RESOURCE_DESC) -> Result<Shadow, Str
 
 /// The depth buffer `res` is gone (its last reference released).
 pub(super) fn forget(res: usize) {
+    depth_lineage::forget(res);
     if !active() {
         return;
     }
     let gone = SHADOWS.lock().unwrap().as_mut().and_then(|m| m.remove(&res));
+    if gone.is_some() && depth_state::enabled() {
+        if let Some(d) = SLOT146.lock().unwrap().as_mut() {
+            d.samples.remove(&res);
+        }
+    }
     drop(gone);
 }
 
@@ -452,9 +503,38 @@ pub(super) unsafe fn view(
         return None;
     }
     let n = VIEWS.fetch_add(1, Ordering::Relaxed) + 1;
+    let wanted = desc.map_or(DXGI_FORMAT_UNKNOWN, |d| d.Format);
+    let mut view_range = Range::All;
+    let mut stencil = matches!(wanted, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT | DXGI_FORMAT_X24_TYPELESS_G8_UINT | DXGI_FORMAT_R8_UINT | DXGI_FORMAT_R8_UNORM);
+    if depth_lineage::enabled() {
+        let (mip, slice, count, plane) = match desc {
+            Some(d) => match d.ViewDimension {
+                D3D12_UAV_DIMENSION_TEXTURE1D => (d.Anonymous.Texture1D.MipSlice, 0, 1, 0),
+                D3D12_UAV_DIMENSION_TEXTURE1DARRAY => {
+                    let a = d.Anonymous.Texture1DArray;
+                    (a.MipSlice, a.FirstArraySlice, a.ArraySize, 0)
+                }
+                D3D12_UAV_DIMENSION_TEXTURE2D => {
+                    let a = d.Anonymous.Texture2D;
+                    (a.MipSlice, 0, 1, a.PlaneSlice)
+                }
+                D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
+                    let a = d.Anonymous.Texture2DArray;
+                    (a.MipSlice, a.FirstArraySlice, a.ArraySize, a.PlaneSlice)
+                }
+                _ => (0, 0, 0, 0),
+            },
+            None => (0, 0, u32::from(rd.DepthOrArraySize), 0),
+        };
+        stencil |= plane == 1;
+        let (mips, slices) = (u32::from(rd.MipLevels), u32::from(rd.DepthOrArraySize));
+        if mip < mips && count != 0 && slice.checked_add(count).is_some_and(|end| end <= slices) {
+            view_range = Range::Rect { ranges: [(mip, 1), (slice, count), (if stencil { 1 } else { plane }, 1)], mips, slices };
+        }
+    }
     let made = (|| {
-        let format = view_format(rd.Format, desc.map_or(DXGI_FORMAT_UNKNOWN, |d| d.Format))?;
-        let s = shadow_of(res, rd)?;
+        let format = view_format(rd.Format, wanted).ok_or("unsupported-format")?;
+        let s = shadow_of(res, rd).ok_or(if rd.SampleDesc.Count > 1 { "multisampled" } else { "no-twin" })?;
         let mut v = D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: format, ..Default::default() };
         match desc {
             Some(d) => {
@@ -464,7 +544,7 @@ pub(super) unsafe fn view(
                     D3D12_UAV_DIMENSION_TEXTURE1DARRAY if s.one_d => v.Anonymous.Texture1DArray = d.Anonymous.Texture1DArray,
                     D3D12_UAV_DIMENSION_TEXTURE2D if !s.one_d && d.Anonymous.Texture2D.PlaneSlice == 0 => v.Anonymous.Texture2D = d.Anonymous.Texture2D,
                     D3D12_UAV_DIMENSION_TEXTURE2DARRAY if !s.one_d && d.Anonymous.Texture2DArray.PlaneSlice == 0 => v.Anonymous.Texture2DArray = d.Anonymous.Texture2DArray,
-                    _ => return None,
+                    _ => return Err("unsupported-dimension-or-plane"),
                 }
             }
             None => match (s.one_d, s.slices > 1) {
@@ -481,9 +561,18 @@ pub(super) unsafe fn view(
             },
         }
         let texture_desc = D3D12_RESOURCE_DESC { Format: s.typeless, Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, Alignment: 0, ..*rd };
-        Some((s.texture.as_raw(), v, texture_desc))
+        Ok((s.texture.as_raw(), v, texture_desc))
     })();
-    if made.is_none() {
+    match &made {
+        Ok((twin, v, _)) => depth_lineage::note(res as usize, 0, view_range, "twin-uav-view", || {
+            format!("twin={:#x} requested_format={} actual_format={} dimension={}", *twin as usize, wanted.0, v.Format.0, v.ViewDimension.0)
+        }),
+        Err(reason) => depth_lineage::note(res as usize, 0, view_range, "null-depth-uav-view", || {
+            let reason = if stencil { "stencil-plane" } else { *reason };
+            format!("reason={reason} resource_format={} requested_format={} dimension={}", rd.Format.0, wanted.0, desc.map_or(0, |d| d.ViewDimension.0))
+        }),
+    }
+    if made.is_err() {
         NULL_VIEWS.fetch_add(1, Ordering::Relaxed);
     }
     if n <= 8 || n.is_power_of_two() {
@@ -491,10 +580,10 @@ pub(super) unsafe fn view(
             "D3D12.X: unordered access view #{n} of a depth buffer ({}x{}, {} slices, {} mips, format {}; view format {}, dimension {}): {}",
             rd.Width, rd.Height, rd.DepthOrArraySize, rd.MipLevels, rd.Format.0,
             desc.map_or(0, |d| d.Format.0), desc.map_or(0, |d| d.ViewDimension.0),
-            if made.is_some() { "of its shadow texture" } else { "a null view (the stencil plane, a multisampled buffer, or no shadow)" }
+            if made.is_ok() { "of its shadow texture" } else { "a null view (the stencil plane, a multisampled buffer, or no shadow)" }
         );
     }
-    made
+    made.ok()
 }
 
 // ---------------------------------------------------------------------------------------
@@ -553,6 +642,7 @@ fn mark_in_step(list: *mut c_void, res: usize, sub: u32) {
 /// PC `Dispatch` of an adopted list (XCL's own calls of it for the title's dispatches).
 pub(super) unsafe extern "system" fn pc_dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
     note_op(this);
+    super::image_writeback::note_work(this);
     let f = raw::<unsafe extern "system" fn(*mut c_void, u32, u32, u32)>(this, DISPATCH);
     super::gpu_timing::op_grid(this, super::gpu_timing::Kind::Dispatch, || 0, [x, y, z], || f(this, x, y, z))
 }
@@ -561,7 +651,8 @@ pub(super) unsafe extern "system" fn pc_dispatch(this: *mut c_void, x: u32, y: u
 pub(super) unsafe extern "system" fn pc_clear_depth_stencil(this: *mut c_void, dsv: usize, flags: u32, depth: f32, stencil: u8, n: u32, rects: *const RECT) {
     note_op(this);
     let f = raw::<unsafe extern "system" fn(*mut c_void, usize, u32, f32, u8, u32, *const RECT)>(this, CLEAR_DEPTH_STENCIL_VIEW);
-    super::gpu_timing::class(this, super::gpu_timing::Kind::Clear, || f(this, dsv, flags, depth, stencil, n, rects))
+    super::gpu_timing::class(this, super::gpu_timing::Kind::Clear, || f(this, dsv, flags, depth, stencil, n, rects));
+    super::depth_capture_views::note_clear(this, dsv, flags, depth, n);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -580,6 +671,7 @@ fn transition(res: usize, sub: u32, before: u32, after: u32) -> [u32; 8] {
 
 unsafe fn barriers(list: *mut c_void, b: &[[u32; 8]]) {
     raw::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(list, RESOURCE_BARRIER)(list, b.len() as u32, b.as_ptr());
+    super::depth_state::legacy_raw(list as usize, b);
 }
 
 const COPY_IN_2D: &str = r#"
@@ -728,10 +820,10 @@ unsafe fn copy_subs(list: *mut c_void, dst: usize, src: usize, subs: &[u32]) {
 
 /// Records on `list` the copy of subresource `sub` (or ALL) of the depth buffer `depth` to its
 /// shadow of the same format. The depth buffer's are in NON_PIXEL_SHADER_RESOURCE.
-unsafe fn copy_in_exact(list: *mut c_void, s: &Shadow, depth: usize, sub: u32) -> bool {
+unsafe fn copy_in_exact(list: *mut c_void, s: &Shadow, depth: usize, sub: u32) -> Result<(), &'static str> {
     let subs: Vec<u32> = s.parts(sub).iter().map(|&(m, sl)| m + sl * s.mips).collect();
     if subs.is_empty() {
-        return false;
+        return Err("no-depth-parts");
     }
     let t = s.texture.as_raw() as usize;
     let predicated = super::list_x::before_own_pass(list);
@@ -740,16 +832,16 @@ unsafe fn copy_in_exact(list: *mut c_void, s: &Shadow, depth: usize, sub: u32) -
     barriers(list, &[transition(depth, sub, COPY_SOURCE, SHADER_READ), transition(t, sub, COPY_DEST, UNORDERED_ACCESS)]);
     super::list_x::after_own_pass(list, false, predicated);
     COPIES_IN.fetch_add(1, Ordering::Relaxed);
-    true
+    Ok(())
 }
 
 /// Records on `list` the copy of the depth plane's `runs` to the shadow. The depth buffer's
 /// are in NON_PIXEL_SHADER_RESOURCE.
-unsafe fn copy_in(list: *mut c_void, s: &Shadow, runs: &[(u32, u32, u32)]) -> bool {
+unsafe fn copy_in(list: *mut c_void, s: &Shadow, runs: &[(u32, u32, u32)]) -> Result<(), &'static str> {
     if runs.is_empty() {
-        return false;
+        return Err("no-depth-parts");
     }
-    let Some((rs, pso)) = pass_in(s.one_d) else { return false };
+    let (rs, pso) = pass_in(s.one_d).ok_or("compute-pass-unavailable")?;
     let predicated = super::list_x::before_own_pass(list);
     let heaps = [s.views_heap];
     raw::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(list, SET_DESCRIPTOR_HEAPS)(list, 1, heaps.as_ptr());
@@ -775,7 +867,7 @@ unsafe fn copy_in(list: *mut c_void, s: &Shadow, runs: &[(u32, u32, u32)]) -> bo
     barriers(list, &[[2, 0, t as u32, (t as u64 >> 32) as u32, 0, 0, 0, 0]]);
     super::list_x::after_own_pass(list, false, predicated);
     COPIES_IN.fetch_add(1, Ordering::Relaxed);
-    true
+    Ok(())
 }
 
 /// The state the PC depth buffer is in for a copy back from its shadow.
@@ -788,20 +880,19 @@ fn out_state(s: &Shadow) -> u32 {
 }
 
 /// A copy back is recorded.
-fn copied_out(s: &Shadow) -> bool {
+fn copied_out(s: &Shadow) {
     COPIES_OUT.fetch_add(1, Ordering::Relaxed);
     if !s.written.swap(true, Ordering::Relaxed) {
         let n = WRITTEN.fetch_add(1, Ordering::Relaxed) + 1;
         crate::xlog_info!("D3D12.X: depth buffer {}x{} ({} slices, {} mips): the first copy of its shadow texture back to the depth plane ({n} depth buffers written back so far)", s.width, s.height, s.slices, s.mips);
     }
-    true
 }
 
 /// Records on `list` the copy of the shadow's `parts` back to the depth plane of `depth`, whose
 /// are in `out_state`: CopyTextureRegion (any list type), or the pass (a direct list).
-unsafe fn copy_out(list: *mut c_void, s: &Shadow, depth: usize, parts: &[(u32, u32)]) -> bool {
+unsafe fn copy_out(list: *mut c_void, s: &Shadow, depth: usize, parts: &[(u32, u32)]) -> Result<(), &'static str> {
     if parts.is_empty() {
-        return false;
+        return Err("no-depth-parts");
     }
     let t = s.texture.as_raw() as usize;
     if s.exact {
@@ -813,9 +904,10 @@ unsafe fn copy_out(list: *mut c_void, s: &Shadow, depth: usize, parts: &[(u32, u
         copy_subs(list, depth, t, &subs);
         barriers(list, &written);
         super::list_x::after_own_pass(list, false, predicated);
-        return copied_out(s);
+        copied_out(s);
+        return Ok(());
     }
-    let Some((rs, pso)) = pass_out(s.one_d, s.depth_format) else { return false };
+    let (rs, pso) = pass_out(s.one_d, s.depth_format).ok_or("graphics-pass-unavailable")?;
     // (the pass's view is of the whole shadow)
     let read = [transition(t, ALL, UNORDERED_ACCESS, PIXEL_READ)];
     let written = [transition(t, ALL, PIXEL_READ, UNORDERED_ACCESS)];
@@ -846,8 +938,25 @@ unsafe fn copy_out(list: *mut c_void, s: &Shadow, depth: usize, parts: &[(u32, u
     }
     barriers(list, &written);
     super::list_x::after_own_pass(list, true, predicated);
-    copied_out(s)
+    copied_out(s);
+    Ok(())
 }
+
+fn copy_event(
+    res: usize, list: usize, range: Range, into_twin: bool, result: Result<(), &'static str>, path: &'static str,
+) {
+    let kind = match (into_twin, result.is_ok()) {
+        (true, true) => "copy-in-recorded",
+        (true, false) => "copy-in-skipped",
+        (false, true) => "copy-out-recorded",
+        (false, false) => "copy-out-skipped",
+    };
+    depth_lineage::note(res, list, range, kind, || {
+        format!("path={path} reason={}", result.err().unwrap_or("recorded"))
+    });
+}
+
+const LINEAGE_PARTS: usize = 16;
 
 fn note_copy() {
     let n = COPIES_IN.load(Ordering::Relaxed) + COPIES_OUT.load(Ordering::Relaxed);
@@ -865,6 +974,7 @@ pub(super) struct Later {
     shadow: Arc<Shadow>,
     depth: usize,
     sub: u32,
+    guest_sub: u32,
     runs: Vec<(u32, u32, u32)>,
 }
 
@@ -879,6 +989,16 @@ pub(super) unsafe fn on_transition(list: *mut c_void, b: &mut [u32; 8], later: &
     if res == 0 {
         return true;
     }
+    let list_key = list as usize;
+    let sub = b[4];
+    let flags = b[1];
+    let range = legacy_range(sub);
+    let (was, is) = (before & UNORDERED_ACCESS != 0, after & UNORDERED_ACCESS != 0);
+    let egress = was && !is && flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY.0 as u32 == 0;
+    let transition_kind = if egress { "guest-legacy-uav-egress" } else { "guest-legacy-transition" };
+    let guest_transition = || depth_lineage::note(res, list_key, range, transition_kind, || {
+        format!("before={before:#x} after={after:#x} flags={flags:#x}")
+    });
     let s = match known(res) {
         Some(Some(s)) => s,
         // a depth buffer no shadow could be made for, or – not known yet – one the title moves
@@ -895,6 +1015,10 @@ pub(super) unsafe fn on_transition(list: *mut c_void, b: &mut [u32; 8], later: &
             match if other.is_some() { None } else { shadow_of(p, &rd) } {
                 Some(s) => s,
                 None => {
+                    guest_transition();
+                    if was != is {
+                        copy_event(res, list_key, range, is, Err("no-twin"), "legacy");
+                    }
                     // states the PC depth buffer has, at least
                     (b[5], b[6]) = (pc_state(before), pc_state(after));
                     return b[5] != b[6];
@@ -902,18 +1026,22 @@ pub(super) unsafe fn on_transition(list: *mut c_void, b: &mut [u32; 8], later: &
             }
         }
     };
+    guest_transition();
     // the two halves of a split barrier: the work is done at its end
-    if b[1] & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY.0 as u32 != 0 {
+    if flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY.0 as u32 != 0 {
+        if was != is {
+            copy_event(res, list_key, range, is, Err("split-begin"), "legacy");
+        }
         return false;
     }
     b[1] = 0;
-    let sub = b[4];
     let (pc_before, pc_after) = (pc_state(before), pc_state(after));
-    let (was, is) = (before & UNORDERED_ACCESS != 0, after & UNORDERED_ACCESS != 0);
     let ty = raw::<unsafe extern "system" fn(*mut c_void) -> D3D12_COMMAND_LIST_TYPE>(list, GET_TYPE)(list);
     let direct = ty == D3D12_COMMAND_LIST_TYPE_DIRECT;
     let index = |&(m, sl): &(u32, u32)| m + sl * s.mips;
     let parts = s.parts(sub);
+    let copy_range = depth_range(&s, sub);
+    let out_path = if s.exact { "texture-copy" } else { "graphics-pass" };
     // the copies back that lists which cannot draw left for these subresources
     let owed: Vec<(u32, u32)> = {
         let mut g = s.owed.lock().unwrap();
@@ -930,7 +1058,9 @@ pub(super) unsafe fn on_transition(list: *mut c_void, b: &mut [u32; 8], later: &
         if needed && (direct || s.exact) {
             let held = out_state(&s);
             barriers(list, &[transition(res, sub, pc_before, held)]);
-            if copy_out(list, &s, res, &parts) {
+            let copied = copy_out(list, &s, res, &parts);
+            copy_event(res, list_key, copy_range, false, copied, out_path);
+            if copied.is_ok() {
                 mark_in_step(list, res, sub);
                 note_copy();
             }
@@ -946,12 +1076,17 @@ pub(super) unsafe fn on_transition(list: *mut c_void, b: &mut [u32; 8], later: &
                     COPIES_OWED.fetch_add(1, Ordering::Relaxed);
                 }
             }
+            drop(g);
+            copy_event(res, list_key, copy_range, false, Err(if parts.is_empty() { "no-depth-parts" } else { "deferred-non-direct-list" }), out_path);
             static N: AtomicU64 = AtomicU64::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: a depth buffer leaves unordered access on a command list of type {} (no draws there): its shadow texture is copied back by the next direct list that names it in a transition", ty.0);
             }
-        } else if !parts.is_empty() {
-            COPIES_OUT_LEFT_OUT.fetch_add(1, Ordering::Relaxed);
+        } else {
+            if !parts.is_empty() {
+                COPIES_OUT_LEFT_OUT.fetch_add(1, Ordering::Relaxed);
+            }
+            copy_event(res, list_key, copy_range, false, Err(if parts.is_empty() { "no-depth-parts" } else { "already-in-step" }), out_path);
         }
     } else if !owed.is_empty() {
         // not leaving unordered access here, but the depth plane is behind its shadow
@@ -960,7 +1095,22 @@ pub(super) unsafe fn on_transition(list: *mut c_void, b: &mut [u32; 8], later: &
         if pc_before != DEPTH_WRITE {
             barriers(list, &read);
         }
-        if copy_out(list, &s, res, &owed) {
+        let copied = copy_out(list, &s, res, &owed);
+        if depth_lineage::enabled() {
+            if owed == parts {
+                copy_event(res, list_key, copy_range, false, copied, "owed-flush");
+            } else {
+                for p in owed.iter().take(LINEAGE_PARTS) {
+                    copy_event(res, list_key, Range::One(index(p)), false, copied, "owed-flush");
+                }
+                if owed.len() > LINEAGE_PARTS {
+                    depth_lineage::note(res, list_key, copy_range, "copy-out-range-truncated", || {
+                        format!("path=owed-flush omitted_parts={} result={copied:?}", owed.len() - LINEAGE_PARTS)
+                    });
+                }
+            }
+        }
+        if copied.is_ok() {
             note_copy();
         }
         if pc_before != DEPTH_WRITE {
@@ -975,9 +1125,14 @@ pub(super) unsafe fn on_transition(list: *mut c_void, b: &mut [u32; 8], later: &
             if !parts.is_empty() {
                 COPIES_IN_LEFT_OUT.fetch_add(1, Ordering::Relaxed);
             }
+            copy_event(res, list_key, copy_range, true, Err(if parts.is_empty() { "no-depth-parts" } else { "already-in-step" }), "legacy");
         } else if !runs.is_empty() {
-            later.push(Later { shadow: s.clone(), depth: res, sub: if behind.is_empty() { sub } else { u32::MAX - 1 }, runs });
+            later.push(Later { shadow: s.clone(), depth: res, sub: if behind.is_empty() { sub } else { u32::MAX - 1 }, guest_sub: sub, runs });
+        } else {
+            copy_event(res, list_key, copy_range, true, Err(if parts.is_empty() { "no-depth-parts" } else { "depth-older-than-twin" }), "legacy");
         }
+    } else if is && !was {
+        copy_event(res, list_key, copy_range, true, Err("unsupported-list-type"), "legacy");
     }
     (b[5], b[6]) = (pc_before, pc_after);
     b[5] != b[6]
@@ -987,13 +1142,292 @@ pub(super) unsafe fn on_transition(list: *mut c_void, b: &mut [u32; 8], later: &
 pub(super) unsafe fn after_barriers(list: *mut c_void, later: Vec<Later>) {
     for l in later {
         let copied = if l.shadow.exact { copy_in_exact(list, &l.shadow, l.depth, l.sub) } else { copy_in(list, &l.shadow, &l.runs) };
-        if copied {
+        if depth_lineage::enabled() {
+            let list_key = list as usize;
+            let range = depth_range(&l.shadow, l.guest_sub);
+            if l.sub != u32::MAX - 1 {
+                copy_event(l.depth, list_key, range, true, copied, if l.shadow.exact { "texture-copy" } else { "compute-pass" });
+            } else if l.shadow.exact {
+                copy_event(l.depth, list_key, range, true, Err("exact-partial-copy-unavailable"), "texture-copy");
+            } else {
+                for &(mip, first, slices) in l.runs.iter().take(LINEAGE_PARTS) {
+                    let part = Range::Rect {
+                        ranges: [(mip, 1), (first, slices), (0, 1)],
+                        mips: l.shadow.mips,
+                        slices: l.shadow.slices,
+                    };
+                    copy_event(l.depth, list_key, part, true, copied, "partial-compute-pass");
+                }
+                depth_lineage::note(l.depth, list_key, range, "copy-in-partial", || {
+                    format!("path=compute-pass excluded=owed-to-depth omitted_runs={} result={copied:?}", l.runs.len().saturating_sub(LINEAGE_PARTS))
+                });
+            }
+        }
+        if copied.is_ok() {
             // (a copy that left out subresources behind their shadow says nothing of the whole)
             if l.sub != u32::MAX - 1 {
                 mark_in_step(list, l.depth, l.sub);
             }
             note_copy();
         }
+    }
+}
+
+#[repr(C)]
+struct Slot146Texture {
+    sync: [i32; 2],
+    access: [i32; 2],
+    layout: [i32; 2],
+    resource: usize,
+    subresources: D3D12_BARRIER_SUBRESOURCE_RANGE,
+    flags: i32,
+}
+
+const _: () = {
+    assert!(size_of::<Slot146Texture>() == size_of::<D3D12_TEXTURE_BARRIER>());
+    assert!(std::mem::offset_of!(Slot146Texture, resource) == std::mem::offset_of!(D3D12_TEXTURE_BARRIER, pResource));
+    assert!(std::mem::offset_of!(Slot146Texture, subresources) == std::mem::offset_of!(D3D12_TEXTURE_BARRIER, Subresources));
+};
+
+#[derive(Clone, Copy, Debug)]
+struct Slot146Match {
+    list: usize,
+    epoch: u64,
+    twin: usize,
+    range: Range,
+    sync: [i32; 2],
+    access: [i32; 2],
+    layout: [i32; 2],
+    flags: i32,
+}
+
+impl Slot146Match {
+    fn uav_egress(self) -> bool {
+        let uav = |i: usize| {
+            self.access[i] & D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 != 0
+                || matches!(D3D12_BARRIER_LAYOUT(self.layout[i]), D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS
+                    | D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_UNORDERED_ACCESS
+                    | D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_UNORDERED_ACCESS)
+        };
+        uav(0) && !uav(1)
+    }
+}
+
+#[derive(Default)]
+struct Slot146Decoded {
+    global: u64,
+    first_global: Option<([i32; 2], [i32; 2])>,
+    matches: Vec<(usize, Slot146Match)>,
+}
+
+#[derive(Default, Clone, Copy, Debug)]
+struct Slot146Counts {
+    calls: u64,
+    global: u64,
+    opaque: u64,
+    empty: u64,
+    known_twin: u64,
+    dropped: u64,
+}
+
+#[derive(Default)]
+struct Slot146Trace {
+    counts: Slot146Counts,
+    samples: HashMap<usize, Vec<Slot146Match>>,
+}
+
+static SLOT146: Mutex<Option<Slot146Trace>> = Mutex::new(None);
+
+unsafe fn slot146_slice<'a, T>(p: *const T, n: usize) -> Option<&'a [T]> {
+    (p.is_aligned() && crate::gpu::shader::readable(p as usize, n.checked_mul(size_of::<T>())?))
+        .then(|| std::slice::from_raw_parts(p, n))
+}
+
+unsafe fn slot146_decode(
+    list: usize, n: u32, groups: *const c_void,
+) -> Option<Slot146Decoded> {
+    if n > 32 {
+        return None;
+    }
+    let groups = slot146_slice(groups.cast::<D3D12_BARRIER_GROUP>(), n as usize)?;
+    let mut remaining = 256usize;
+    let mut decoded = Slot146Decoded::default();
+    let epoch = super::present::counters().1;
+    for g in groups {
+        let count = g.NumBarriers as usize;
+        remaining = remaining.checked_sub(count)?;
+        if count == 0 {
+            continue;
+        }
+        match g.Type {
+            D3D12_BARRIER_TYPE_GLOBAL => {
+                let globals = slot146_slice(g.Anonymous.pGlobalBarriers, count)?;
+                decoded.global += count as u64;
+                if decoded.first_global.is_none() {
+                    let g = &globals[0];
+                    decoded.first_global = Some(([g.SyncBefore.0, g.SyncAfter.0], [g.AccessBefore.0, g.AccessAfter.0]));
+                }
+            }
+            D3D12_BARRIER_TYPE_BUFFER => {
+                slot146_slice(g.Anonymous.pBufferBarriers, count)?;
+            }
+            D3D12_BARRIER_TYPE_TEXTURE => {
+                let textures = slot146_slice(g.Anonymous.pTextureBarriers.cast::<Slot146Texture>(), count)?;
+                for t in textures {
+                    let (twin, mips, slices, planes) = if let Some(Some(s)) = known(t.resource) {
+                        let planes = if matches!(s.depth_format, DXGI_FORMAT_D24_UNORM_S8_UINT | DXGI_FORMAT_D32_FLOAT_S8X24_UINT) { 2 } else { 1 };
+                        (s.texture.as_raw() as usize, s.mips, s.slices, planes)
+                    } else if depth_lineage::twin_enabled() && depth_lineage::interested(t.resource) {
+                        let Some((mips, slices, planes)) = super::vram::arena_depth_shape(t.resource) else { continue };
+                        (0, mips, slices, planes)
+                    } else { continue };
+                    let range = Range::texture(t.subresources, mips, slices, planes)?;
+                    if !t.layout.iter().all(|&x| (-1..=D3D12_BARRIER_LAYOUT_VIDEO_QUEUE_COMMON.0).contains(&x))
+                        || !matches!(t.flags, 0 | 1)
+                    {
+                        return None;
+                    }
+                    decoded.matches.push((t.resource, Slot146Match {
+                        list, epoch, twin, range,
+                        sync: t.sync, access: t.access, layout: t.layout, flags: t.flags,
+                    }));
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(decoded)
+}
+
+pub(super) fn note_slot146_global(list: usize) {
+    depth_lineage::note(0, list, Range::All, "slot146-actual-global", || {
+        "legacy UAV barrier; no resource or texture layout transition".into()
+    });
+}
+
+pub(super) unsafe fn observe_slot146(list: usize, n: u32, groups: *const c_void, native_now: bool) {
+    let state = depth_state::enabled();
+    let lineage = depth_lineage::enabled();
+    if !state && !lineage {
+        return;
+    }
+    let decoded = (n != 0).then(|| slot146_decode(list, n, groups)).flatten();
+    if native_now {
+        if let Some((owner, shadow, mip, slice, sub, generation, index, groups, gate)) = super::depth_twin_probe::take(list) {
+            let valid = decoded.as_ref().is_some_and(|d| d.matches.iter().any(|(r, e)|
+                *r == owner && e.twin == shadow.texture.as_raw() as usize && e.range.covers(sub)
+                    && e.uav_egress() && e.flags == 0 && (e.sync[0] | e.sync[1]) & D3D12_BARRIER_SYNC_SPLIT.0 == 0
+                    && e.access[0] & D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 != 0
+                    && e.layout[1] == D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE.0));
+            if valid && known(owner).flatten().is_some_and(|s| Arc::ptr_eq(&s, &shadow)) {
+                if let Some(cl) = ID3D12GraphicsCommandList::from_raw_borrowed(&(list as *mut c_void)) {
+                    let context = format!("actual dispatch and named guest UAV egress; owner={owner:#x} twin={:p} list={list:#x}/{generation} descriptor={index} grid={groups:?} sub={sub}; before-state from private committed twin, not guest layout", shadow.texture.as_raw());
+                    if let Err(reason) = super::depth_capture::record_twin(cl, &shadow.texture, mip, slice, context, gate) {
+                        static REFUSALS: AtomicU64 = AtomicU64::new(0);
+                        if REFUSALS.fetch_add(1, Ordering::Relaxed) < 4 { crate::xlog_warn!("twin egress capture: {reason}"); }
+                    }
+                }
+            }
+        }
+    }
+    if lineage {
+        if let Some(d) = &decoded {
+            if let Some((sync, access)) = d.first_global {
+                depth_lineage::note(0, list, Range::All, "slot146-guest-global", || {
+                    format!("groups={n} globals={} first_sync={sync:x?} first_access={access:x?}", d.global)
+                });
+            } else if d.matches.is_empty() {
+                depth_lineage::note(0, list, Range::All, "slot146-guest-unmatched", || format!("groups={n}"));
+            }
+            for &(res, s) in &d.matches {
+                let kind = if s.uav_egress() { "slot146-guest-uav-egress" } else { "slot146-guest-texture" };
+                depth_lineage::note(res, list, s.range, kind, || {
+                    format!("twin={:#x} sync={:x?} access={:x?} layout={:?} flags={:#x}", s.twin, s.sync, s.access, s.layout, s.flags)
+                });
+                if depth_lineage::twin_enabled() {
+                    for (hit, kind) in [
+                        (s.layout[0] == D3D12_BARRIER_LAYOUT_UNDEFINED.0, "slot146-guest-activation"),
+                        (s.flags & D3D12_TEXTURE_BARRIER_FLAG_DISCARD.0 != 0, "slot146-guest-discard"),
+                        ((s.sync[0] | s.sync[1]) & D3D12_BARRIER_SYNC_SPLIT.0 != 0, "slot146-guest-split"),
+                    ] {
+                        if hit { depth_lineage::note(res, list, s.range, kind, || format!("guest only; twin={:#x} sync={:x?} access={:x?} layout={:?} flags={:#x}", s.twin, s.sync, s.access, s.layout, s.flags)); }
+                    }
+                }
+            }
+        } else {
+            let kind = if n == 0 { "slot146-guest-empty" } else { "slot146-guest-opaque" };
+            depth_lineage::note(0, list, Range::All, kind, || format!("groups={n}"));
+        }
+    }
+    if !state {
+        return;
+    }
+    let counts = {
+        let mut g = SLOT146.lock().unwrap();
+        let trace = g.get_or_insert_with(Slot146Trace::default);
+        let c = &mut trace.counts;
+        c.calls += 1;
+        if n == 0 {
+            c.empty += 1;
+        } else if let Some(d) = decoded {
+            c.global += d.global;
+            c.known_twin += d.matches.len() as u64;
+            for (res, sample) in d.matches {
+                if sample.twin == 0 { continue }
+                if trace.samples.len() >= 512 && !trace.samples.contains_key(&res) {
+                    c.dropped += 1;
+                    continue;
+                }
+                let samples = trace.samples.entry(res).or_default();
+                let egress = sample.uav_egress();
+                samples.retain(|x| x.range != sample.range || x.twin != sample.twin || x.uav_egress() != egress);
+                if samples.len() >= 16 {
+                    c.dropped += 1;
+                    if let Some(i) = samples.iter().position(|x| !x.uav_egress()) {
+                        samples.remove(i);
+                    } else if egress {
+                        samples.remove(0);
+                    } else {
+                        continue;
+                    }
+                }
+                samples.push(sample);
+            }
+        } else {
+            c.opaque += 1;
+        }
+        *c
+    };
+    if counts.calls.is_power_of_two() {
+        crate::xlog_info!("depth capture #146 CPU input totals (global entries, opaque calls): {counts:?}");
+    }
+}
+
+pub(super) fn report_slot146(list: usize, resource: usize, subresource: u32) {
+    static REPORTS: AtomicU64 = AtomicU64::new(0);
+    if !depth_state::enabled() || REPORTS.fetch_add(1, Ordering::Relaxed) >= 32 {
+        return;
+    }
+    let twin = known(resource).flatten().map(|s| s.texture.as_raw() as usize);
+    let (counts, matched, egress) = SLOT146.lock().unwrap().as_ref().map_or((Slot146Counts::default(), None, None), |trace| {
+        let (matched, egress) = trace.samples.get(&resource).map_or((None, None), |samples| {
+            let mut matching = samples.iter().rev().copied().filter(|s| Some(s.twin) == twin && s.range.covers(subresource));
+            let latest = matching.next();
+            let egress = latest.filter(|s| s.uav_egress()).or_else(|| matching.find(|s| s.uav_egress()));
+            (latest, egress)
+        });
+        (trace.counts, matched, egress)
+    });
+    crate::xlog_info!("depth capture #146 CPU input join: EQUAL list {list:#x} resource {resource:#x} subresource {subresource} twin {twin:x?}; {counts:?}");
+    if let Some(s) = matched {
+        crate::xlog_info!("depth capture #146 matched CPU record: list {:#x} title epoch {} twin {:#x} range {:?} sync {:x?} access {:x?} layout {:?} flags {:#x}",
+            s.list, s.epoch, s.twin, s.range, s.sync, s.access, s.layout, s.flags);
+    } else {
+        crate::xlog_info!("depth capture #146: no matching checked texture record for this subresource");
+    }
+    if let Some(s) = egress.filter(|_| matched.is_some_and(|m| !m.uav_egress())) {
+        crate::xlog_info!("depth capture #146 retained CPU UAV egress: list {:#x} title epoch {} twin {:#x} range {:?} sync {:x?} access {:x?} layout {:?} flags {:#x}",
+            s.list, s.epoch, s.twin, s.range, s.sync, s.access, s.layout, s.flags);
     }
 }
 

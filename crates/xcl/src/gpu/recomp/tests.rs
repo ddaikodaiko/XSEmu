@@ -815,11 +815,8 @@ fn atomic_inc_dec_x2_encoding_families() {
     }
 }
 
-/// *_atomic_fcmpswap_x2 (buffer / flat / global): a 64-bit float compare-swap; the payload
-/// compares bitwise, exactly like the 32-bit fcmpswap – one InterlockedCompareExchange64.
-/// Deterministic emitted text on all three encoding families.
 #[test]
-fn atomic_fcmpswap_x2_is_a_bitwise_64_bit_cas() {
+fn atomic_fcmpswap_x2_uses_float_equality_and_a_64_bit_cas() {
     let code = prog(&[
         ("BUFFER_ATOMIC_FCMPSWAP_X2", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 8), ("SRSRC", 2), ("SOFFSET", 128), ("OFFEN", 1), ("GLC", 1)], None),
         ("FLAT_ATOMIC_FCMPSWAP_X2", "ENC_FLAT", &[("VDST", 12), ("ADDR", 14), ("DATA", 16), ("GLC", 1)], None),
@@ -827,8 +824,8 @@ fn atomic_fcmpswap_x2_is_a_bitwise_64_bit_cas() {
     ]);
     let t = translate(&code, &Options::default()).unwrap();
     assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
-    // one native 64-bit CAS per instruction – no emulation loop
     assert_eq!(t.hlsl.matches("xcl_mInterlockedCompareExchange64(t").count(), 3, "{}", t.hlsl);
+    assert_eq!(t.hlsl.matches("_cmp) == 0 ?").count(), 3, "{}", t.hlsl);
     // [DATA:DATA+1] is the swap value, [DATA+2:DATA+3] the compare value (128-bit operand)
     assert!(t.hlsl.contains("_v = (uint64_t)v4 | ((uint64_t)v5 << 32); uint64_t") && t.hlsl.contains("_cmp = (uint64_t)v6 | ((uint64_t)v7 << 32);"), "{}", t.hlsl);
     assert!(t.hlsl.contains("_cmp = (uint64_t)v18 | ((uint64_t)v19 << 32);"), "{}", t.hlsl);
@@ -847,10 +844,8 @@ fn atomic_fcmpswap_x2_is_a_bitwise_64_bit_cas() {
     }
 }
 
-/// *_atomic_fmin_x2 / fmax_x2 (buffer / flat / global): f64 min / max as one native 64-bit
-/// integer atomic picked by the operand's sign, like the f32 forms – no CAS loop.
 #[test]
-fn atomic_fmin_fmax_x2_are_native_64_bit_atomics() {
+fn atomic_fmin_fmax_x2_use_ordered_comparisons_and_a_64_bit_cas() {
     let code = prog(&[
         ("BUFFER_ATOMIC_FMIN_X2", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 8), ("SRSRC", 2), ("SOFFSET", 128), ("OFFEN", 1), ("GLC", 1)], None),
         ("BUFFER_ATOMIC_FMAX_X2", "ENC_MUBUF", &[("VDATA", 6), ("VADDR", 8), ("SRSRC", 2), ("SOFFSET", 128), ("OFFEN", 1)], None),
@@ -861,17 +856,14 @@ fn atomic_fmin_fmax_x2_are_native_64_bit_atomics() {
     ]);
     let t = translate(&code, &Options::default()).unwrap();
     assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
-    assert!(!t.hlsl.contains("xcl_mInterlockedCompareExchange64(t"), "{}", t.hlsl);
-    // one signed and one unsigned branch per instruction, chosen at +inf's bits
-    assert_eq!(t.hlsl.matches("<= 0x7FF0000000000000ull)").count(), 6, "{}", t.hlsl);
-    assert_eq!(t.hlsl.matches("xcl_mInterlockedMin64(t").count(), 6, "{}", t.hlsl);
-    assert_eq!(t.hlsl.matches("xcl_mInterlockedMax64(t").count(), 6, "{}", t.hlsl);
+    assert_eq!(t.hlsl.matches("xcl_mInterlockedCompareExchange64(t").count(), 6, "{}", t.hlsl);
+    assert_eq!(t.hlsl.matches("_c) == -1 ?").count(), 3, "{}", t.hlsl);
+    assert_eq!(t.hlsl.matches("_c) == 1 ?").count(), 3, "{}", t.hlsl);
     assert_eq!(t.hlsl.matches("& ~7u;").count(), 6, "{}", t.hlsl);
     // memory above 4 GiB: the same accessors, on the window `xcl_w` selects (the flat forms' on
     // the lane's, `xcl_wv`)
     let w = translate(&code, &Options { mem_windows: 2, ..Default::default() }).unwrap();
-    assert_eq!((w.hlsl.matches("xcl_mInterlockedMin64(t").count(), w.hlsl.matches("xcl_vInterlockedMin64(t").count()), (4, 2), "{}", w.hlsl);
-    assert_eq!((w.hlsl.matches("xcl_mInterlockedMax64(t").count(), w.hlsl.matches("xcl_vInterlockedMax64(t").count()), (4, 2), "{}", w.hlsl);
+    assert_eq!((w.hlsl.matches("xcl_mInterlockedCompareExchange64(t").count(), w.hlsl.matches("xcl_vInterlockedCompareExchange64(t").count()), (4, 2), "{}", w.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
         super::dxc::compile(&w.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", w.hlsl));
@@ -4034,6 +4026,59 @@ fn gpu_cube_sample_grad_min_lod() {
 }
 
 #[test]
+fn gpu_gather4_explicit_lod_uses_the_named_mip() {
+    if !gpu_ready() {
+        return;
+    }
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_FLOAT, DXGI_SAMPLE_DESC};
+    for (op, unorm, coords, expected) in [
+        ("IMAGE_GATHER4_L", 0, [0.375, 0.375, 1.0, 0.0], [109.0, 110.0, 106.0, 105.0]),
+        ("IMAGE_GATHER4_L_O", 1, [f32::from_bits(63), 1.5, 1.5, 1.0], [108.0, 109.0, 105.0, 104.0]),
+        ("IMAGE_GATHER4_C_L", 0, [107.0, 0.375, 0.375, 1.0], [1.0, 1.0, 0.0, 0.0]),
+    ] {
+        let mut ps = Vec::new();
+        for (k, value) in coords.into_iter().enumerate() {
+            ps.extend(ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 4 + k as u64), ("SRC0", 255)], Some(f(value))));
+        }
+        ps.extend(ins(op, "ENC_MIMG", &[("DIM", 1), ("VADDR", 4), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 1), ("VDATA", 12), ("UNORM", unorm)], None));
+        ps.extend(ins("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 15), ("VSRC0", 12), ("VSRC1", 13), ("VSRC2", 14), ("VSRC3", 15), ("DONE", 1), ("VM", 1)], None));
+        ps.extend(ins("S_ENDPGM", "ENC_SOPP", &[], None));
+        let res = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 8, Height: 8, DepthOrArraySize: 1, MipLevels: 2,
+            Format: DXGI_FORMAT_R32_FLOAT, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default()
+        };
+        let mut srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: res.Format, ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, ..Default::default()
+        };
+        srv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 2, ..Default::default() };
+        let data = (0..64).map(|i| i as f32).chain((100..116).map(|i| i as f32)).flat_map(f32::to_le_bytes).collect();
+        let texture = runner::ViewTexture { res, srv, data, row_bytes: 8 * 4 };
+        let mut sgprs = vec![0u32; 32];
+        sgprs[16..24].copy_from_slice(&tsharp(0, 22, 9));
+        let sampler = [2 | 2 << 3 | 2 << 6 | 1 << 12, 0xFFF << 12, 2 << 26, 0];
+        sgprs[24..28].copy_from_slice(&sampler);
+        let pixels = draw_console_views(None, Some(&ps), &[[0.0, 0.0], [0.0, 32.0], [32.0, 0.0]], &sgprs, &[texture], &[crate::gpu::desc::sampler_d3d12(&sampler, false)]);
+        for pixel in pixels {
+            assert_eq!(pixel, expected, "{op}");
+        }
+    }
+}
+
+/// A gather reads an integer view as integers: the T#'s FORMAT class picks the view type at run
+/// time, as for image_load, and a float view keeps the float gather.
+#[test]
+fn gather4_reads_integer_views_as_integers() {
+    let gather: &[(&str, u64)] = &[("VDATA", 40), ("VADDR", 33), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)];
+    let t = translate(&prog(&[("IMAGE_GATHER4_LZ", "ENC_MIMG", gather, None)]), &Options::default()).unwrap();
+    for view in ["Texture2D<uint4>", "Texture2D<int4>", "Texture2D<float4>"] {
+        assert!(t.hlsl.contains(view), "{view} gather");
+    }
+    assert_eq!(t.hlsl.matches(".GatherRed(").count(), 3, "one gather per view class");
+}
+
+#[test]
 fn gpu_images_sample_load_store_atomic() {
     if !gpu_ready() {
         return;
@@ -4178,6 +4223,37 @@ fn gpu_static_samplers_from_constants_in_code() {
         assert_eq!([fl(10), fl(11), fl(12), fl(13)], [2.0, 0.0, 2.0, 1.0], "lane {l}: static point sampler");
         assert_eq!([fl(20), fl(21), fl(22), fl(23)], [1.5, 0.0, 1.5, 1.0], "lane {l}: static linear sampler");
     }
+}
+
+/// Static samplers across blocks: an S# built from constants before a branch stays that constant
+/// where every path to the sample agrees, and is no constant once one path rewrites a word.
+#[test]
+fn static_samplers_from_constants_in_an_earlier_block() {
+    let clamp = 2 | 2 << 3 | 2 << 6;
+    let point = [clamp, 0x00FF_F000u32, 0, 0];
+    let mov = |r: u64, v: u32| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
+        if v == 0 {
+            ("S_MOV_B32", "ENC_SOP1", vec![("SDST", r), ("SSRC0", 128)], None)
+        } else {
+            ("S_MOV_B32", "ENC_SOP1", vec![("SDST", r), ("SSRC0", 255)], Some(v))
+        }
+    };
+    let translated = |arm: bool| {
+        let mut list: Vec<_> = (0..4).map(|k| mov(24 + k as u64, point[k])).collect();
+        list.push(("S_CBRANCH_SCC1", "ENC_SOPP", vec![("SIMM16", arm as u64)], None));
+        if arm {
+            list.push(mov(24, 0));
+        }
+        list.push(("IMAGE_SAMPLE_LZ", "ENC_MIMG", vec![("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 1)], None));
+        let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+        translate(&prog(&refs), &Options::default()).unwrap()
+    };
+    let agreed = translated(false);
+    assert_eq!(agreed.static_samplers, vec![(point, false)], "the constants of the block before the branch");
+    assert!(!agreed.hlsl.contains("SamplerDescriptorHeap"), "no sampler heap lookup left");
+    let rewritten = translated(true);
+    assert!(rewritten.static_samplers.is_empty(), "one path rewrites word 0");
+    assert!(rewritten.hlsl.contains("SamplerDescriptorHeap"));
 }
 
 #[test]
@@ -4992,6 +5068,93 @@ fn gpu_memory_windows_above_4_gib() {
     }
     assert_eq!(*word(w1 + 0x6000), 64, "global_atomic_add in window 1");
     assert_eq!(*word(w0 + 0x6000), 0, "nothing in window 0 at the same low address");
+}
+
+#[test]
+fn gpu_page_directory_carry_scatter_alias_and_override_uma() {
+    if !gpu_ready() {
+        return;
+    }
+    let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();
+    let (w0, w1) = (arena.window(0).0, arena.window(1).0);
+    let views = runner::mem_views_at(0);
+    let directory = views + super::MEM_NULL_VIEW + 2;
+    let uma_hi = (w0 >> 32) as u32;
+    let hi = uma_hi + 32;
+    let mut tables = vec![vec![0u32; 65536 * 2], vec![0; 65536], vec![0; 65536], vec![0; 65536], vec![0; 65536]];
+    for high in [hi, hi + 1] {
+        tables[0][2 * high as usize..2 * high as usize + 2].copy_from_slice(&[directory + 1, directory + 2]);
+    }
+    tables[0][2 * uma_hi as usize..2 * uma_hi as usize + 2].copy_from_slice(&[directory + 3, directory + 4]);
+    let pte = |view: u32, page: u32| 0x80000000 | page << 20 | view;
+    tables[1][65535] = pte(views, 4);
+    tables[2][0] = pte(views + 1, 7);
+    tables[1][8] = pte(views + 1, 7);
+    tables[1][7] = 0x80000000;
+    tables[2][7] = pte(views + 1, 7);
+    tables[3][9] = pte(views + 1, 7);
+    tables[4][9] = pte(views, 4);
+    tables[3][10] = 0x80000000;
+    tables[4][10] = pte(views, 4);
+    tables[4][11] = pte(views, 4);
+    let word = |p: usize| unsafe { &mut *(p as *mut u32) };
+    *word(w0 + 0x4fffc) = 0x44332211;
+    *word(w0 + 0x50000) = 0xdeadbeef;
+    *word(w1 + 0x70000) = 0x88776655;
+    *word(w0 + 0x40000) = 0xcafef00d;
+    *word(w0 + 0xa0000) = 0xdeadbeef;
+    *word(w0 + 0xc0000) = 0xaabbccdd;
+    let mut st = KernelState::default();
+    st.sgpr[8..12].copy_from_slice(&[0xfffffffc, hi, 64, 0]);
+    st.sgpr[12..16].copy_from_slice(&[8 * 65536 + 16, hi + 1, 64, 0]);
+    st.sgpr[16..20].copy_from_slice(&[7 * 65536 + 16, hi + 1, 64, 0]);
+    st.sgpr[20..24].copy_from_slice(&[0x90000, uma_hi, 4 * 65536, 0]);
+    st.sgpr[28..32].copy_from_slice(&[0x90000, 0, 64, 0]);
+    tables.insert(0, vec![directory]);
+    let run = |code: &[u8], st: &KernelState| {
+        let t = translate(code, &Options { wave64: false, mem_windows: 2, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+        runner::run_arena_kernel(&dxil, st, &arena, &tables).unwrap()
+    };
+    for (i, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = (i as u32 & 1) * 4;
+        r[7] = 1;
+        r[8] = 1;
+        r[4] = (i as u32 & 3) * 65536;
+        r[10] = 1;
+    }
+    let r = run(&prog(&[
+        ("S_BUFFER_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 24), ("SBASE", 4), ("SOFFSET", 125)], None),
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 2), ("SRSRC", 2), ("SOFFSET", 128), ("OFFEN", 1)], None),
+        ("BUFFER_LOAD_USHORT", "ENC_MUBUF", &[("VDATA", 3), ("SRSRC", 2), ("SOFFSET", 128), ("OFFSET", 3)], None),
+        ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("VDATA", 7), ("SRSRC", 3), ("SOFFSET", 128), ("GLC", 1)], None),
+        ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("VDATA", 8), ("SRSRC", 4), ("SOFFSET", 128), ("GLC", 1)], None),
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 9), ("SRSRC", 5), ("SOFFSET", 128), ("VADDR", 4), ("OFFEN", 1)], None),
+        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 36), ("SBASE", 14), ("SOFFSET", 125)], None),
+        ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("VDATA", 10), ("SRSRC", 7), ("SOFFSET", 128), ("GLC", 1)], None),
+    ]), &st);
+    assert_eq!(&r.sgpr[24..26], &[0x44332211, 0x88776655]);
+    assert_eq!(r.sgpr[36], 0x88776655);
+    for (i, lane) in r.vgpr[..32].iter().enumerate() {
+        assert_eq!(lane[2], if i % 2 == 0 { 0x44332211 } else { 0x88776655 });
+        assert_eq!(lane[3], 0x5544);
+        assert_eq!(lane[8], 0);
+        assert_eq!(lane[9], [0x88776655, 0, 0xcafef00d, 0xaabbccdd][i % 4]);
+        assert_eq!(lane[10], 0);
+    }
+    assert_eq!(*word(w1 + 0x70010), 32);
+    st.sgpr[126] = 1;
+    st.vgpr[0][1] = 0xabcd;
+    st.vgpr[0][2] = u32::MAX;
+    let r = run(&prog(&[
+        ("BUFFER_STORE_SHORT", "ENC_MUBUF", &[("VDATA", 1), ("SRSRC", 2), ("SOFFSET", 128), ("OFFSET", 3)], None),
+        ("BUFFER_ATOMIC_ADD_X2", "ENC_MUBUF", &[("VDATA", 2), ("SRSRC", 2), ("SOFFSET", 128), ("GLC", 1)], None),
+    ]), &st);
+    assert_eq!(&r.vgpr[0][2..4], &[0, 0]);
+    assert_eq!(*word(w0 + 0x4fffc), 0xcd332211);
+    assert_eq!(*word(w1 + 0x70000), 0x887766ab);
+    assert_eq!(*word(w0 + 0x50000), 0xdeadbeef);
 }
 
 /// Out-of-UMA addresses must NEVER alias onto live UMA windows via `& 3`:
@@ -6224,11 +6387,11 @@ fn gpu_built_bvh_nodes_match_the_cpu_node_test() {
         }
         rays.push((node, o, d, inv));
     }
-    let res = runner::run_code(&code, &st, &mem).unwrap();
+    let res = runner::run_code_with_options(&code, &st, &mem, &Options { bvh_node_fix: true, ..runner::options(Mode::Kernel) }).unwrap();
     let (mut boxes, mut tri_hits) = (0, 0);
     for (l, &(node, o, d, inv)) in rays.iter().enumerate() {
         let gpu: [u32; 4] = res.vgpr[l][100..104].try_into().unwrap();
-        let cpu = bvh::intersect_node(&b.data, node, 100.0, o, d, inv, true);
+        let cpu = bvh::intersect_node(&b.data, node, 100.0, o, d, inv, bvh::NodeOptions { sort: true, ..Default::default() });
         if node & 7 == bvh::BOX32 {
             assert_eq!(gpu, cpu, "lane {l}: box node {node:#x}");
             boxes += 1;
@@ -6292,12 +6455,12 @@ fn gpu_triangle_pair_and_box16_nodes() {
         }
         rays.push((node, o, d, inv));
     }
-    let res = runner::run_code(&code, &st, &mem).unwrap();
+    let res = runner::run_code_with_options(&code, &st, &mem, &Options { bvh_node_fix: true, ..runner::options(Mode::Kernel) }).unwrap();
     let data: Vec<u8> = mem[base / 4..].iter().flat_map(|x| x.to_le_bytes()).collect();
     let mut checked = 0;
     for (l, &(node, o, d, inv)) in rays.iter().enumerate() {
         let gpu: [u32; 4] = res.vgpr[l][100..104].try_into().unwrap();
-        let cpu = bvh::intersect_node(&data, node, 100.0, o, d, inv, true);
+        let cpu = bvh::intersect_node(&data, node, 100.0, o, d, inv, bvh::NodeOptions { sort: true, ..Default::default() });
         if node == root {
             assert_eq!(gpu, cpu, "lane {l}: box16");
             continue;
@@ -6325,8 +6488,148 @@ fn gpu_triangle_pair_and_box16_nodes() {
     assert!(checked > 5, "{checked} triangle hits");
 }
 
+#[test]
+fn bvh_intersection_loads_are_inside_the_lane_predicate() {
+    for (op, bvh_node_fix) in [("IMAGE_BVH_INTERSECT_RAY", false), ("IMAGE_BVH64_INTERSECT_RAY", false), ("IMAGE_BVH_INTERSECT_RAY", true), ("IMAGE_BVH64_INTERSECT_RAY", true)] {
+        let code = prog(&[(op, "ENC_MIMG", &[("VDATA", 100), ("VADDR", 12), ("SRSRC", 2), ("DMASK", 15)], None)]);
+        let t = translate(&code, &Options { bvh_node_fix, ..Options::default() }).unwrap();
+        let call = t.hlsl.lines().find(|line| line.contains(" = bvh_intersect(")).expect("BVH intersection call");
+        assert!(call.trim_start().starts_with("if ("), "{op}: {call}");
+    }
+}
+
+#[test]
+fn gpu_bvh_node_types_and_a16() {
+    use crate::gpu::bvh::tests::{triangle_ray, TRIANGLE_REMAP, TRIANGLE_VERTICES};
+    if !gpu_ready() {
+        return;
+    }
+    let base = 0x1000usize;
+    let mut mem = vec![0u32; 0x2000 / 4];
+    for (k, v) in TRIANGLE_VERTICES.iter().enumerate() {
+        let at = base / 4 + k * 3;
+        mem[at..at + 3].copy_from_slice(&v.map(f32::to_bits));
+    }
+    mem[(base + 60) / 4] = TRIANGLE_REMAP;
+    for (offset, packed) in [(0x40, true), (0x80, false)] {
+        let at = (base + offset) / 4;
+        mem[at..at + 4].copy_from_slice(&[8, 16, 24, 32]);
+        for (k, z) in [6.0f32, -2.0, -2.0, 18.0].into_iter().enumerate() {
+            let bounds = [-16.0, -16.0, z, 16.0, 16.0, z + 8.0];
+            if packed {
+                let h = bounds.map(half_bits);
+                let dst = at + 4 + 3 * k;
+                mem[dst..dst + 3].copy_from_slice(&[h[0] | h[1] << 16, h[2] | h[3] << 16, h[4] | h[5] << 16]);
+            } else {
+                let dst = at + 4 + 6 * k;
+                mem[dst..dst + 6].copy_from_slice(&bounds.map(f32::to_bits));
+            }
+        }
+    }
+    let mut code = Vec::new();
+    let mut st = KernelState::default();
+    st.sgpr[8..12].copy_from_slice(&crate::gpu::desc::bvh_words(base as u64, true));
+    st.sgpr[11] = 0x8100_0000;
+    let forms = [(false, false), (false, true), (true, false), (true, true)];
+    for (k, (wide, a16)) in forms.into_iter().enumerate() {
+        let (dst, src) = (100 + 4 * k, 16 * k);
+        let op = if wide { "IMAGE_BVH64_INTERSECT_RAY" } else { "IMAGE_BVH_INTERSECT_RAY" };
+        code.extend(encode(op, "ENC_MIMG", &[("VDATA", dst as u64), ("VADDR", src as u64), ("SRSRC", 2), ("DMASK", 15), ("A16", a16 as u64)], None).unwrap());
+        for (lane, v) in st.vgpr.iter_mut().enumerate() {
+            let case = lane % 32;
+            let (node, tmax, o, d) = if case < 20 {
+                let (ty, ray) = (case / 5, case % 5);
+                let (o, d, _, _) = triangle_ray(ty, ray);
+                (ty as u32, 1.0, o, d)
+            } else {
+                let node = if case < 24 { 12 } else if case < 28 { 21 } else { 6 | (case & 1) as u32 };
+                let tmax = [4.0, -0.5, 100.0, 100.0][case % 4];
+                let o = [if case % 4 == 3 { 64.0 } else { 0.0 }, 0.0, 0.0];
+                (node, tmax, o, [0.5, -0.25, 2.0])
+            };
+            let start = src + 1 + usize::from(wide);
+            v[src] = node;
+            v[start..start + 4].copy_from_slice(&[tmax, o[0], o[1], o[2]].map(f32::to_bits));
+            let [x, y, z] = d;
+            let dir_inv = [x, y, z, 1.0 / x, 1.0 / y, 1.0 / z];
+            if a16 {
+                let h = dir_inv.map(half_bits);
+                v[start + 4..start + 7].copy_from_slice(&[h[0] | h[1] << 16, h[2] | h[3] << 16, h[4] | h[5] << 16]);
+            } else {
+                v[start + 4..start + 10].copy_from_slice(&dir_inv.map(f32::to_bits));
+            }
+        }
+    }
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let out = runner::run_code_with_options(&code, &st, &mem, &Options { bvh_node_fix: true, ..runner::options(Mode::Kernel) }).unwrap();
+    const M: u32 = u32::MAX;
+    for (lane, v) in out.vgpr.iter().enumerate() {
+        let case = lane % 32;
+        for k in 0..forms.len() {
+            let got: [u32; 4] = v[100 + k * 4..104 + k * 4].try_into().unwrap();
+            let context = format!("lane {lane}, width/A16 {:?}: {got:x?}", forms[k]);
+            if case < 20 {
+                let (_, d, t, [i, j]) = triangle_ray(case / 5, case % 5);
+                let [tn, det, bi, bj] = got.map(f32::from_bits);
+                assert_eq!(det.is_sign_negative(), d[2] > 0.0, "{context}");
+                assert_eq!([bi / det, bj / det], [i, j], "{context}");
+                if t < 0.0 {
+                    assert!(tn.is_infinite() && tn.is_sign_negative() == det.is_sign_negative(), "{context}");
+                } else {
+                    assert_eq!(tn / det, t, "{context}");
+                }
+            } else {
+                let expect = if case >= 28 { [M; 4] } else { [[24, 16, 8, M], [M; 4], [24, 16, 8, 32], [M; 4]][case % 4] };
+                assert_eq!(got, expect, "{context}");
+            }
+        }
+    }
+}
+
+#[test]
+fn gpu_bvh_box_growth() {
+    if !gpu_ready() {
+        return;
+    }
+    let base = 0x1000usize;
+    let mut mem = vec![u32::MAX; 0x2000 / 4];
+    let bounds = [-1.0f32, -1.0, 2.0, 1.0, 1.0, 4.0];
+    let h = bounds.map(half_bits);
+    let at = base / 4;
+    mem[at] = 8;
+    mem[at + 4..at + 7].copy_from_slice(&[h[0] | h[1] << 16, h[2] | h[3] << 16, h[4] | h[5] << 16]);
+    let at = (base + 64) / 4;
+    mem[at] = 8;
+    mem[at + 4..at + 10].copy_from_slice(&bounds.map(f32::to_bits));
+
+    let mut st = KernelState::default();
+    st.sgpr[8..12].copy_from_slice(&crate::gpu::desc::bvh_words(base as u64, false));
+    st.sgpr[12..16].copy_from_slice(&crate::gpu::desc::bvh_words(base as u64, true));
+    st.sgpr[13] |= 6 << 23;
+    let mut code = Vec::new();
+    for (dst, desc) in [(100, 2), (104, 3)] {
+        code.extend(encode("IMAGE_BVH_INTERSECT_RAY", "ENC_MIMG", &[("VDATA", dst), ("VADDR", 0), ("SRSRC", desc), ("DMASK", 15)], None).unwrap());
+    }
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let near = 2.0f32.to_bits();
+    for (lane, v) in st.vgpr.iter_mut().enumerate() {
+        v[0] = if lane & 1 == 0 { 4 } else { 13 };
+        v[1] = [near - 1, near - 16, near, (-1.0f32).to_bits()][(lane / 2) % 4];
+        v[7] = 1.0f32.to_bits();
+        v[8..11].copy_from_slice(&[f32::INFINITY, f32::INFINITY, 1.0].map(f32::to_bits));
+    }
+    let out = runner::run_code_with_options(&code, &st, &mem, &Options { bvh_node_fix: true, ..runner::options(Mode::Kernel) }).unwrap();
+    for (lane, v) in out.vgpr.iter().enumerate() {
+        let case = (lane / 2) % 4;
+        assert_eq!(v[100], if case == 2 { 8 } else { u32::MAX }, "lane {lane}, grow 0");
+        assert_eq!(v[104], if case == 0 || case == 2 { 8 } else { u32::MAX }, "lane {lane}, grow 6");
+        assert_eq!(v[101..104], [u32::MAX; 3]);
+        assert_eq!(v[105..108], [u32::MAX; 3]);
+    }
+}
+
 /// Multi-window `image_bvh64_intersect_ray` (full 64-bit node pointer into UMA window 1 with
-/// base = 0, plus 48-bit base in window 1) and axis-aligned grazing ray / NaN-disabled box.
+/// base = 0, plus 48-bit base in window 1) and axis-aligned grazing ray / NaN planes.
 #[test]
 fn gpu_bvh64_intersect_ray_across_memory_windows_and_grazing() {
     if !gpu_ready() {
@@ -6348,11 +6651,12 @@ fn gpu_bvh64_intersect_ray_across_memory_windows_and_grazing() {
     let nan_child = 0xC0u32 >> 3;
     let inv_child = 0x100u32 >> 3;
     // Window 1 root box32 at bvh_addr: child 0 = normal box [-1..1, -1..1, 5..6],
-    // child 1 = NaN-disabled box, child 2 = inverted box (mn > mx), child 3 = invalid
-    write_words(bvh_addr, &[tri_rel, nan_child, inv_child, u32::MAX]);
+    // child 1 = open NaN plane, child 2 = inverted box (mn > mx), child 3 = all near planes NaN
+    write_words(bvh_addr, &[tri_rel, nan_child, inv_child, 0x140 >> 3]);
     write_words(bvh_addr + 16, &ff(&[-1.0, -1.0, 5.0, 1.0, 1.0, 6.0]));
     write_words(bvh_addr + 40, &ff(&[f32::NAN, -1.0, 2.0, 1.0, 1.0, 3.0]));
     write_words(bvh_addr + 64, &ff(&[2.0, -1.0, 2.0, -2.0, 1.0, 3.0]));
+    write_words(bvh_addr + 88, &ff(&[f32::NAN, f32::NAN, f32::NAN, 1.0, 1.0, 3.0]));
     // Triangle at bvh_addr + 0x80 in z = 5
     write_words(bvh_addr + 0x80, &ff(&[-1.0, -1.0, 5.0, 1.0, -1.0, 5.0, -1.0, 1.0, 5.0]));
     write_words(bvh_addr + 0x80 + 60, &[9]);
@@ -6368,14 +6672,16 @@ fn gpu_bvh64_intersect_ray_across_memory_windows_and_grazing() {
     code.extend(mimg("IMAGE_BVH64_INTERSECT_RAY", 104, 20, 2));
     // s[12:15] = 48-bit base pointing at window 1 (`bvh_words(bvh_addr, true)`), v40 = 32-bit root
     code.extend(mimg("IMAGE_BVH_INTERSECT_RAY", 108, 40, 3));
+    code.extend(mimg("IMAGE_BVH_INTERSECT_RAY", 112, 60, 4));
     code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
 
-    let t = translate(&code, &on_gpu(Options { mem_windows: 2, ..Default::default() })).unwrap();
+    let t = translate(&code, &on_gpu(Options { mem_windows: 2, bvh_node_fix: true, ..Default::default() })).unwrap();
     let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
 
     let mut st = KernelState::default();
     st.sgpr[8..12].copy_from_slice(&crate::gpu::desc::bvh_words(0, true));
     st.sgpr[12..16].copy_from_slice(&crate::gpu::desc::bvh_words(bvh_addr, true));
+    st.sgpr[16..20].copy_from_slice(&crate::gpu::desc::bvh_words(w0, true));
     let root64 = (bvh_addr >> 3) | 5;
     let tri64 = (bvh_addr + 0x80) >> 3;
     for (l, r) in st.vgpr.iter_mut().enumerate() {
@@ -6396,14 +6702,19 @@ fn gpu_bvh64_intersect_ray_across_memory_windows_and_grazing() {
         put_ray(r, 22);
         r[40] = 5; // relative root box32 at bvh_addr
         put_ray(r, 41);
+        r[60] = (if l % 2 == 0 { (bvh_addr - w0) >> 3 } else { base_off >> 3 }) as u32 | 5;
+        put_ray(r, 61);
     }
     let res = runner::run_in_arena(&dxil, &st, &arena).unwrap();
     const F: u32 = u32::MAX;
     for l in 0..64usize {
         let v = &res.vgpr[l];
         let q = |at: usize| [v[at], v[at + 1], v[at + 2], v[at + 3]];
-        assert_eq!(q(100), [tri_rel, F, F, F], "lane {l}: 64-bit box32 in window 1 (grazing/NaN/inverted)");
-        assert_eq!(q(108), [tri_rel, F, F, F], "lane {l}: 48-bit base box32 in window 1");
+        let window_one = [nan_child, tri_rel, F, F];
+        assert_eq!(q(100), window_one, "lane {l}: 64-bit box32 in window 1 (grazing/NaN/inverted)");
+        assert_eq!(q(108), window_one, "lane {l}: 48-bit base box32 in window 1");
+        let expected = if l % 2 == 0 { window_one } else { [0xDEAD_BEEF, F, F, F] };
+        assert_eq!(q(112), expected, "lane {l}: 32-bit relative node uses the lane's effective window");
         let tri = q(104).map(f32::from_bits);
         assert!(!tri[0].is_infinite() && ((tri[0] / tri[1]) - 5.0).abs() < 1e-4, "lane {l}: 64-bit triangle in window 1 → {tri:?}");
     }
@@ -6635,9 +6946,6 @@ fn gpu_more_atomics_sub_dword_scratch_valu() {
     assert_eq!(r.sgpr[106] | r.sgpr[107], 0, "v_div_scale_f32: VCC 0 (no post-scale)");
 }
 
-/// *_atomic_fcmpswap_x2 on hardware: a bitwise 64-bit compare-swap. A compare value equal
-/// as a float but different in bits (-0.0 vs +0.0) must NOT swap; GLC returns the old qword.
-/// Per-lane cells are deterministic; the three shared cells end in the unique winner's value.
 #[test]
 fn gpu_atomic_fcmpswap_x2() {
     if !gpu_ready() {
@@ -6672,8 +6980,6 @@ fn gpu_atomic_fcmpswap_x2() {
         r[14] = 0x800 + 8 * l as u32;
         r[22] = 8 * l as u32; // + s2 -> 0xA00 + 8·lane
         r[10] = 0xE00; // flat shared cell (all lanes)
-        // even lanes: cell = INIT, cmp = INIT -> swap happens; odd lanes: cell = +0.0, cmp =
-        // -0.0 -> bitwise different -> no swap (a numeric compare would swap)
         let cmp = if l % 2 == 0 { INIT } else { NEG_ZERO };
         let put = |r: &mut Vec<u32>, at: usize, v: u64| {
             r[at] = v as u32;
@@ -6711,8 +7017,7 @@ fn gpu_atomic_fcmpswap_x2() {
         let v = &r.vgpr[l];
         let even = l % 2 == 0;
         let l64 = l as u64;
-        // per-lane cells: swapped iff cmp == cell bits
-        let (bs, fs, gs) = if even { (newv(0xB000, l64), newv(0xF000, l64), newv(0xA000, l64)) } else { (0, 0, 0) };
+        let (bs, fs, gs) = (newv(0xB000, l64), newv(0xF000, l64), newv(0xA000, l64));
         let cmp_old = if even { INIT } else { 0 }; // the cell's pre-swap value
         assert_eq!(cell(0x600 + 8 * l), bs, "lane {l}: buffer cell");
         assert_eq!(cell(0x800 + 8 * l), fs, "lane {l}: flat cell");
@@ -6732,10 +7037,44 @@ fn gpu_atomic_fcmpswap_x2() {
     }
 }
 
-/// 32-bit float atomic min / max in memory with a -0.0 operand. The translation turns them
-/// into integer atomics chosen by the operand's sign; -0.0 has its sign bit set, so it has to
-/// take the negative path: fmin(-5, -0) = -5, fmax(-5, -0) = -0, fmin(3, -0) = -0,
-/// fmax(3, -0) = 3. Both code paths: global (flat / global) and buffer.
+#[test]
+fn gpu_atomic_f32_matches_ordered_float_comparisons() {
+    if !gpu_ready() {
+        return;
+    }
+    let ops = ["GLOBAL_ATOMIC_FMIN", "GLOBAL_ATOMIC_FMAX", "GLOBAL_ATOMIC_FCMPSWAP"];
+    let mut code = Vec::new();
+    for (i, op) in ops.into_iter().enumerate() {
+        code.extend(encode(op, "ENC_FLAT_GLBL", &[("ADDR", 30), ("DATA", 32), ("SADDR", 2), ("OFFSET", 4 * i as u64), ("VDST", 40 + i as u64), ("GLC", 1)], None).unwrap());
+    }
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut state = KernelState::default();
+    state.sgpr[2] = 0x600;
+    let values = [
+        f32::NEG_INFINITY.to_bits(), (-5.0f32).to_bits(), 0x8000_0001, (-0.0f32).to_bits(),
+        0, 1, 3.0f32.to_bits(), f32::INFINITY.to_bits(), 0x7fff_ffff, 0xffc0_0001,
+        0x7f80_0001, 0xff80_0001,
+    ];
+    let mut mem = vec![0u32; 0x900 / 4];
+    for (i, regs) in state.vgpr.iter_mut().enumerate() {
+        let old = values[i % values.len()];
+        regs[30] = 12 * i as u32;
+        regs[32] = values[(i * 7 + 3) % values.len()];
+        regs[33] = if old & 0x7fff_ffff == 0 { old ^ 0x8000_0000 } else if i % 4 == 1 { regs[32] } else { old };
+        let at = 0x600 / 4 + i * 3;
+        mem[at..at + 3].fill(old);
+    }
+    let result = runner::run_code(&code, &state, &mem).unwrap();
+    for (i, regs) in state.vgpr.iter().enumerate() {
+        let at = 0x600 / 4 + i * 3;
+        let (old, v, cmp) = (mem[at], regs[32], regs[33]);
+        let (a, b, c) = (f32::from_bits(old), f32::from_bits(v), f32::from_bits(cmp));
+        let want = [if b < a { v } else { old }, if b > a { v } else { old }, if a == c { v } else { old }];
+        assert_eq!(result.mem[at..at + 3], want, "lane {i}: old={old:08x} operand={v:08x} cmp={cmp:08x}");
+        assert_eq!(result.vgpr[i][40..43], [old; 3], "lane {i}: GLC old bits");
+    }
+}
+
 #[test]
 fn gpu_atomic_fmin_fmax_negative_zero() {
     if !gpu_ready() {
@@ -7635,6 +7974,119 @@ fn far_jumps_are_direct_branches() {
     let r = runner::run_code(&code, &st, &[]).unwrap();
     for l in 0..64 {
         assert_eq!((r.vgpr[l][1], r.vgpr[l][2]), (1, 9), "lane {l}");
+    }
+}
+
+/// The console compiler keeps constant tables in the code region after the program and
+/// addresses them through `s_getpc_b64`: its address, a table at 0x100, two loads through
+/// it, and a load through an ordinary pointer in s12:s13.
+fn code_table_program() -> Vec<u8> {
+    prog(&[
+        ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 4)], None), // s4 = 0x4
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 4), ("SSRC1", 255)], Some(0xFC)),
+        ("S_ADDC_U32", "ENC_SOP2", &[("SDST", 5), ("SSRC0", 5), ("SSRC1", 128)], None),
+        ("S_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 2), ("SOFFSET", 125)], None),
+        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 10), ("SBASE", 2), ("OFFSET", 8), ("SOFFSET", 125)], None),
+        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 11), ("SBASE", 6), ("SOFFSET", 125)], None),
+        ("GLOBAL_LOAD_DWORDX2", "ENC_FLAT_GLBL", &[("VDST", 8), ("ADDR", 0), ("SADDR", 4)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 4)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 5)], None),
+        ("FLAT_LOAD_DWORDX3", "ENC_FLAT", &[("VDST", 12), ("ADDR", 4), ("OFFSET", 4)], None),
+        ("GLOBAL_LOAD_DWORDX3", "ENC_FLAT_GLBL", &[("VDST", 16), ("ADDR", 4), ("SADDR", 0x7D)], None),
+        ("FLAT_LOAD_USHORT", "ENC_FLAT", &[("VDST", 20), ("ADDR", 4), ("OFFSET", 3)], None),
+    ])
+}
+
+fn code_table() -> super::CodeData {
+    super::CodeData { at: 0x100, words: vec![0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444] }
+}
+
+#[test]
+fn code_region_table_bounds_are_relative_to_the_program() {
+    use crate::gpu::xbox::{Fssm, Program};
+    let p = Program { offset: 5, len: 8 };
+    let mut f = Fssm { data: (0..32).collect(), data_blocks: vec![Program { offset: 0, len: 4 }], ..Default::default() };
+    assert!(super::code_data(&f, &p).is_none());
+    f.data_blocks.extend([Program { offset: 24, len: 4 }, Program { offset: 19, len: 2 }]);
+    let table = super::code_data(&f, &p).unwrap();
+    assert_eq!(table.at, 12);
+    assert_eq!(table.words, [0x14131211, 0x18171615, 0x001b1a19]);
+}
+
+fn far_jump_table_program() -> Vec<u8> {
+    prog(&[
+        ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 4)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 4), ("SSRC1", 255)], Some(0x14)),
+        ("S_ADDC_U32", "ENC_SOP2", &[("SDST", 5), ("SSRC0", 5), ("SSRC1", 128)], None),
+        ("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 4)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 135)], None),
+        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 2), ("OFFSET", 0xe8), ("SOFFSET", 125)], None),
+        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 11), ("SBASE", 6), ("SOFFSET", 125)], None),
+    ])
+}
+
+/// With the code region's data (`Options::code_data`) a scalar load through an `s_getpc_b64`
+/// address reads the table. A far jump can leave its target in a register pair used by a load.
+#[test]
+fn code_region_tables_are_read_through_getpc_addresses() {
+    let code = code_table_program();
+    let with = super::translate(&code, &Options { code_data: Some(code_table()), ..Default::default() }).unwrap();
+    assert!(with.complete(), "{:?}", with.unsupported);
+    assert!(with.hlsl.contains("static const uint xcl_code_d[4] = { 0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u };"), "{}", with.hlsl);
+    assert!(with.hlsl.contains("uint xcl_code(uint a) { uint i = (a - 0x00000100u) >> 2; return i < 4u ? xcl_code_d[i] : 0u; }"), "{}", with.hlsl);
+    assert!(with.hlsl.contains("s4 = 0x00000004u; s5 = 0xC0DE0000u;"), "{}", with.hlsl);
+    assert_eq!(with.hlsl.matches("_pc) {").count(), 3, "every scalar load tells the code region from guest memory:\n{}", with.hlsl);
+
+    let without = super::translate(&code, &Options::default()).unwrap();
+    assert!(without.hlsl.contains("s4 = 0x00000004u; s5 = 0u;"), "{}", without.hlsl);
+    assert!(!without.hlsl.contains("xcl_code") && !without.hlsl.contains("0xC0DE0000u") && !without.hlsl.contains("_pc"), "{}", without.hlsl);
+
+    let far = far_jump_table_program();
+    let plain = super::translate(&far, &Options::default()).unwrap();
+    let given = super::translate(&far, &Options { code_data: Some(code_table()), ..Default::default() }).unwrap();
+    assert!(plain.complete(), "{:?}", plain.unsupported);
+    assert!(given.complete(), "{:?}", given.unsupported);
+    assert!(!plain.hlsl.contains("xcl_code"));
+    assert!(given.hlsl.contains("s5 = 0xC0DE0000u;"), "a resolved jump's target remains a code pointer");
+    let no_getpc = prog(&[("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 11), ("SBASE", 6), ("SOFFSET", 125)], None)]);
+    assert_eq!(super::translate(&no_getpc, &Options::default()).unwrap().hlsl,
+        super::translate(&no_getpc, &Options { code_data: Some(code_table()), ..Default::default() }).unwrap().hlsl);
+}
+
+/// The table is not guest memory: the kernel's `mem` holds other values at the table's
+/// program-relative addresses, and the loads through the `s_getpc_b64` address return the
+/// table's words. The load through s12:s13 reads `mem` either way.
+#[test]
+fn gpu_code_region_tables_are_not_guest_memory() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = code_table_program();
+    let mut mem = vec![0u32; 68];
+    mem[64..68].copy_from_slice(&[0xDEC0_0000, 0xDEC0_0001, 0xDEC0_0002, 0xDEC0_0003]);
+    mem[32] = 0x5555_AAAA;
+    let mut st = KernelState::default();
+    st.sgpr[12] = 0x80;
+    for (lane, v) in st.vgpr.iter_mut().enumerate() {
+        v[0] = 4 * (lane as u32 & 1);
+    }
+    let r = runner::run_code_with_options(&code, &st, &mem, &Options { code_data: Some(code_table()), ..runner::options(Mode::Kernel) }).unwrap();
+    assert_eq!(r.sgpr[8..12], [0x1111_1111, 0x2222_2222, 0x3333_3333, 0x5555_AAAA], "the table's words and the guest dword");
+    let words = code_table().words;
+    for (lane, v) in r.vgpr.iter().enumerate() {
+        let i = lane & 1;
+        assert_eq!(v[8..10], words[i..i + 2], "global scalar base, lane {lane}");
+        assert_eq!(v[12..15], words[1..4], "flat vector base, lane {lane}");
+        assert_eq!(v[16..19], words[..3], "global vector base, lane {lane}");
+        assert_eq!(v[20], 0x2211, "unaligned ushort, lane {lane}");
+    }
+    let r = runner::run_code_with_options(&code, &st, &mem, &runner::options(Mode::Kernel)).unwrap();
+    assert_eq!(r.sgpr[8..12], [0xDEC0_0000, 0xDEC0_0001, 0xDEC0_0002, 0x5555_AAAA], "without the data: guest memory, as a kernel test places its code");
+    let far = far_jump_table_program();
+    for (table, want) in [(None, 0xDEC0_0000), (Some(code_table()), 0x1111_1111)] {
+        let r = runner::run_code_with_options(&far, &st, &mem, &Options { code_data: table, ..runner::options(Mode::Kernel) }).unwrap();
+        assert_eq!(r.vgpr[0][1], 0, "the far jump skipped the move");
+        assert_eq!((r.sgpr[4], r.sgpr[8], r.sgpr[11]), (0x18, want, 0x5555_AAAA));
     }
 }
 
@@ -10386,4 +10838,78 @@ fn mesh_containers_compile_as_host_mesh_shaders() {
     for (e, (count, example)) in why.into_inner().unwrap() {
         println!("  {count} x {e} (e.g. {example})");
     }
+}
+
+/// A wave32 pixel program under `s_wqm` with the march loop of a retail volumetric PS after
+/// another loop: every lane counts steps in a vector register, and the loop goes on as long as
+/// a lane of the mask taken from EXEC has not reached 6 (`v_cmp_le_f32`, `s_andn2 mask, mask,
+/// vcc`, `s_cbranch_scc1`). Exports (passes of the march, the lane's steps, 1, 1).
+fn mask_loop_ps() -> super::Translation {
+    use super::PsInterface;
+    let before = [
+        ins("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 5), ("SRC0", V + 2)], None),
+        ins("S_ADD_U32", "ENC_SOP2", &[("SDST", 9), ("SSRC0", 9), ("SSRC1", 129)], None),
+        ins("S_CMP_LT_U32", "ENC_SOPC", &[("SSRC0", 9), ("SSRC1", 130)], None),
+    ]
+    .concat();
+    let march = [
+        ins("V_ADD_F32", "ENC_VOP2", &[("VDST", 9), ("SRC0", 242), ("VSRC1", 9)], None),
+        ins("S_ADD_U32", "ENC_SOP2", &[("SDST", 8), ("SSRC0", 8), ("SSRC1", 129)], None),
+        ins("V_CMP_LE_F32", "ENC_VOPC", &[("SRC0", 255), ("VSRC1", 9)], Some(0x40C0_0000)),
+        ins("S_ANDN2_B32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 106)], None),
+    ]
+    .concat();
+    let back = |body: &[u8]| (-((body.len() as i64 + 4) / 4)) as u16 as u64;
+    let mut code = [
+        ins("S_MOV_B32", "ENC_SOP1", &[("SDST", 20), ("SSRC0", 126)], None),
+        ins("S_WQM_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 126)], None),
+        ins("S_MOV_B32", "ENC_SOP1", &[("SDST", 9), ("SSRC0", 128)], None),
+    ]
+    .concat();
+    code.extend(&before);
+    code.extend(ins("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", back(&before))], None));
+    code.extend(ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 128)], None));
+    code.extend(ins("S_MOV_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 128)], None));
+    code.extend(ins("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 126)], None));
+    code.extend(&march);
+    code.extend(ins("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", back(&march))], None));
+    code.extend(
+        [
+            ins("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 20)], None),
+            ins("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 10), ("SRC0", 8)], None),
+            ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 11), ("SRC0", 242)], None),
+            ins("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 10), ("VSRC1", 9), ("VSRC2", 11), ("VSRC3", 11), ("DONE", 1), ("VM", 1)], None),
+            ins("S_ENDPGM", "ENC_SOPP", &[], None),
+        ]
+        .concat(),
+    );
+    let psi = PsInterface { inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x302, attrs: None };
+    translate(&code, &Options { mode: Mode::Pixel(psi), wave64: false, ..Default::default() }).unwrap()
+}
+
+/// Draws `mask_loop_ps` on two triangles sharing a diagonal (helper lanes along it): the march
+/// ends after its 6 passes in every pixel. A helper lane's steps cannot be read from the second
+/// pass on with an RDNA2 driver, its bit stayed in the mask and the loop ran to the loop budget
+/// (SCC must count only live lanes).
+#[test]
+fn gpu_ps_mask_loop_on_a_primitive_edge_ends() {
+    if !gpu_ready() {
+        return;
+    }
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_FLOAT;
+    let vs = super::dxc::compile("float4 main(float2 p : POSITION) : SV_Position { return float4(p, 0.5, 1.0); }\n", "main", "vs_6_6", &[]).unwrap();
+    let pt = mask_loop_ps();
+    assert!(pt.complete(), "{:?}\n{}", pt.unsupported_why, pt.hlsl);
+    assert!(pt.hlsl.contains("& ballot(true).x) != 0u);"), "{}", pt.hlsl);
+    // the fourth channel: the hardware wave's lane count
+    let hlsl = pt.hlsl.replacen("    if (!xcl_live) discard;", "    xo.t0[3] = (float)WaveGetLaneCount();\n    if (!xcl_live) discard;", 1);
+    let ps = super::dxc::compile(&hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{hlsl}"));
+    let quad = [-1.0f32, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0];
+    let layout = [runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 }];
+    let size = 32usize;
+    let px = runner::draw(&vs, &ps, &layout, &quad, 8, &[], &[], size as u32, [9.0; 4]).unwrap();
+    let lanes: std::collections::BTreeSet<u32> = px.iter().map(|p| p[3] as u32).collect();
+    let bad: Vec<(usize, usize, [f32; 4])> = (0..size * size).filter(|&i| px[i][0] != 6.0 || px[i][1] != 6.0).map(|i| (i % size, i / size, px[i])).collect();
+    println!("{:?}: lane counts {lanes:?}; {} of {} pixels wrong, first {:?}", runner::adapter(), bad.len(), size * size, bad.iter().take(8).collect::<Vec<_>>());
+    assert!(bad.is_empty(), "{} pixels wrong (passes, steps, 1, lane count), first {:?}", bad.len(), &bad[..bad.len().min(8)]);
 }
