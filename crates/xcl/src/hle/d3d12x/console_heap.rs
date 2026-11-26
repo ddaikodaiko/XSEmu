@@ -832,6 +832,12 @@ mod tests {
             println!("SKIPPED texture3d_uav_companion_reads_written_mip: {e}");
             return;
         }
+        // WARP has no sparse VRAM window, so there is no shared descriptor heap to write
+        // the companion SRV into (the emulator reports "a memory window has no buffer").
+        if crate::gpu::uma::get().is_none_or(|u| !u.is_committed_window(0)) {
+            println!("SKIPPED texture3d_uav_companion_reads_written_mip: no sparse memory window on this adapter");
+            return;
+        }
         unsafe {
             let raw = real::device_raw();
             let dev = ID3D12Device::from_raw_borrowed(&raw).unwrap();
@@ -1035,6 +1041,9 @@ mod tests {
     #[test]
     fn slots_copy_and_release() {
         let Some(u) = crate::gpu::uma::get() else { return };
+        // The heaps are addressed through window 0; without a sparse window (WARP) there is
+        // nothing to place the descriptor table in.
+        if !u.is_committed_window(0) { return; }
         let rel = |p: u64| (p as usize - u.base()) as u32;
         // views: 4 slots over a PC heap at 0x1000 (increment 32, GPU 0x5000); samplers: 2 at 0x9000
         assert!(register(0xA1, 4, 0x1000, 0x5000, 32, false, false, true));
@@ -1079,6 +1088,11 @@ mod tests {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
         use windows::Win32::Graphics::Dxgi::*;
         if crate::gpu::uma::get().is_none() {
+            return;
+        }
+        // A large heap gets its pages in the shared heap, which lives in sparse window 0;
+        // WARP has no sparse window and the views have nowhere to go.
+        if crate::gpu::uma::get().is_none_or(|u| !u.is_committed_window(0)) {
             return;
         }
         let dev = unsafe {
