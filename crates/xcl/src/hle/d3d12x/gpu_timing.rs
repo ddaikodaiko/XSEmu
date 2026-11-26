@@ -2061,7 +2061,16 @@ mod tests {
                 assert_ne!(index, new_index);
                 let old = state.slots[index].recording.as_ref().unwrap();
                 assert!(!old.owned);
-                assert_eq!(old.in_flight, 1);
+                assert_eq!(
+                    old.in_flight, 1,
+                    "lists {:?}; flights {:?}",
+                    state.lists,
+                    state
+                        .flights
+                        .iter()
+                        .map(|(id, f)| (*id, f.queue.id, f.marker.value, f.marker.fence.GetCompletedValue(), f.recordings.clone()))
+                        .collect::<Vec<_>>()
+                );
                 new_index
             };
             drop(unblock);
