@@ -1,0 +1,53 @@
+# Temporary: runs scripts/build-windows.ps1 on a real Windows runner.
+# Not part of the contribution branch; delete after the run.
+name: Test build-windows.ps1
+
+on:
+  push:
+    branches: [ci/test-windows-quickstart]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  script:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.99
+        run: |
+          rustup toolchain install 1.99.0-x86_64-pc-windows-msvc --profile minimal
+          rustup default 1.99.0-x86_64-pc-windows-msvc
+          rustc -V
+
+      - name: Set up the MSVC environment
+        uses: ilammy/msvc-dev-cmd@7defe9254715b088f12dddd9942945a3d75cdad5 # v1.9.0
+        with:
+          arch: x64
+
+      - name: Run build-windows.ps1
+        shell: pwsh
+        run: ./scripts/build-windows.ps1
+
+      - name: Check the portable folder
+        shell: pwsh
+        run: |
+          $ok = $true
+          foreach ($p in 'dist\bin\xcl.exe', 'dist\bin\dxcompiler.dll', 'dist\bin\dxil.dll', 'dist\bin\D3D12\D3D12Core.dll', 'dist\bin\QUICKSTART.txt', 'dist\bin\run.cmd', 'dist\xcl-windows-x64.zip') {
+            if (Test-Path $p) { Write-Host "OK   $p ($((Get-Item $p).Length) B)" }
+            else { Write-Host "MISS $p"; $ok = $false }
+          }
+          if (-not $ok) { throw 'missing outputs' }
+          & dist\bin\xcl.exe --version
+
+      - name: Upload the zip
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: xcl-windows-x64-script-test
+          path: dist/xcl-windows-x64.zip
+          if-no-files-found: error
